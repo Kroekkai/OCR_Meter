@@ -9,9 +9,8 @@ services:
     env_file:
       - .env
     environment:
-      # Fixed by the deployment — override the rest in .env (see .env.example)
       - TZ=Asia/Bangkok
-      - DB_HOST=192.168.248.199
+      - DB_HOST=timescaledb
       - DB_PORT=5432
       - BASE_PATH_PREFIX=/iot
     volumes:

@@ -6,8 +6,13 @@
 #   docker compose -f docker-compose.local.yml up --build
 #
 # Then:
-#   http://localhost:3003/health
-#   http://localhost:3003/docs   (BASE_PATH_PREFIX is empty locally, no /iot prefix)
+#   http://localhost:3003/health          (works — no prefix)
+#   http://localhost:3003/iot/health      (also works — matches production's
+#                                          /iot path, since the middleware
+#                                          only acts on paths that actually
+#                                          start with the prefix; anything
+#                                          else passes through untouched)
+#   http://localhost:3003/docs            or  http://localhost:3003/iot/docs
 #
 # DEVICE_API_KEY / OCR_CLIENT_KEY below are set so you can exercise the
 # no-login upload/OCR-claim path locally too — see the README smoke test.
@@ -49,7 +54,7 @@ services:
       - DB_PASSWORD=devpassword
       - JWT_SECRET=dev-secret-not-for-production
       - JWT_EXPIRE_MINUTES=60
-      - BASE_PATH_PREFIX=
+      - BASE_PATH_PREFIX=/iot
       - UPLOAD_DIR=/data/images
       - MAX_UPLOAD_MB=15
       - MAX_OCR_ATTEMPTS=5
