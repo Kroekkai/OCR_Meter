@@ -1,0 +1,47 @@
+import asyncio
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app import db
+from app.config import get_settings
+from app.grouping import group_sweep_loop
+from app.prefix_middleware import StripPathPrefixMiddleware
+from app.routers import admin_users, auth_routes, health, images, meters, ocr_jobs
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.connect()
+    # Finalizes burst upload groups into ocr_jobs once their window
+    # closes — see app/grouping.py. Runs independently of any HTTP
+    # request, so the wait actually happens even if nobody polls.
+    sweep_task = asyncio.create_task(group_sweep_loop())
+    yield
+    sweep_task.cancel()
+    try:
+        await sweep_task
+    except asyncio.CancelledError:
+        pass
+    await db.disconnect()
+
+
+settings = get_settings()
+
+app = FastAPI(
+    title="OCR Meter Store",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+app.include_router(health.router)
+app.include_router(auth_routes.router)
+app.include_router(admin_users.router)
+app.include_router(images.router)
+app.include_router(ocr_jobs.router)
+app.include_router(meters.router)
+
+# Strips BASE_PATH_PREFIX (e.g. "/iot") from the incoming request path
+# before routing, if present. No-op if the proxy already strips it, or if
+# base_path_prefix is "" — see app/prefix_middleware.py.
+app = StripPathPrefixMiddleware(app, settings.base_path_prefix)

@@ -1,0 +1,71 @@
+# Local test stack — separate from docker-compose.yml (production).
+# Spins up a throwaway Postgres alongside the app so you can test on
+# localhost:3003 without touching the real DB at 192.168.248.199.
+#
+# Run:
+#   docker compose -f docker-compose.local.yml up --build
+#
+# Then:
+#   http://localhost:3003/health
+#   http://localhost:3003/docs   (BASE_PATH_PREFIX is empty locally, no /iot prefix)
+#
+# DEVICE_API_KEY / OCR_CLIENT_KEY below are set so you can exercise the
+# no-login upload/OCR-claim path locally too — see the README smoke test.
+# These dev values are NOT the real production secrets.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ocr-meter-store-db-local
+    environment:
+      - POSTGRES_DB=imagestore
+      - POSTGRES_USER=imguser
+      - POSTGRES_PASSWORD=devpassword
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ocr_pg_data_local:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"  # optional — lets you poke at it with psql/pgweb from the host
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imguser -d imagestore"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  ocr-meter-store:
+    build: .
+    container_name: ocr-meter-store-local
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "3003:3003"
+    environment:
+      - TZ=Asia/Bangkok
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=imagestore
+      - DB_USER=imguser
+      - DB_PASSWORD=devpassword
+      - JWT_SECRET=dev-secret-not-for-production
+      - JWT_EXPIRE_MINUTES=60
+      - BASE_PATH_PREFIX=
+      - UPLOAD_DIR=/data/images
+      - MAX_UPLOAD_MB=15
+      - MAX_OCR_ATTEMPTS=5
+      - DEVICE_API_KEY=dev-device-key-not-for-production
+      - DEVICE_API_KEY_USERNAME=esp32
+      - OCR_CLIENT_KEY=dev-ocr-key-not-for-production
+      - OCR_CLIENT_KEY_USERNAME=ocr-service
+      # Matches production (60s, see app/config.py and .env) per your
+      # request — local and prod use the same window now. Local test
+      # uploads will take up to a minute to turn into a job; that's
+      # expected, not a bug.
+      - IMAGE_GROUP_WINDOW_SECONDS=60
+      - GROUP_SWEEP_INTERVAL_SECONDS=2
+    volumes:
+      - ocr_images_local:/data/images
+
+volumes:
+  ocr_pg_data_local:
+  ocr_images_local:
