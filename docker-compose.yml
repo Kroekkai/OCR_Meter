@@ -5,7 +5,7 @@ services:
     container_name: ocr-meter-store
     restart: unless-stopped
     ports:
-      - "3003:3003"
+      - "3003:8000"
     env_file:
       - .env
     environment:
