@@ -72,18 +72,13 @@ CREATE INDEX IF NOT EXISTS idx_images_electric_meter ON images_electric (meter_i
 CREATE INDEX IF NOT EXISTS idx_images_water_meter    ON images_water    (meter_id, device_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_images_gas_meter      ON images_gas      (meter_id, device_timestamp DESC);
 
--- หา "กลุ่มที่ยังเปิดอยู่" ของมิเตอร์หนึ่งๆ ให้เร็ว (upload ใหม่เช็คว่ามี
--- กลุ่มเปิดอยู่ไหม, background sweep เช็คว่ากลุ่มไหนหมดเวลาแล้ว) — index
--- นี้ครอบคลุมเฉพาะแถวที่เป็น "หัวกลุ่ม" เท่านั้น (group_id = id)
-CREATE INDEX IF NOT EXISTS idx_images_electric_group_lookup ON images_electric (meter_id, received_at) WHERE group_id = id;
-CREATE INDEX IF NOT EXISTS idx_images_water_group_lookup    ON images_water    (meter_id, received_at) WHERE group_id = id;
-CREATE INDEX IF NOT EXISTS idx_images_gas_group_lookup      ON images_gas      (meter_id, received_at) WHERE group_id = id;
-
 -- ถ้า images_electric/water/gas มีอยู่แล้วจาก schema เก่า (ก่อนมี
 -- group_id/received_at) บล็อกนี้เติม column ให้ครบแล้ว backfill แถวเก่า
 -- ให้เป็น "กลุ่มของตัวเอง" — บน fresh install ตารางเพิ่งถูกสร้างพร้อม
 -- 2 column นี้อยู่แล้วด้านบน บล็อกนี้เลยแค่ no-op ผ่านไปเฉยๆ ไม่มีผลอะไร
--- ปลอดภัยรันซ้ำได้ไม่จำกัดจำนวนรอบ
+-- ปลอดภัยรันซ้ำได้ไม่จำกัดจำนวนรอบ — ต้องมาก่อน index ด้านล่างที่อ้างถึง
+-- group_id เสมอ ไม่งั้น CREATE INDEX จะพังถ้า column ยังไม่มี (แก้จากบั๊ก
+-- ที่เจอจริงตอน migrate cfo_iot — เดิมอยู่หลัง index เลย fail ไป 3 ตัว)
 DO $$
 DECLARE
     tbl TEXT;
@@ -102,6 +97,13 @@ BEGIN
         EXECUTE format('ALTER TABLE %I ALTER COLUMN received_at SET DEFAULT now()', tbl);
     END LOOP;
 END $$;
+
+-- หา "กลุ่มที่ยังเปิดอยู่" ของมิเตอร์หนึ่งๆ ให้เร็ว (upload ใหม่เช็คว่ามี
+-- กลุ่มเปิดอยู่ไหม, background sweep เช็คว่ากลุ่มไหนหมดเวลาแล้ว) — index
+-- นี้ครอบคลุมเฉพาะแถวที่เป็น "หัวกลุ่ม" เท่านั้น (group_id = id)
+CREATE INDEX IF NOT EXISTS idx_images_electric_group_lookup ON images_electric (meter_id, received_at) WHERE group_id = id;
+CREATE INDEX IF NOT EXISTS idx_images_water_group_lookup    ON images_water    (meter_id, received_at) WHERE group_id = id;
+CREATE INDEX IF NOT EXISTS idx_images_gas_group_lookup      ON images_gas      (meter_id, received_at) WHERE group_id = id;
 
 -- meter_id/original_filename/device_timestamp ก็อปมาจากแถว "หัวกลุ่ม"
 -- (denormalized) ให้เปิดตาราง ocr_jobs เฉยๆ (เช่นผ่าน pgweb) แล้วรู้ครบ
