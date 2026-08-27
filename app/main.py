@@ -37,8 +37,16 @@ app = FastAPI(
 app.include_router(health.router)
 app.include_router(auth_routes.router)
 app.include_router(admin_users.router)
-app.include_router(images.router)
+# ocr_jobs ต้อง include ก่อน images เสมอ — ocr_jobs.router มี
+# "GET /admin/images/ocr" (literal, ไม่มี path param) ส่วน images.router
+# มี "GET /admin/images/{item_id}" (path param เดียวกันตำแหน่งเดียวกัน)
+# FastAPI/Starlette จับคู่ route ตามลำดับ include ก่อน-หลัง ไม่ใช่ตาม
+# ความเฉพาะเจาะจง — ถ้า images มาก่อน "/admin/images/ocr" จะโดน
+# {item_id} ดักจับไปตีความ "ocr" เป็นค่า item_id (แล้ว fail เป็น int
+# ไม่ได้ -> 422) ก่อนที่ ocr_jobs.router จะมีโอกาสได้ทำงานเลย — บั๊กจริง
+# ที่เจอตอน ocr_client_poller.py เรียก GET /admin/images/ocr ครั้งแรก
 app.include_router(ocr_jobs.router)
+app.include_router(images.router)
 app.include_router(meters.router)
 
 # Strips BASE_PATH_PREFIX (e.g. "/iot") from the incoming request path
