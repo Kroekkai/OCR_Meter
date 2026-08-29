@@ -121,21 +121,22 @@ class OcrManualEditRequest(BaseModel):
 # --------------------------------------------------------------------------
 # ocr_meter — clean, standalone OCR results table (no FK back to
 # images_*/ocr_jobs on purpose). One row per *finished* OCR attempt.
-# Written by POST /admin/images/ocr/{job_id}/result. error_type is always
-# present (0/1/2/3 — see db/init.sql's error_type lookup table for what
-# each code means). group_id is copied from the job (E1/W3/G12 — see
-# db/init.sql). reading_date/reading_time are the ESP32's capture time
-# (job.device_timestamp), not when OCR ran. image_error is only ever set
-# when error_type != 0 — the SAME filename the group's anchor image was
-# already stored under at upload time (no separate file, no re-upload —
-# the OCR client no longer attaches anything here at all), for a human
-# to review; never set on a clean successful read (error_type=0).
-# (Column used to be called ocr_image_filename.)
+# Written by POST /admin/images/ocr/{job_id}/result. Deliberately just
+# these 6 fields (confirmed) — no group_id here (that's an
+# images_*/ocr_jobs-internal concern only, never copied into this
+# output table, even though an earlier revision briefly did). error_type
+# is always present (0/1/2/3 — see db/init.sql's error_type lookup table
+# for what each code means). reading_date/reading_time are the ESP32's
+# capture time (job.device_timestamp), not when OCR ran. image_error is
+# only ever set when error_type != 0 — the SAME filename the group's
+# anchor image was already stored under at upload time (no separate
+# file, no re-upload — the OCR client no longer attaches anything here
+# at all), for a human to review; never set on a clean successful read
+# (error_type=0). (Column used to be called ocr_image_filename.)
 # --------------------------------------------------------------------------
 class OcrMeterEntry(BaseModel):
     id: int
     meter_id: str
-    group_id: str
     reading_date: dt.date
     reading_time: dt.time
     ocr_reading: float | None

@@ -259,10 +259,6 @@ ON CONFLICT (code) DO NOTHING;
 -- ocr_jobs.device_timestamp ของ job นั้น) ไม่ใช่เวลาที่ OCR ประมวลผล —
 -- server เป็นคนเติมให้เองจาก device_timestamp ไม่ใช่ค่าที่ OCR client ส่งมา
 --
--- group_id: ก็อปมาจาก ocr_jobs.group_id ตอนส่งผล (E1/W3/G12 — ดูคำอธิบาย
--- ที่ images_electric ด้านบน) ให้เปิดตารางนี้เฉยๆ ก็รู้ว่าแถวนี้เป็นผล
--- ของกลุ่มไหน ไม่ต้อง join กลับไปที่ ocr_jobs
---
 -- image_error: ใส่เฉพาะตอน error_type != 0 เท่านั้น (1, 2, หรือ 3
 -- — ไม่ใส่ตอนสำเร็จเปล่าๆ error_type=0) เป็น**ชื่อไฟล์เดียวกับที่หัวกลุ่ม
 -- ถูกอัปโหลดไว้แล้วตรงๆ** (ไม่ใช่ไฟล์แยกที่ OCR อัปโหลดซ้ำมาใหม่ — เดิม
@@ -272,10 +268,15 @@ ON CONFLICT (code) DO NOTHING;
 -- ไปที่ไฟล์ที่มีอยู่แล้วในเครื่อง ให้คนอ่านตรวจสอบตอนเกิด error/ผิดปกติ
 -- (ชื่อคอลัมน์เดิมคือ ocr_image_filename — เปลี่ยนเป็น image_error ให้
 -- สื่อความหมายตรงขึ้น เพราะมีค่าเฉพาะตอนเกิด error เท่านั้น)
+--
+-- ตารางนี้ตั้งใจให้มีแค่ 6 field ตามที่ยืนยัน (meter_id, reading_date,
+-- reading_time, ocr_reading, error_type, image_error) — ไม่มี group_id
+-- ในตารางนี้แล้ว (เคยมีอยู่ช่วงสั้นๆ ตอนรวม column กับ ocr_jobs แต่ตัด
+-- ออกตามที่ขอ — group_id ยังใช้เป็นกลไกภายในต่อใน images_*/ocr_jobs
+-- ตามเดิม แค่ไม่ก็อปมาใส่ตารางผลลัพธ์นี้อีกต่อไป)
 CREATE TABLE IF NOT EXISTS ocr_meter (
     id                  BIGSERIAL   PRIMARY KEY,
     meter_id            TEXT        NOT NULL,
-    group_id            TEXT        NOT NULL DEFAULT '',
     reading_date        DATE        NOT NULL,
     reading_time        TIME        NOT NULL,
     ocr_reading         NUMERIC,
@@ -284,7 +285,7 @@ CREATE TABLE IF NOT EXISTS ocr_meter (
 );
 
 -- อัปเกรด DB ที่มี ocr_meter อยู่แล้วจาก schema เก่า (error_type เป็น TEXT,
--- มี error_detail, ไม่มี group_id, หรือมี group_label แทน, หรือมี
+-- มี error_detail, มี group_id หรือ group_label ที่ตัดออกไปแล้ว, หรือมี
 -- reading_timestamp เดียวจากรอบทดลองสั้นๆ ที่ยกเลิกไปแล้ว, หรือคอลัมน์
 -- ชื่อ ocr_image_filename แทน image_error) ให้ตรงกับ schema ใหม่ — no-op
 -- บน fresh install
@@ -321,14 +322,11 @@ BEGIN
     ) THEN
         ALTER TABLE ocr_meter DROP COLUMN error_detail;
     END IF;
-    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS group_id TEXT NOT NULL DEFAULT '';
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'ocr_meter' AND column_name = 'group_label'
-    ) THEN
-        UPDATE ocr_meter SET group_id = group_label WHERE group_id = '' OR group_id IS NULL;
-        ALTER TABLE ocr_meter DROP COLUMN group_label;
-    END IF;
+    -- group_id/group_label: ตัดออกจากตารางนี้ตามที่ยืนยัน — ไม่ก็อป
+    -- group_id เข้ามาที่ ocr_meter อีกต่อไป (ยังอยู่ใน images_*/ocr_jobs
+    -- เหมือนเดิม แค่ไม่ไหลมาถึงตารางผลลัพธ์นี้)
+    ALTER TABLE ocr_meter DROP COLUMN IF EXISTS group_id;
+    ALTER TABLE ocr_meter DROP COLUMN IF EXISTS group_label;
     -- reading_timestamp เดียว (TIMESTAMPTZ) จากรอบทดลองสั้นๆ ที่ยกเลิก
     -- ไปแล้ว -> แยกกลับเป็น reading_date + reading_time เหมือนเดิม — แปลง
     -- กลับเป็นเวลาไทย (Bangkok, UTC+7) local ก่อนแยก เพราะ TIMESTAMPTZ

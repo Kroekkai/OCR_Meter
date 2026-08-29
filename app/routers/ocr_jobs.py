@@ -146,9 +146,9 @@ async def admin_submit_ocr_result(
 
     reading_date/reading_time are no longer client-supplied — they're
     derived from the job's own device_timestamp (when ESP32 captured the
-    photo), not from anything in this request. group_id is copied from
-    the job (E1/W3/G12 — see db/init.sql) so ocr_meter carries it too
-    without a join.
+    photo), not from anything in this request. ocr_meter does NOT carry
+    group_id (confirmed) — that's an internal images_*/ocr_jobs concern
+    only; ocr_meter stays just the 6 confirmed fields.
 
     No file upload here at all anymore — plain form fields, not
     multipart. ocr_meter.image_error (only set when error_type != 0) is
@@ -205,12 +205,11 @@ async def admin_submit_ocr_result(
 
             meter_row = await conn.fetchrow(
                 """
-                INSERT INTO ocr_meter (meter_id, group_id, reading_date, reading_time, ocr_reading, error_type, image_error)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO ocr_meter (meter_id, reading_date, reading_time, ocr_reading, error_type, image_error)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING *
                 """,
                 job["meter_id"],
-                job["group_id"],
                 reading_date,
                 reading_time,
                 ocr_reading,

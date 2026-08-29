@@ -11,7 +11,7 @@ piece by piece against docs/config as they come in. Tracking here so
 nothing gets silently re-guessed or re-flipped:
 
 **Confirmed, implemented:**
-- `error_type` is a plain integer 0/1/2/3 (not free-form text) — meanings live in the `error_type` lookup table (`db/init.sql`), server owns the definitions, OCR client just reports the code. Case 3 ("read a value, but anomalous") replaces the old `reading_decreased`/`usage_anomaly` text values as one combined case — still client-computed, server doesn't run this check. `error_detail` column removed from `ocr_meter`. `reading_date`/`reading_time` derived server-side from the job's `device_timestamp` now, never client-supplied. **No file upload on `/result` at all anymore** — it's plain form fields, not multipart; the old `result_image` field is gone (see "ocr_meter" below for why — it was a real risk, not just unnecessary). `ocr_meter.ocr_image_filename` renamed to `image_error`, and its value is now just the job's own `original_filename` (the anchor's already-stored file), not a separately uploaded one. `GET /admin/images/{item_id}/ocr-result-file` (original spec) removed accordingly — use `/file` instead. `meter_id` stored uppercase everywhere (was lowercase). `ocr_jobs.last_error`/`admin_reason` columns removed (not persisted anywhere now — `/fail`'s error message only reaches the server log). `group_id` is now the E1/W3/G12-style text code directly (the old numeric `group_id`/self-reference anchor mechanism and the separate `group_label` column from an earlier revision are both gone — merged into one `group_id` column, with a new `is_anchor` boolean replacing the self-reference trick), on `images_*`/`ocr_jobs`/`ocr_meter`. A group also now finalizes into `ocr_jobs` immediately once it reaches `IMAGE_GROUP_SIZE` (3) images, not just on the 60s window fallback. See "ocr_meter", "group_id", and "Burst upload grouping" sections below.
+- `error_type` is a plain integer 0/1/2/3 (not free-form text) — meanings live in the `error_type` lookup table (`db/init.sql`), server owns the definitions, OCR client just reports the code. Case 3 ("read a value, but anomalous") replaces the old `reading_decreased`/`usage_anomaly` text values as one combined case — still client-computed, server doesn't run this check. `error_detail` column removed from `ocr_meter`. `reading_date`/`reading_time` derived server-side from the job's `device_timestamp` now, never client-supplied. **No file upload on `/result` at all anymore** — it's plain form fields, not multipart; the old `result_image` field is gone (see "ocr_meter" below for why — it was a real risk, not just unnecessary). `ocr_meter.ocr_image_filename` renamed to `image_error`, and its value is now just the job's own `original_filename` (the anchor's already-stored file), not a separately uploaded one. `GET /admin/images/{item_id}/ocr-result-file` (original spec) removed accordingly — use `/file` instead. `meter_id` stored uppercase everywhere (was lowercase). `ocr_jobs.last_error`/`admin_reason` columns removed (not persisted anywhere now — `/fail`'s error message only reaches the server log). `group_id` is now the E1/W3/G12-style text code directly (the old numeric `group_id`/self-reference anchor mechanism and the separate `group_label` column from an earlier revision are both gone — merged into one `group_id` column, with a new `is_anchor` boolean replacing the self-reference trick), on `images_*`/`ocr_jobs`. A group also now finalizes into `ocr_jobs` immediately once it reaches `IMAGE_GROUP_SIZE` (3) images, not just on the 60s window fallback. **`ocr_meter` does NOT carry `group_id`** — briefly did in an intermediate revision, confirmed removed: `ocr_meter` is exactly 6 fields (`meter_id`, `reading_date`, `reading_time`, `ocr_reading`, `error_type`, `image_error`), nothing else, group tracking is an `images_*`/`ocr_jobs`-internal concern only. See "ocr_meter", "group_id", and "Burst upload grouping" sections below.
 - `DB_HOST=timescaledb` (container name on `innovation_net`), **not** the host's own IP `192.168.248.199` — connecting via the host's external IP timed out from inside the container (self-referential/hairpin routing back to its own host), confirmed via `docker network inspect innovation_net` while debugging the actual deploy. `timescaledb` and `ocr-meter-store` are both already on that network, so Docker's internal DNS resolves it directly — no IP needed at all.
 - `ocr_jobs` is one shared table across meter types (per `db/init.sql`) — not split into `ocr_jobs_electric/water/gas`.
 - Upload filename convention: `{meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg`, meter_id/device_timestamp parsed from it (Thailand local time, UTC+7), invalid meter_id prefix → HTTP 400.
@@ -256,8 +256,10 @@ the anchor image's own `id` — jumps around unpredictably since
 `images_electric`/`water`/`gas` all share one `images_id_seq`) plus
 `group_label` (`TEXT`, the human-readable code) as a separate addition.
 Confirmed simplification: drop the numeric one, rename `group_label` to
-just `group_id` — one column, one name, everywhere (`images_*`,
-`ocr_jobs`, `ocr_meter`).
+just `group_id` — one column, one name, in `images_*` and `ocr_jobs`.
+**Not in `ocr_meter`** — briefly was, in an intermediate revision, but
+confirmed removed: `ocr_meter` is exactly 6 fields and group tracking
+isn't one of them (see "ocr_meter" section above).
 
 Assigned once per meter type from its own dedicated sequence
 (`electric_group_seq`/`water_group_seq`/`gas_group_seq`) the moment a
@@ -265,9 +267,8 @@ brand-new group opens (the first image of a burst, in
 `POST /images/upload`). Every other image joining that same group
 copies the anchor's existing `group_id` rather than pulling a new one.
 It then flows through unchanged: `images_*.group_id` →
-`ocr_jobs.group_id` (copied when the group finalizes — see below) →
-`ocr_meter.group_id` (copied when `/result` is submitted) — so any of
-the three tables can be read on its own and still show a sensible `E1`,
+`ocr_jobs.group_id` (copied when the group finalizes — see below) — so
+either table can be read on its own and still show a sensible `E1`,
 `E2`, `E3`, ... sequence for that meter type, without a join.
 
 **`is_anchor` (`BOOLEAN`) replaces the old self-reference trick.**
