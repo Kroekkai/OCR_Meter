@@ -45,9 +45,10 @@ def image_out(table: str, row: asyncpg.Record) -> ImageOut:
     )
 
 
-async def get_group_images(table: str, group_id: int) -> list[asyncpg.Record]:
-    """All images sharing this group_id (the burst group), including the
-    anchor image itself (group_id == its own id) — see db/init.sql."""
+async def get_group_images(table: str, group_id: str) -> list[asyncpg.Record]:
+    """All images sharing this group_id (the burst group, e.g. "E1"),
+    including the anchor image itself (is_anchor = true) — see
+    db/init.sql."""
     return await pool().fetch(
         f"SELECT * FROM {table} WHERE group_id = $1 ORDER BY id ASC",
         group_id,

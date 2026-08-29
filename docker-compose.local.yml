@@ -1,6 +1,6 @@
 # Local test stack — separate from docker-compose.yml (production).
 # Spins up a throwaway Postgres alongside the app so you can test on
-# localhost:3003 without touching the real DB at 192.168.248.199.
+# localhost:3003 without touching the real production DB.
 #
 # Run:
 #   docker compose -f docker-compose.local.yml up --build
@@ -68,6 +68,7 @@ services:
       # expected, not a bug.
       - IMAGE_GROUP_WINDOW_SECONDS=60
       - GROUP_SWEEP_INTERVAL_SECONDS=2
+      - IMAGE_GROUP_SIZE=3
     volumes:
       - ocr_images_local:/data/images
 

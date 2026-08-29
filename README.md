@@ -11,6 +11,8 @@ piece by piece against docs/config as they come in. Tracking here so
 nothing gets silently re-guessed or re-flipped:
 
 **Confirmed, implemented:**
+- `error_type` is a plain integer 0/1/2/3 (not free-form text) — meanings live in the `error_type` lookup table (`db/init.sql`), server owns the definitions, OCR client just reports the code. Case 3 ("read a value, but anomalous") replaces the old `reading_decreased`/`usage_anomaly` text values as one combined case — still client-computed, server doesn't run this check. `error_detail` column removed from `ocr_meter`. `reading_date`/`reading_time` derived server-side from the job's `device_timestamp` now, never client-supplied. **No file upload on `/result` at all anymore** — it's plain form fields, not multipart; the old `result_image` field is gone (see "ocr_meter" below for why — it was a real risk, not just unnecessary). `ocr_meter.ocr_image_filename` renamed to `image_error`, and its value is now just the job's own `original_filename` (the anchor's already-stored file), not a separately uploaded one. `GET /admin/images/{item_id}/ocr-result-file` (original spec) removed accordingly — use `/file` instead. `meter_id` stored uppercase everywhere (was lowercase). `ocr_jobs.last_error`/`admin_reason` columns removed (not persisted anywhere now — `/fail`'s error message only reaches the server log). `group_id` is now the E1/W3/G12-style text code directly (the old numeric `group_id`/self-reference anchor mechanism and the separate `group_label` column from an earlier revision are both gone — merged into one `group_id` column, with a new `is_anchor` boolean replacing the self-reference trick), on `images_*`/`ocr_jobs`/`ocr_meter`. A group also now finalizes into `ocr_jobs` immediately once it reaches `IMAGE_GROUP_SIZE` (3) images, not just on the 60s window fallback. See "ocr_meter", "group_id", and "Burst upload grouping" sections below.
+- `DB_HOST=timescaledb` (container name on `innovation_net`), **not** the host's own IP `192.168.248.199` — connecting via the host's external IP timed out from inside the container (self-referential/hairpin routing back to its own host), confirmed via `docker network inspect innovation_net` while debugging the actual deploy. `timescaledb` and `ocr-meter-store` are both already on that network, so Docker's internal DNS resolves it directly — no IP needed at all.
 - `ocr_jobs` is one shared table across meter types (per `db/init.sql`) — not split into `ocr_jobs_electric/water/gas`.
 - Upload filename convention: `{meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg`, meter_id/device_timestamp parsed from it (Thailand local time, UTC+7), invalid meter_id prefix → HTTP 400.
 - Auth is fixed-secret-per-deployment: `DEVICE_API_KEY`/`DEVICE_API_KEY_USERNAME` and `OCR_CLIENT_KEY`/`OCR_CLIENT_KEY_USERNAME`, each an *optional shortcut* alongside real JWT login (blank pair = login required). See `app/auth.py`.
@@ -20,12 +22,12 @@ nothing gets silently re-guessed or re-flipped:
 - Production `DB_NAME=cfo_iot` (confirmed) — **not** `imagestore`. Note: the pgweb screenshots and sample rows used earlier in this build (the `esp32`/`ocr-service`/`dashboard-service` users, the `ocr_jobs` attempts-storm data) came from a database named `imagestore`, which is a *different* database from production `cfo_iot`. Schema should be identical (same `init.sql`), but treat any specific row-level data from those screenshots as reference/staging data, not necessarily what's live in `cfo_iot` right now.
 - On-disk filenames use the original uploaded filename directly (e.g. `e101_20260824_140000_01.jpg`), no `image_id` prefix — confirmed acceptable since meter_id+HHMMSS+seq is treated as guaranteed unique by convention. If that ever isn't true in practice, two uploads with the same filename will silently overwrite each other's file on disk (DB rows stay separate either way). See `app/storage.py`.
 - `meter_id` is normalized to lowercase at parse time (`app/filename.py`) — `E101` and `e101` always store as `e101`, so the same physical meter's history never fragments across two casings.
-- **Burst upload grouping** — server waits `IMAGE_GROUP_WINDOW_SECONDS` (default 30) after a burst's first image, one `ocr_jobs` row per group (not per image), OCR picks a single winning image per group. Confirmed via 3 explicit answers — see "Burst upload grouping" section below for the full design.
+- **Burst upload grouping** — server waits `IMAGE_GROUP_WINDOW_SECONDS` (60s, both local and production) after a burst's first image, one `ocr_jobs` row per group (not per image), OCR picks a single winning image per group. Confirmed via 3 explicit answers — see "Burst upload grouping" section below for the full design.
 - **New `ocr_meter` table** (replaces the old "ocr_jobs only" results model) — a clean, standalone results table with no FK back to `images_*`/`ocr_jobs`, meant to be handed off to the external Store system. `ocr_jobs` stays exactly as before as the *internal* job queue (state machine, `attempts` cap, retry-storm guard) — the two are deliberately decoupled. Confirmed via 3 explicit answers:
   - Queue (`ocr_jobs`) and results (`ocr_meter`) are two separate tables, not one.
   - The OCR client computes the month-over-month "reading decreased" comparison itself (pulls history via the new `GET /admin/meters/{meter_id}/ocr-readings` endpoint), not the server.
   - `reading_date`/`reading_time` are two separate DB columns (`DATE` + `TIME`), not one combined timestamp.
-  - See `db/init.sql` (or the standalone `db/add-ocr-meter.sql` for the already-deployed `cfo_iot` database) and `app/routers/ocr_jobs.py`'s `/result` endpoint for the full design.
+  - See `db/init.sql` and `app/routers/ocr_jobs.py`'s `/result` endpoint for the full design. (Previously shipped as a standalone `db/add-ocr-meter.sql` migration — merged into `init.sql` itself now, which is safe to (re-)run against any DB state: fresh, pre-`ocr_meter`, or already up to date.)
 
 **Still open — not confirmed from what you've shared:**
 - `get_admin_or_service()` (the combined admin-JWT-or-service-key dependency on the read-mostly `/admin/images*`/`/admin/meters/*` routes) is my own addition — I don't have confirmation this exists in your real code, or what it actually requires.
@@ -35,7 +37,8 @@ nothing gets silently re-guessed or re-flipped:
 
 ## Endpoints implemented
 
-Matches the OpenAPI list from the Swagger screenshots, plus one addition (marked below) not in the original list:
+Matches the OpenAPI list from the Swagger screenshots (minus one removal
+and plus one addition, both marked below):
 
 ```
 GET    /health
@@ -47,7 +50,7 @@ POST   /images/upload                              [X-Device-Key]
 GET    /admin/images
 GET    /admin/images/ocr
 POST   /admin/images/ocr/{job_id}/claim            [X-OCR-Key]
-POST   /admin/images/ocr/{job_id}/result           [X-OCR-Key]   (multipart — see "ocr_meter" below)
+POST   /admin/images/ocr/{job_id}/result           [X-OCR-Key]   (plain form fields, not multipart — see "ocr_meter" below)
 POST   /admin/images/ocr/{job_id}/fail             [X-OCR-Key]
 POST   /admin/images/{item_id}/reprocess           [admin JWT]
 GET    /admin/images/{item_id}
@@ -55,9 +58,13 @@ DELETE /admin/images/{item_id}                    [admin JWT]
 GET    /admin/meters/{meter_id}/history
 GET    /admin/meters/{meter_id}/ocr-readings                     (NEW — not in original spec, see below)
 GET    /admin/images/{item_id}/file
-GET    /admin/images/{item_id}/ocr-result-file
 PUT    /admin/images/{item_id}/ocr-manual         [admin JWT]
 ```
+
+`GET /admin/images/{item_id}/ocr-result-file` (in the original spec) was
+**removed** — there's no separate "OCR result" file anymore (see
+"ocr_meter" below for why). Use the same `/file` endpoint for an
+error/anomaly row's referenced image too.
 
 ## Auth design
 
@@ -154,98 +161,188 @@ two different jobs:
   meant to be hand-off-ready for the external Store system without that
   system needing to know anything about our internal job queue.
 
-`POST /admin/images/ocr/{job_id}/result` now covers both a successful
-read AND the 3 known business-error outcomes — all four are "OCR
-finished and has a definitive answer," as opposed to `/fail`, which is
-only for a transient/technical failure where OCR never got far enough
-to produce any answer at all (network error, `OCR_API_URL` missing,
-etc.). Request is now **multipart/form-data**, not JSON, so it can carry
-an optional annotated result image alongside the fields:
+**`error_type` is now a plain integer (0/1/2/3), not free-form text** —
+the full meaning of each code lives in the `error_type` lookup table in
+`db/init.sql` (single source of truth), not scattered across comments:
+
+| code | meaning | `ocr_reading` |
+|---|---|---|
+| `0` | read successfully | required |
+| `1` | found the meter but couldn't read the digits | must be omitted |
+| `2` | couldn't find any digits/meter in the image at all | must be omitted |
+| `3` | read a value, but it's anomalous (decreased from last time, or usage spike) | required |
+
+Case 3 covers what used to be two separate string values
+(`reading_decreased`/`usage_anomaly`) — the OCR client is still the one
+that pulls history and decides (server doesn't compute this), it just
+reports one combined code now instead of two.
+
+`POST /admin/images/ocr/{job_id}/result` covers both a successful read
+AND all 3 error/anomaly outcomes — as opposed to `/fail`, which is only
+for a transient/technical failure where OCR never got far enough to
+reach any outcome at all (network error, `OCR_API_URL` missing, etc.).
+**No file upload at all anymore** — plain form fields, not
+multipart/form-data:
 
 | field | required | notes |
 |---|---|---|
-| `reading_date` | always | date OCR performed the read |
-| `reading_time` | always | time OCR performed the read |
-| `ocr_reading` | success + `reading_decreased` only | omit for the other two error types |
-| `error_type` | only on error | `no_digits_found` \| `image_unreadable` \| `reading_decreased`, omit entirely on success |
-| `error_detail` | optional | free-text detail |
-| `result_image` | optional | annotated OCR image file |
+| `ocr_reading` | codes 0, 3 only | must be omitted for codes 1, 2 |
+| `error_type` | always | integer 0/1/2/3 — see table above |
+
+**`reading_date`/`reading_time` are no longer sent by the client at
+all** — the server derives them itself from the job's own
+`device_timestamp` (when the ESP32 captured the photo), not from
+whenever OCR happened to run. **`error_detail` is gone too** — human-
+readable descriptions live once, in the `error_type` lookup table, not
+repeated per-row.
+
+**No `result_image` upload either** — the OCR client never attaches an
+image to this endpoint. `ocr_meter.image_error` (only set when
+`error_type != 0`) is just the job's own `original_filename` — the same
+file the group's anchor image was already stored under at upload time,
+referenced by name, nothing written twice. An earlier version of this
+endpoint accepted a re-uploaded copy via a `result_image` field —
+removed: it added nothing (the OCR client can only legitimately attach
+one of the group's own already-stored photos anyway), and it was
+actively risky — the save path was always computed from the *anchor's*
+filename regardless of which photo's bytes were actually attached, so a
+client attaching a different image in the group (say, image 2 of 3)
+would silently overwrite image 1's file on disk with image 2's content.
 
 ```bash
 # success
 curl -X POST http://localhost:3003/admin/images/ocr/1/result \
     -H 'X-OCR-Key: dev-ocr-key-not-for-production' \
-    -F 'reading_date=2026-08-25' -F 'reading_time=09:31:02' \
-    -F 'ocr_reading=12345'
+    -F 'ocr_reading=12345' -F 'error_type=0'
 
-# error case 1: no digits found in the image
+# case 1: found the meter, couldn't read the digits
 curl -X POST http://localhost:3003/admin/images/ocr/2/result \
     -H 'X-OCR-Key: dev-ocr-key-not-for-production' \
-    -F 'reading_date=2026-08-25' -F 'reading_time=09:34:11' \
-    -F 'error_type=no_digits_found' -F 'error_detail=YOLO found nothing'
+    -F 'error_type=1'
 
-# error case 3: reading is present but lower than last month (client-computed)
+# case 2: no digits/meter found in the image at all
 curl -X POST http://localhost:3003/admin/images/ocr/3/result \
     -H 'X-OCR-Key: dev-ocr-key-not-for-production' \
-    -F 'reading_date=2026-08-25' -F 'reading_time=09:37:20' \
-    -F 'ocr_reading=9800' -F 'error_type=reading_decreased'
+    -F 'error_type=2'
+
+# case 3: read a value, but it's anomalous (client-computed against history)
+curl -X POST http://localhost:3003/admin/images/ocr/4/result \
+    -H 'X-OCR-Key: dev-ocr-key-not-for-production' \
+    -F 'ocr_reading=1510' -F 'error_type=3'
 ```
 
-The OCR client is responsible for the `reading_decreased` check itself —
-pull this meter's history first, compare, then decide `error_type`
-before calling `/result`:
+The OCR client is still responsible for deciding case 3 itself — pull
+this meter's recent *successful* history first (`only_successful=true`
+excludes every error/anomaly row, including old case-3 ones, so a
+flagged reading never pollutes the "normal" baseline), compute the
+deltas/average/threshold, and report `error_type=3` if it decides the
+new reading qualifies. The server only ever serves the history; it
+never computes this comparison itself:
 
 ```bash
-curl -s http://localhost:3003/admin/meters/e101/ocr-readings \
+curl -s "http://localhost:3003/admin/meters/e101/ocr-readings?limit=3&only_successful=true" \
     -H 'X-OCR-Key: dev-ocr-key-not-for-production'
+# -> last 3 successful readings, most recent first — e.g. [1310, 1250, 1200]
+# client computes: deltas [60, 50] -> avg 55 -> threshold 55*3=165
+# if (new_reading - 1310) > 165 -> submit /result with error_type=3
 ```
+
+## `group_id` — human-readable group codes (E1, W3, G12, ...)
+
+**Changed again — `group_id` is now the E1/W3/G12-style text code
+directly, not a separate `group_label` alongside a numeric anchor.**
+Earlier revision had two columns: `group_id` (`BIGINT`, self-referencing
+the anchor image's own `id` — jumps around unpredictably since
+`images_electric`/`water`/`gas` all share one `images_id_seq`) plus
+`group_label` (`TEXT`, the human-readable code) as a separate addition.
+Confirmed simplification: drop the numeric one, rename `group_label` to
+just `group_id` — one column, one name, everywhere (`images_*`,
+`ocr_jobs`, `ocr_meter`).
+
+Assigned once per meter type from its own dedicated sequence
+(`electric_group_seq`/`water_group_seq`/`gas_group_seq`) the moment a
+brand-new group opens (the first image of a burst, in
+`POST /images/upload`). Every other image joining that same group
+copies the anchor's existing `group_id` rather than pulling a new one.
+It then flows through unchanged: `images_*.group_id` →
+`ocr_jobs.group_id` (copied when the group finalizes — see below) →
+`ocr_meter.group_id` (copied when `/result` is submitted) — so any of
+the three tables can be read on its own and still show a sensible `E1`,
+`E2`, `E3`, ... sequence for that meter type, without a join.
+
+**`is_anchor` (`BOOLEAN`) replaces the old self-reference trick.**
+Since `group_id` is no longer a `BIGINT` that can equal a row's own
+`id`, there needs to be an explicit flag marking which row in a group is
+the "anchor" (the one whose `meter_id`/`original_filename`/
+`device_timestamp` get copied into `ocr_jobs` when the group finalizes,
+and the one the claim/sweep race-safety locks against) — `true` for the
+first image that opened the group, `false` for every image that joined
+it afterward.
 
 ## Burst upload grouping — multiple photos per reading, one job
 
 ESP32 sends more than one photo per meter reading (a "burst" — e.g. 3
-shots a few seconds apart). Confirmed design (3 explicit answers):
+shots a few seconds apart). Confirmed design:
 
 - **The server** decides when a group is "complete", not the OCR client.
-- **Time-based**: the server waits `IMAGE_GROUP_WINDOW_SECONDS` (default
-  30) after the *first* image of a burst arrives, then finalizes the
-  group with whatever showed up — it does not require an exact count and
-  will not wait forever for a straggler.
+- **Two paths to "complete", whichever comes first:**
+  - **Count-based (fast path)**: the moment a group reaches
+    `IMAGE_GROUP_SIZE` (3) images, that upload request finalizes the
+    group into `ocr_jobs` immediately, synchronously, in the same
+    request — no waiting at all.
+  - **Time-based (fallback)**: for a group that never reaches that
+    count (e.g. only 1-2 images ever arrive), the server waits
+    `IMAGE_GROUP_WINDOW_SECONDS` (60, both local and production) after
+    the *first* image, then finalizes with whatever showed up — it does
+    not wait forever for a straggler.
 - **OCR picks one winner**: the OCR client tries every image in the
   group and submits a single result for the whole group, referencing
   whichever one image it judged best — not an aggregate of all three.
 
 **How it works:**
 
-1. `POST /images/upload` no longer creates an `ocr_jobs` row directly.
-   It looks for a still-open group for that `meter_id` (an anchor image —
-   `images_*.group_id = id` — received within the window) and joins it,
-   or starts a new group if none is open. `image_id` in the response is
-   gone; you get `group_id` instead, and `ocr_job_id` is always `null`
-   (the job doesn't exist yet).
+1. `POST /images/upload` looks for a still-open group for that
+   `meter_id` (an anchor image — `images_*.is_anchor = true` — received
+   within the window, with no `ocr_jobs` row yet) and joins it, or
+   starts a new group if none is open. After the insert, it counts how
+   many images now share that `group_id`; if the count has reached
+   `IMAGE_GROUP_SIZE`, it finalizes the group into `ocr_jobs` right then
+   and there, and `ocr_job_id` in the response is non-null on exactly
+   that request. Otherwise `ocr_job_id` stays `null` — the group isn't
+   done yet, and it'll either get more images or eventually get picked
+   up by the fallback below.
 2. A background task (`app/grouping.py`, started in `app/main.py`'s
    lifespan — not tied to any HTTP request) checks every
    `GROUP_SWEEP_INTERVAL_SECONDS` (default 5) for groups whose window has
-   closed, and creates exactly **one** `ocr_jobs` row per group,
-   referencing the group's anchor image.
-3. `POST /admin/images/ocr/{job_id}/claim` now returns
-   `image_file_urls` (plural — a list, one URL per image in the group),
-   not a single `image_file_url`.
-4. `POST /admin/images/ocr/{job_id}/result` is unchanged in shape — the
-   OCR client just submits its one chosen result (optionally with
-   `result_image`, the winning photo) the same way as before. Internally,
-   every image in the group gets `ocr_status` updated together (not just
-   the anchor).
+   closed *and that don't already have an `ocr_jobs` row* — i.e. only
+   the ones the fast path above never got to. Groups that already hit
+   `IMAGE_GROUP_SIZE` and got finalized immediately never show up in
+   this sweep at all.
+   Both paths funnel through the same `finalize_group()` helper in
+   `app/grouping.py`, so the actual `INSERT INTO ocr_jobs` only exists
+   in one place.
+3. `POST /admin/images/ocr/{job_id}/claim` returns `image_file_urls`
+   (plural — a list, one URL per image sharing the job's `group_id`).
+4. `POST /admin/images/ocr/{job_id}/result` — see the `ocr_meter` section
+   above for the full current shape (`error_type` 0-3,
+   `reading_date`/`reading_time` no longer client-supplied, `error_detail`
+   gone). Internally, every image in the group gets `ocr_status` updated
+   together (not just the anchor).
 
-**Schema**: `images_electric/water/gas` gained two columns —
-`group_id BIGINT NOT NULL` (self-referencing: the anchor's `group_id`
-equals its own `id`; other images in the burst point at that anchor) and
-`received_at TIMESTAMPTZ NOT NULL` (server receive time — used for the
-window check; deliberately separate from `device_timestamp`, which is
+**Schema**: `images_electric/water/gas` gained columns beyond the
+original spec — `group_id TEXT NOT NULL` (the E1/W3/G12 code, shared by
+every image in the burst — see the `group_id` section above),
+`is_anchor BOOLEAN NOT NULL` (marks the one row per group whose data
+gets copied into `ocr_jobs`), and `received_at TIMESTAMPTZ NOT NULL`
+(server receive time — used for the window check; deliberately separate
+from `device_timestamp`, which is
 client-supplied and can't be trusted to measure server-side elapsed
-time). See `db/init.sql` for the full rationale, or
-`db/add-image-grouping.sql` for a standalone migration that safely
-backfills existing rows (each becomes a group of one) without touching
-`ocr_jobs`/`ocr_meter`.
+time). `meter_id` is also always stored **uppercase** now (normalized
+once in `app/filename.py` at upload time, regardless of what case the
+device sent) — was lowercase in an earlier version of this doc; flag if
+anything downstream (meter-dashboard, External Store) still expects
+lowercase. See `db/init.sql` — it's a single file, safe to (re-)run
+against any DB state (fresh, an older schema, or already up to date).
 
 **Concurrency**: both the upload path and the background sweep lock the
 anchor row with `SELECT ... FOR UPDATE` before deciding — this is what
@@ -265,17 +362,19 @@ cp .env.example .env   # fill in DB_USER / DB_PASSWORD / JWT_SECRET / etc.
 docker compose up --build
 ```
 
-The DB itself (`192.168.248.199:5432`, database from `DB_NAME`) is
-assumed to already exist and already have `db/init.sql` applied — this
-compose file does not manage a Postgres container. If it's a brand-new
-database, run `db/init.sql` against it once by hand
-(`psql -f db/init.sql`) before starting the app.
+The DB itself (container name `timescaledb` on `innovation_net`,
+`DB_HOST` — **not** the host's `192.168.248.199`, which times out due to
+container-to-own-host routing, confirmed while debugging the real
+deploy — database from `DB_NAME`) is assumed to already exist and
+already have `db/init.sql` applied — this compose file does not manage
+a Postgres container. If it's a brand-new database, run `db/init.sql`
+against it once by hand (`psql -f db/init.sql`) before starting the app.
 
 ### Testing on localhost first (no production DB needed)
 
 `docker-compose.local.yml` is a separate stack that adds a throwaway
 local Postgres, so you can smoke-test everything before pointing at the
-real `192.168.248.199` database. It also sets dev `DEVICE_API_KEY`/
+real production database. It also sets dev `DEVICE_API_KEY`/
 `OCR_CLIENT_KEY` values so you can test the no-login key path too:
 
 ```bash
@@ -305,14 +404,17 @@ curl -s -X POST http://localhost:3003/login \
 # 3. upload an image via the no-login device key (matches DEVICE_API_KEY_USERNAME=esp32)
 # meter_id and the capture timestamp come from the FILENAME itself —
 # {meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg — rename any test JPEG to match:
-cp /path/to/some.jpg e101_20260818_151230_01.jpg
+cp /path/to/some.jpg E101_20260818_151230_01.jpg
 
 curl -s -X POST http://localhost:3003/images/upload \
     -H 'X-Device-Key: dev-device-key-not-for-production' \
-    -F 'file=@e101_20260818_151230_01.jpg'
-# -> {"image": {...}, "group_id": 1, "ocr_job_id": null}
-# ocr_job_id is always null here now — a burst upload window is running
-# (5s in this local stack, see docker-compose.local.yml). Wait ~5s, then:
+    -F 'file=@E101_20260818_151230_01.jpg'
+# -> {"image": {...}, "group_id": "E1", "ocr_job_id": null}
+# ocr_job_id is null here — this group has only 1 image so far
+# (IMAGE_GROUP_SIZE is 3), so it hasn't finalized immediately. Either
+# upload 2 more within the window to trigger the fast path, or wait out
+# the full window (60s, matches production — see docker-compose.local.yml)
+# for the fallback sweep to pick it up with just this 1 image. Then:
 
 curl -s "http://localhost:3003/admin/images/ocr?job_status=queued" \
     -H 'X-OCR-Key: dev-ocr-key-not-for-production'
@@ -333,9 +435,14 @@ curl -s -X POST http://localhost:3003/admin/images/ocr/1/result \
 curl -s http://localhost:3003/admin/images -H "Authorization: Bearer $TOKEN"
 ```
 
-Interactive docs (Swagger UI) are at `http://localhost:3003/docs` — same
-shape as the production `/iot/docs`, just without the `/iot` prefix
-since `BASE_PATH_PREFIX` is empty in the local stack.
+Interactive docs (Swagger UI) work both ways locally now —
+`http://localhost:3003/docs` **and** `http://localhost:3003/iot/docs`
+both work simultaneously, since `BASE_PATH_PREFIX=/iot` matches
+production but the middleware only acts on paths that actually start
+with it (see `app/prefix_middleware.py`) — anything else passes through
+untouched. Use the `/iot/...` form specifically when you want to verify
+our own handling of the production path is correct, in isolation from
+whatever's happening with the reverse proxy at `cfo.ntplc.co.th`.
 
 Once this all checks out, switch to the real `docker-compose.yml`
 (production DB + `/iot` base path + `innovation_net`) for the actual
@@ -374,11 +481,20 @@ docker compose exec ocr-meter-store python -m scripts.create_user \
 - **`get_admin_or_service()`** (admin-JWT-or-either-static-key, on the
   read-mostly `/admin/images*`/`/admin/meters/*` routes) — my own
   addition, not confirmed against your real code.
-- **OCR result submission** (`POST .../result`): JSON body
-  `{"ocr_reading": <number>}` — no annotated result image upload wired
-  in yet, even though `GET .../ocr-result-file` expects one to exist.
-  If the real OCR client also uploads an annotated result image, tell
-  me and I'll add a multipart file field to `/result`.
 - **`meter_id` → table routing**: first letter `e/w/g` (case-insensitive),
   per your comment in `init.sql` and the "ประเภทมิเตอร์" spec page.
-# OCR_Meter
+- **`error_type` codes 1 vs 2** ("found the meter but couldn't read the
+  digits" vs "couldn't find any digits/meter at all") — the distinction
+  is entirely the OCR client's own judgment call; nothing server-side
+  tries to tell these apart.
+- **`group_id` assignment timing**: happens when a group *opens* (first
+  image of a burst), not when it's *finalized* into a job — so a burst
+  that never completes still consumes a code from the sequence (a
+  small, permanent gap, same as id gaps elsewhere in this system). Flag
+  if you'd rather it only be assigned at finalization time.
+- **Fast-path race window**: two uploads that both push a group's count
+  to `IMAGE_GROUP_SIZE` at nearly the same instant are protected by
+  `FOR UPDATE` on the anchor row plus a `NOT EXISTS` check right before
+  inserting into `ocr_jobs` (`app/routers/images.py`) — same pattern as
+  the sweep's own race-safety. Not independently tested against real
+  concurrent load, just reasoned through.

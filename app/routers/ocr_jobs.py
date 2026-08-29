@@ -1,13 +1,15 @@
 import datetime as dt
+import logging
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, status
 
 from app.auth import CurrentUser, get_admin_or_service, get_ocr_client
-from app.config import get_settings
-from app.db import pool
-from app.repo import find_image_table, get_group_images
-from app.schemas import JobStatus, OcrClaimResponse, OcrErrorType, OcrFailRequest, OcrJobOut, OcrMeterEntry
-from app import storage
+from app.db import pool, table_for_group_id
+from app.filename import BANGKOK_TZ
+from app.repo import get_group_images
+from app.schemas import JobStatus, OcrClaimResponse, OcrFailRequest, OcrJobOut, OcrMeterEntry
+
+logger = logging.getLogger("ocr_meter_store.ocr_jobs")
 
 router = APIRouter(prefix="/admin/images/ocr", tags=["default"])
 
@@ -18,6 +20,27 @@ def _job_out(row) -> OcrJobOut:
 
 def _meter_out(row) -> OcrMeterEntry:
     return OcrMeterEntry(**dict(row))
+
+
+def _reading_date_time_from_device_timestamp(device_timestamp: dt.datetime | None) -> tuple[dt.date, dt.time]:
+    """
+    reading_date/reading_time mean "when ESP32 captured the photo", not
+    "when OCR ran" — pulled from the job's own device_timestamp (already
+    stored, denormalized from the anchor image) rather than anything the
+    OCR client sends. device_timestamp comes back from asyncpg as a
+    UTC-aware datetime (Postgres stores TIMESTAMPTZ as UTC internally) —
+    convert back to Bangkok local time first, or the date could be off
+    by a day near midnight, and the time would be wrong by 7 hours.
+
+    device_timestamp is nullable in the schema — falls back to the
+    current server time (Bangkok) in the rare case it's missing, so this
+    never fails outright.
+    """
+    if device_timestamp is not None:
+        local = device_timestamp.astimezone(BANGKOK_TZ)
+    else:
+        local = dt.datetime.now(BANGKOK_TZ)
+    return local.date(), local.time()
 
 
 @router.get("", response_model=list[OcrJobOut], summary="Admin List Ocr Jobs")
@@ -33,7 +56,7 @@ async def admin_list_ocr_jobs(
         params.append(job_status)
         clauses.append(f"status = ${len(params)}")
     if meter_id:
-        params.append(meter_id)
+        params.append(meter_id.strip().upper())  # meter_id is always stored uppercase — see app/filename.py
         clauses.append(f"meter_id = ${len(params)}")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params.extend([limit, offset])
@@ -55,9 +78,9 @@ async def admin_claim_ocr_job(job_id: int, _: CurrentUser = Depends(get_ocr_clie
     can't double-process the same job, and a client can't re-claim
     something it already finished.
 
-    image_file_urls lists EVERY image in the job's burst group (job.image_id
-    is the group's anchor — see db/init.sql) — download and OCR all of
-    them, then submit only the single best result via /result.
+    image_file_urls lists EVERY image sharing the job's group_id (E1/W3/G12
+    — see db/init.sql) — download and OCR all of them, then submit only
+    the single best result via /result.
     """
     async with pool().acquire() as conn:
         async with conn.transaction():
@@ -78,11 +101,9 @@ async def admin_claim_ocr_job(job_id: int, _: CurrentUser = Depends(get_ocr_clie
                 job_id,
             )
 
-    table = await find_image_table(updated["image_id"])
-    urls = [f"/admin/images/{updated['image_id']}/file"]
-    if table:
-        group_images = await get_group_images(table, updated["image_id"])
-        urls = [f"/admin/images/{img['id']}/file" for img in group_images]
+    table = table_for_group_id(updated["group_id"])
+    group_images = await get_group_images(table, updated["group_id"])
+    urls = [f"/admin/images/{img['id']}/file" for img in group_images]
 
     return OcrClaimResponse(job=_job_out(updated), image_file_urls=urls)
 
@@ -90,19 +111,24 @@ async def admin_claim_ocr_job(job_id: int, _: CurrentUser = Depends(get_ocr_clie
 @router.post("/{job_id}/result", response_model=OcrMeterEntry, summary="Admin Submit Ocr Result")
 async def admin_submit_ocr_result(
     job_id: int,
-    reading_date: dt.date = Form(..., description="Date OCR performed this reading"),
-    reading_time: dt.time = Form(..., description="Time OCR performed this reading"),
     ocr_reading: float | None = Form(
         default=None,
-        description="Required for success and for error_type in (reading_decreased, usage_anomaly). Must be omitted for the other two error types.",
+        description="Required when error_type is 0 or 3. Must be omitted for error_type 1 or 2 — there is no reading to report.",
     ),
-    error_type: OcrErrorType | None = Form(
-        default=None,
-        description="Omit entirely for a successful read. One of no_digits_found / image_unreadable / reading_decreased / usage_anomaly otherwise.",
-    ),
-    error_detail: str | None = Form(default=None, max_length=2000),
-    result_image: UploadFile | None = File(
-        default=None, description="Optional OCR-annotated image, stored alongside the original upload."
+    error_type: int = Form(
+        ...,
+        description=(
+            "Always required. 0 = read successfully, 1 = found the meter but couldn't read the "
+            "digits, 2 = couldn't find any digits/meter in the image at all, 3 = read a value "
+            "successfully but it's anomalous (decreased from last time, or usage spike — the OCR "
+            "client checks this itself against GET .../ocr-readings history, server doesn't compute "
+            "it). Full definitions live server-side in the error_type table — the OCR client just "
+            "reports which code applies. Must be 0, 1, 2, or 3 — validated by hand in the function "
+            "body rather than via a Literal[0,1,2,3] type: that type annotation on a Form() field "
+            "doesn't reliably coerce the string \"0\"/\"1\"/etc. that multipart/form-data always sends "
+            "into the matching int, and rejects it outright with a confusing 422 instead — confirmed "
+            "against a real request while testing, not just theoretical."
+        ),
     ),
     _: CurrentUser = Depends(get_ocr_client),
 ):
@@ -110,39 +136,54 @@ async def admin_submit_ocr_result(
     processing -> done (ocr_jobs), plus one new row in ocr_meter — the
     clean, standalone results table with no FK back to images_*/ocr_jobs.
 
-    This single endpoint covers BOTH a successful read and the 4 known
-    business-error cases (no_digits_found, image_unreadable,
-    reading_decreased, usage_anomaly) — all four are *definitive*
-    outcomes, not retryable technical failures, so they belong here
-    rather than in /fail. reading_decreased and usage_anomaly are both
-    decided by the OCR client itself: it pulls this meter's history
-    (GET /admin/meters/{meter_id}/ocr-readings, ?only_successful=true for
-    usage_anomaly specifically — see that endpoint's docstring) and
-    compares before calling this endpoint — the server does not compute
-    either comparison. Both carry the current (newest) reading as
-    ocr_reading, same as a normal success — only error_type marks it
-    as anomalous.
+    error_type is always required now (0/1/2/3, not free-form business
+    error strings) — see db/init.sql's error_type lookup table for what
+    each code means; the server owns those definitions, the OCR client
+    only ever reports which one applies. Case 3 covers what used to be
+    two separate cases (reading_decreased/usage_anomaly) — the OCR
+    client is still the one that checks history and decides, server just
+    stores whichever code it reports.
+
+    reading_date/reading_time are no longer client-supplied — they're
+    derived from the job's own device_timestamp (when ESP32 captured the
+    photo), not from anything in this request. group_id is copied from
+    the job (E1/W3/G12 — see db/init.sql) so ocr_meter carries it too
+    without a join.
+
+    No file upload here at all anymore — plain form fields, not
+    multipart. ocr_meter.image_error (only set when error_type != 0) is
+    just the job's own original_filename — the SAME file the anchor
+    image was already stored under at upload time. The OCR client has no
+    image of its own to contribute here; it never captured anything,
+    ESP32 did, and that file is already on disk. An earlier version of
+    this endpoint accepted a re-uploaded copy via a result_image field —
+    removed, since it added nothing (the OCR client can only ever
+    legitimately attach one of the group's own already-stored photos
+    anyway) and could silently overwrite a *different* image in the same
+    group on disk (the save path was always computed from the anchor's
+    filename, regardless of which photo's bytes were actually attached).
 
     Only allowed on a job this client actually claimed (status='processing') —
     same state-machine guard as /claim and /fail.
     """
-    NO_READING_ERRORS = ("no_digits_found", "image_unreadable")
-    ANOMALOUS_READING_ERRORS = ("reading_decreased", "usage_anomaly")
+    VALID_CODES = (0, 1, 2, 3)
+    NO_READING_CODES = (1, 2)
+    HAS_READING_CODES = (0, 3)
 
-    if error_type is None and ocr_reading is None:
+    if error_type not in VALID_CODES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="ocr_reading is required when error_type is not set (success case)",
+            detail=f"error_type must be 0, 1, 2, or 3 — got {error_type!r}",
         )
-    if error_type in NO_READING_ERRORS and ocr_reading is not None:
+    if error_type in HAS_READING_CODES and ocr_reading is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"ocr_reading must be omitted when error_type={error_type!r} — there is no reading to report",
+            detail=f"ocr_reading is required when error_type={error_type}",
         )
-    if error_type in ANOMALOUS_READING_ERRORS and ocr_reading is None:
+    if error_type in NO_READING_CODES and ocr_reading is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"ocr_reading is required when error_type={error_type!r} — it's the anomalous reading itself",
+            detail=f"ocr_reading must be omitted when error_type={error_type} — there is no reading to report",
         )
 
     async with pool().acquire() as conn:
@@ -156,28 +197,25 @@ async def admin_submit_ocr_result(
                     detail=f"Job {job_id} is '{job['status']}', not 'processing' — call /claim first",
                 )
 
-            ocr_image_filename = None
-            if result_image is not None:
-                data = await result_image.read()
-                if data:
-                    path = await storage.save_upload(
-                        job["image_id"], job["original_filename"], data, is_ocr_result=True
-                    )
-                    ocr_image_filename = path.name
+            reading_date, reading_time = _reading_date_time_from_device_timestamp(job["device_timestamp"])
+
+            # No file write at all — just reference the anchor's filename,
+            # already sitting on disk since the original ESP32 upload.
+            image_error = job["original_filename"] if error_type != 0 else None
 
             meter_row = await conn.fetchrow(
                 """
-                INSERT INTO ocr_meter (meter_id, reading_date, reading_time, ocr_reading, error_type, error_detail, ocr_image_filename)
+                INSERT INTO ocr_meter (meter_id, group_id, reading_date, reading_time, ocr_reading, error_type, image_error)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING *
                 """,
                 job["meter_id"],
+                job["group_id"],
                 reading_date,
                 reading_time,
                 ocr_reading,
                 error_type,
-                error_detail,
-                ocr_image_filename,
+                image_error,
             )
 
             await conn.execute(
@@ -185,12 +223,11 @@ async def admin_submit_ocr_result(
                 ocr_reading,
                 job_id,
             )
-            table = await find_image_table(job["image_id"])
-            if table:
-                # job["image_id"] is the group's anchor — mark every image
-                # in the burst group 'done', not just the anchor, since
-                # OCR considered (and picked from) all of them.
-                await conn.execute(f"UPDATE {table} SET ocr_status = 'done' WHERE group_id = $1", job["image_id"])
+            table = table_for_group_id(job["group_id"])
+            # job["group_id"] is shared by every image in the burst group
+            # — mark all of them 'done', not just the anchor, since OCR
+            # considered (and picked from) all of them.
+            await conn.execute(f"UPDATE {table} SET ocr_status = 'done' WHERE group_id = $1", job["group_id"])
 
     return _meter_out(meter_row)
 
@@ -205,22 +242,24 @@ async def admin_report_ocr_failure(
     processing -> failed (terminal). For *transient/technical* failures
     only (network error, OCR_API_URL not configured, download failed,
     etc.) — anything where the OCR process never got far enough to reach
-    a definitive outcome. Does NOT write to ocr_meter; ocr_jobs.last_error
-    is purely internal-queue bookkeeping. A definitive business outcome —
-    including "no digits found" or "image unreadable" — goes through
-    /result instead (with the matching error_type), not here.
+    a definitive outcome. Does NOT write to ocr_meter. A definitive
+    business outcome — including "couldn't read the digits" or "no
+    digits found at all" — goes through /result instead (error_type 1/2),
+    not here.
 
-    This is the fix for jobs like the ones seen with hundreds/thousands of
-    attempts and a config error: previously nothing stopped a job that was
-    already 'failed' from being reported failed again and again, so
-    attempts climbed forever on an already-dead job. Now /fail (like
-    /claim and /result) only accepts a job that's currently 'processing' —
-    once it's terminal, this returns 409 instead of silently incrementing
-    attempts. A human has to explicitly re-queue it via
+    body.error is logged server-side (see logger.warning below) but NOT
+    persisted anywhere — ocr_jobs.last_error was removed. If you need
+    that failure reason preserved for later debugging, it only lives in
+    the server's own logs now, not queryable via the API.
+
+    Same state-machine guard as /claim and /result: only accepts a job
+    that's currently 'processing' — once it's terminal, this returns 409
+    instead of silently incrementing attempts (the original fix for jobs
+    with hundreds/thousands of attempts on an already-dead config error).
+    A human has to explicitly re-queue it via
     POST /admin/images/{item_id}/reprocess, which starts a fresh job row
     at attempts=0.
     """
-    settings = get_settings()
     async with pool().acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow("SELECT * FROM ocr_jobs WHERE id = $1 FOR UPDATE", job_id)
@@ -234,23 +273,16 @@ async def admin_report_ocr_failure(
                         "it cannot be failed again. Re-queue it via /reprocess if it needs another attempt."
                     ),
                 )
+            logger.warning("ocr_jobs %s reported failed: %s", job_id, body.error)
             updated = await conn.fetchrow(
-                "UPDATE ocr_jobs SET status = 'failed', last_error = $1 WHERE id = $2 RETURNING *",
-                body.error,
+                "UPDATE ocr_jobs SET status = 'failed' WHERE id = $1 RETURNING *",
                 job_id,
             )
-            table = await find_image_table(updated["image_id"])
-            if table:
-                # Same group-wide update as /result — see that endpoint's
-                # comment. A technical failure applies to the whole
-                # attempt (all images in the group), not just the anchor.
-                await conn.execute(
-                    f"UPDATE {table} SET ocr_status = 'failed' WHERE group_id = $1", updated["image_id"]
-                )
-
-            if updated["attempts"] >= settings.max_ocr_attempts:
-                # Already terminal (status='failed' above) — this branch is
-                # just here so the response can tell the caller clearly
-                # that it's given up, rather than the caller inferring it.
-                pass
+            table = table_for_group_id(updated["group_id"])
+            # Same group-wide update as /result — see that endpoint's
+            # comment. A technical failure applies to the whole attempt
+            # (all images in the group), not just the anchor.
+            await conn.execute(
+                f"UPDATE {table} SET ocr_status = 'failed' WHERE group_id = $1", updated["group_id"]
+            )
     return _job_out(updated)

@@ -12,7 +12,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # --- Postgres -----------------------------------------------------
-    db_host: str = "192.168.248.199"
+    # Default only — docker-compose.yml/.local.yml always override this
+    # explicitly. Production uses the container name "timescaledb" (same
+    # innovation_net network), not the host's own IP — connecting via the
+    # host's external IP timed out (container-to-own-host routing).
+    db_host: str = "timescaledb"
     db_port: int = 5432
     db_user: str = "CHANGE_ME"
     db_password: str = "CHANGE_ME"
@@ -74,6 +78,13 @@ class Settings(BaseSettings):
     # finalize. Independent of the window above — this is just the poll
     # interval, not the wait time itself.
     group_sweep_interval_seconds: int = 5
+    # Fast path: if a group already has this many images, it's finalized
+    # into ocr_jobs IMMEDIATELY on upload — doesn't wait for the window
+    # above at all. The window is only the FALLBACK for groups that never
+    # reach this count (e.g. only 1-2 images arrive) — those still wait
+    # the full image_group_window_seconds via the background sweep, same
+    # as before. See app/routers/images.py's upload handler.
+    image_group_size: int = 3
 
 
 @lru_cache

@@ -5,8 +5,9 @@ from fastapi.responses import FileResponse
 
 from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_uploader
 from app.config import get_settings
-from app.db import pool, table_for_meter_id
+from app.db import GROUP_ID_INFO, pool, table_for_meter_id
 from app.filename import FilenameParseError, parse_upload_filename
+from app.grouping import finalize_group
 from app.repo import get_image_row, image_out
 from app.schemas import ImageOut, ImageUploadResponse, MeterType, OcrManualEditRequest, OcrStatus
 from app import storage
@@ -27,17 +28,25 @@ async def upload_image(
     """
     meter_id and device_timestamp are NOT sent as separate fields — the
     ESP32-CAM encodes both in the filename itself:
-    {meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg (e.g. e101_20260818_151230_01.jpg).
+    {meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg (e.g. E101_20260818_151230_01.jpg).
     A filename that doesn't match this, or whose meter_id doesn't start
     with e/w/g, is rejected with 400.
 
-    Does NOT create an ocr_jobs row directly — the device sends multiple
-    photos per reading (a "burst"), and this joins the image into
-    whichever burst group for this meter_id is still open (within
-    settings.image_group_window_seconds of its first image), or starts a
-    new group if none is open. A background sweep (app/grouping.py)
-    creates exactly one ocr_jobs row per group once its window closes —
-    see ImageUploadResponse's docstring.
+    Joins the image into whichever burst group for this meter_id is
+    still open (within settings.image_group_window_seconds of its first
+    image), or starts a new group if none is open. Two ways a group
+    turns into exactly one ocr_jobs row:
+      1. FAST PATH (this function, immediately): once the group reaches
+         settings.image_group_size images, this upload finalizes it into
+         ocr_jobs right here in the same request — no waiting at all.
+         ImageUploadResponse.ocr_job_id is non-null on exactly the
+         request that completed the group.
+      2. FALLBACK (app/grouping.py's background sweep): for groups that
+         never reach that count, once image_group_window_seconds elapses
+         since the first image, the sweep finalizes with whatever
+         arrived. Whichever happens first wins — a group that hits the
+         count never waits for the sweep, and a group that hits the
+         window first never waits for more images.
     """
     try:
         meter_id, device_timestamp = parse_upload_filename(file.filename)
@@ -52,62 +61,102 @@ async def upload_image(
     if not data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty file")
 
-    window_seconds = get_settings().image_group_window_seconds
+    settings = get_settings()
+    group_prefix, group_seq = GROUP_ID_INFO[table]
 
     async with pool().acquire() as conn:
         async with conn.transaction():
             # FOR UPDATE here is what makes this race-safe against the
             # background sweep finalizing this exact group at the same
-            # instant — see app/grouping.py's matching FOR UPDATE.
+            # instant — see app/grouping.py's matching FOR UPDATE. Locks
+            # the ANCHOR row (is_anchor=true) representing the group,
+            # not any old numeric self-reference.
             open_anchor = await conn.fetchrow(
                 f"""
-                SELECT id FROM {table}
+                SELECT id, group_id FROM {table}
                 WHERE meter_id = $1
-                  AND group_id = id
+                  AND is_anchor = true
                   AND received_at > now() - ($2 * interval '1 second')
-                  AND NOT EXISTS (SELECT 1 FROM ocr_jobs WHERE image_id = {table}.id)
+                  AND NOT EXISTS (SELECT 1 FROM ocr_jobs WHERE group_id = {table}.group_id)
                 ORDER BY id DESC
                 LIMIT 1
                 FOR UPDATE
                 """,
                 meter_id,
-                window_seconds,
+                settings.image_group_window_seconds,
             )
 
             if open_anchor is not None:
-                # Joins the still-open group — this image is NOT the anchor.
+                # Joins the still-open group — this image is NOT the
+                # anchor, so it just copies the anchor's existing
+                # group_id rather than pulling a new one from the
+                # sequence.
                 image_row = await conn.fetchrow(
                     f"""
-                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id)
-                    VALUES ($1, $2, $3, 'pending', $4)
+                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor)
+                    VALUES ($1, $2, $3, 'pending', $4, false)
                     RETURNING *
                     """,
                     meter_id,
                     file.filename,
                     device_timestamp,
-                    open_anchor["id"],
+                    open_anchor["group_id"],
                 )
             else:
                 # No open group — this image starts a new one as its own
-                # anchor (group_id = its own id). Pulls the id from the
-                # sequence explicitly so both columns can be set in one
-                # INSERT instead of insert-then-update.
-                new_id = await conn.fetchval("SELECT nextval('images_id_seq')")
+                # anchor. group_id pulls from the per-type sequence (E1,
+                # E2, ... / W1, W2, ... / G1, G2, ...) — human-readable,
+                # unlike the raw row id which jumps around since all 3
+                # tables share images_id_seq.
+                new_seq_n = await conn.fetchval(f"SELECT nextval('{group_seq}')")
+                new_group_id = f"{group_prefix}{new_seq_n}"
                 image_row = await conn.fetchrow(
                     f"""
-                    INSERT INTO {table} (id, meter_id, original_filename, device_timestamp, ocr_status, group_id)
-                    VALUES ($1, $2, $3, $4, 'pending', $1)
+                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor)
+                    VALUES ($1, $2, $3, 'pending', $4, true)
                     RETURNING *
                     """,
-                    new_id,
                     meter_id,
                     file.filename,
                     device_timestamp,
+                    new_group_id,
                 )
+
+            # --- Fast path: group just reached image_group_size? -------
+            # Finalize into ocr_jobs immediately, right here, instead of
+            # waiting for the sweep to notice on its next tick (up to
+            # group_sweep_interval_seconds later) or for the window to
+            # close (up to image_group_window_seconds later).
+            ocr_job_id = None
+            group_count = await conn.fetchval(
+                f"SELECT COUNT(*) FROM {table} WHERE group_id = $1",
+                image_row["group_id"],
+            )
+            if group_count >= settings.image_group_size:
+                # Re-fetch the anchor row locked — need its
+                # original_filename/device_timestamp to copy into
+                # ocr_jobs, and FOR UPDATE + the NOT EXISTS check right
+                # after is what prevents two uploads that both push the
+                # count over the line at nearly the same instant from
+                # both creating a job for the same group (mirrors the
+                # same race-safety the sweep already has).
+                anchor_row = await conn.fetchrow(
+                    f"SELECT * FROM {table} WHERE group_id = $1 AND is_anchor = true FOR UPDATE",
+                    image_row["group_id"],
+                )
+                already_has_job = await conn.fetchval(
+                    "SELECT 1 FROM ocr_jobs WHERE group_id = $1", image_row["group_id"]
+                )
+                if anchor_row is not None and not already_has_job:
+                    ocr_job_id = await finalize_group(conn, anchor_row)
 
     await storage.save_upload(image_row["id"], file.filename, data)
 
-    return ImageUploadResponse(image=image_out(table, image_row), group_id=image_row["group_id"])
+    return ImageUploadResponse(
+        image=image_out(table, image_row),
+        group_id=image_row["group_id"],
+        ocr_job_id=ocr_job_id,
+    )
 
 
 @router.get("/admin/images", response_model=list[ImageOut], summary="Admin List Images")
@@ -120,6 +169,8 @@ async def admin_list_images(
     _: CurrentUser = Depends(get_admin_or_service),
 ):
     tables = [f"images_{meter_type}"] if meter_type else ["images_electric", "images_water", "images_gas"]
+    if meter_id:
+        meter_id = meter_id.strip().upper()  # meter_id is always stored uppercase — see app/filename.py
 
     results: list[ImageOut] = []
     for table in tables:
@@ -149,12 +200,14 @@ async def admin_get_image(item_id: int, _: CurrentUser = Depends(get_admin_or_se
 @router.delete("/admin/images/{item_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Admin Delete Image")
 async def admin_delete_image(item_id: int, _: CurrentUser = Depends(get_current_admin)):
     """
-    Deletes just this one image (+ its own ocr_jobs row, if it happens to
-    be a group anchor with one). NOTE: if item_id is a group anchor with
-    other images still in the same burst group, those siblings are left
-    behind with group_id pointing at a now-gone row — they're not
-    auto-deleted or re-anchored. Harmless (group_id is a plain value, not
-    an enforced FK) but worth knowing before deleting an anchor.
+    Deletes just this one image. If item_id happens to be a group's
+    anchor (is_anchor=true), its ocr_jobs row(s) are cleaned up too —
+    same as before, just keyed off is_anchor now instead of the old
+    "group_id equals my own id" self-reference. NOTE: other images still
+    in the same burst group are left behind with group_id pointing at a
+    group whose anchor is now gone — they're not auto-deleted or
+    re-anchored. Harmless (group_id is a plain value, not an enforced
+    FK) but worth knowing before deleting an anchor.
     """
     table, row = await get_image_row(item_id)
     if table is None:
@@ -162,7 +215,8 @@ async def admin_delete_image(item_id: int, _: CurrentUser = Depends(get_current_
 
     async with pool().acquire() as conn:
         async with conn.transaction():
-            await conn.execute("DELETE FROM ocr_jobs WHERE image_id = $1", item_id)
+            if row["is_anchor"]:
+                await conn.execute("DELETE FROM ocr_jobs WHERE group_id = $1", row["group_id"])
             await conn.execute(f"DELETE FROM {table} WHERE id = $1", item_id)
 
     storage.delete_files(item_id, row["original_filename"])
@@ -187,7 +241,7 @@ async def admin_reprocess_image(item_id: int, _: CurrentUser = Depends(get_curre
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
 
     group_id = row["group_id"]
-    anchor = await pool().fetchrow(f"SELECT * FROM {table} WHERE id = $1", group_id)
+    anchor = await pool().fetchrow(f"SELECT * FROM {table} WHERE group_id = $1 AND is_anchor = true", group_id)
     if anchor is None:
         # Anchor was deleted separately (see admin_delete_image's note) —
         # fall back to this image's own data so reprocess still works.
@@ -195,16 +249,7 @@ async def admin_reprocess_image(item_id: int, _: CurrentUser = Depends(get_curre
 
     async with pool().acquire() as conn:
         async with conn.transaction():
-            await conn.execute(
-                """
-                INSERT INTO ocr_jobs (image_id, meter_id, original_filename, device_timestamp, status)
-                VALUES ($1, $2, $3, $4, 'queued')
-                """,
-                group_id,
-                anchor["meter_id"],
-                anchor["original_filename"],
-                anchor["device_timestamp"],
-            )
+            await finalize_group(conn, anchor)
             await conn.execute(f"UPDATE {table} SET ocr_status = 'pending' WHERE group_id = $1", group_id)
             updated = await conn.fetchrow(f"SELECT * FROM {table} WHERE id = $1", item_id)
     return image_out(table, updated)
@@ -221,15 +266,11 @@ async def admin_get_image_file(item_id: int, _: CurrentUser = Depends(get_admin_
     return FileResponse(path, media_type="image/jpeg")
 
 
-@router.get("/admin/images/{item_id}/ocr-result-file", summary="Admin Get Image Ocr Result File")
-async def admin_get_ocr_result_file(item_id: int, _: CurrentUser = Depends(get_admin_or_service)):
-    table, row = await get_image_row(item_id)
-    if table is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
-    path = storage.ocr_result_path(item_id, row["original_filename"])
-    if not path.exists():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No OCR result image for this item yet")
-    return FileResponse(path, media_type="image/jpeg")
+# GET .../ocr-result-file removed — there's no separate "OCR result"
+# file anymore (see app/routers/ocr_jobs.py's /result docstring). For
+# the same image on an error/anomaly row, use this same endpoint
+# (/admin/images/{item_id}/file) — ocr_meter.image_error names exactly
+# this file, nothing new was ever written.
 
 
 @router.put("/admin/images/{item_id}/ocr-manual", summary="Admin Edit Ocr Manually")
@@ -240,11 +281,13 @@ async def admin_edit_ocr_manually(
 ):
     """
     Overwrites ocr_reading on this image's group's most recent ocr_jobs
-    row and records why, in admin_reason. ocr_jobs.image_id always points
-    at a group's anchor (see db/init.sql), never at an arbitrary member
-    image directly — so this looks the job up via item_id's group_id, not
-    item_id itself. Per db/init.sql there is no column that preserves the
-    OCR-produced value once an admin overwrites it here.
+    row. Looks the job up via item_id's group_id (works the same whether
+    item_id is the anchor or any other image in the group, since every
+    image in a group shares one group_id value now — unlike the old
+    numeric scheme, where only the anchor's own id equaled group_id).
+    Per db/init.sql there is no column that preserves the OCR-produced
+    value once an admin overwrites it here, and no column that records
+    why (admin_reason was removed).
     """
     table, image_row = await get_image_row(item_id)
     if table is None:
@@ -252,7 +295,7 @@ async def admin_edit_ocr_manually(
 
     group_id = image_row["group_id"]
     latest_job = await pool().fetchrow(
-        "SELECT id FROM ocr_jobs WHERE image_id = $1 ORDER BY id DESC LIMIT 1",
+        "SELECT id FROM ocr_jobs WHERE group_id = $1 ORDER BY id DESC LIMIT 1",
         group_id,
     )
     if latest_job is None:
@@ -266,12 +309,11 @@ async def admin_edit_ocr_manually(
             updated_job = await conn.fetchrow(
                 """
                 UPDATE ocr_jobs
-                SET ocr_reading = $1, admin_reason = $2, status = 'done'
-                WHERE id = $3
+                SET ocr_reading = $1, status = 'done'
+                WHERE id = $2
                 RETURNING *
                 """,
                 body.ocr_reading,
-                body.admin_reason,
                 latest_job["id"],
             )
             await conn.execute(f"UPDATE {table} SET ocr_status = 'done' WHERE group_id = $1", group_id)

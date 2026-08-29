@@ -6,7 +6,10 @@ from pydantic import BaseModel, Field
 MeterType = Literal["electric", "water", "gas"]
 OcrStatus = Literal["pending", "done", "failed"]
 JobStatus = Literal["queued", "processing", "done", "failed"]
-OcrErrorType = Literal["no_digits_found", "image_unreadable", "reading_decreased", "usage_anomaly"]
+# 0 = อ่านสำเร็จ, 1 = อ่านเลขมิเตอร์ไม่ได้, 2 = หาตัวเลข/มิเตอร์ไม่เจอเลย,
+# 3 = อ่านได้ค่าแต่ผิดปกติ (รวม reading_decreased/usage_anomaly เดิม) —
+# ความหมายเต็มอยู่ที่ตาราง error_type ใน DB (single source of truth)
+OcrErrorType = Literal[0, 1, 2, 3]
 
 
 # --------------------------------------------------------------------------
@@ -53,20 +56,22 @@ class ImageOut(BaseModel):
     original_filename: str | None
     device_timestamp: dt.datetime | None
     ocr_status: OcrStatus
-    group_id: int
+    group_id: str
     received_at: dt.datetime
 
 
 class ImageUploadResponse(BaseModel):
     """
-    ocr_job_id is always null here now — with time-based grouping, a job
-    is never created synchronously at upload time. It's created later by
-    the background sweep once the group's window closes (see
-    app/grouping.py). Check GET /admin/images/{id} afterward, or poll
-    GET /admin/images/ocr?meter_id=... to see the job once it exists.
+    ocr_job_id is non-null only when this upload was the one that
+    completed the group (settings.image_group_size images reached) —
+    the fast path in app/routers/images.py finalizes into ocr_jobs
+    immediately in that case, no waiting for the background sweep. If
+    the group isn't complete yet, ocr_job_id stays null and the job gets
+    created later by the time-based fallback (app/grouping.py) once the
+    window closes — whichever comes first.
     """
     image: ImageOut
-    group_id: int
+    group_id: str
     ocr_job_id: int | None = None
 
 
@@ -74,7 +79,7 @@ class MeterHistoryEntry(BaseModel):
     image_id: int
     device_timestamp: dt.datetime | None
     ocr_status: OcrStatus
-    group_id: int
+    group_id: str
     latest_ocr_reading: float | None
     latest_job_status: JobStatus | None
 
@@ -84,15 +89,13 @@ class MeterHistoryEntry(BaseModel):
 # --------------------------------------------------------------------------
 class OcrJobOut(BaseModel):
     id: int
-    image_id: int
+    group_id: str
     meter_id: str
     original_filename: str | None
     device_timestamp: dt.datetime | None
     ocr_reading: float | None
     status: JobStatus
     attempts: int
-    last_error: str | None
-    admin_reason: str | None
 
 
 class OcrClaimResponse(BaseModel):
@@ -113,23 +116,29 @@ class OcrFailRequest(BaseModel):
 
 class OcrManualEditRequest(BaseModel):
     ocr_reading: float
-    admin_reason: str = Field(min_length=1, max_length=2000)
 
 
 # --------------------------------------------------------------------------
 # ocr_meter — clean, standalone OCR results table (no FK back to
-# images_*/ocr_jobs on purpose). One row per *finished* OCR attempt —
-# either a real reading, or one of the 3 known error_type cases. Written
-# by POST /admin/images/ocr/{job_id}/result. See db/init.sql for the
-# full column-by-column rationale.
+# images_*/ocr_jobs on purpose). One row per *finished* OCR attempt.
+# Written by POST /admin/images/ocr/{job_id}/result. error_type is always
+# present (0/1/2/3 — see db/init.sql's error_type lookup table for what
+# each code means). group_id is copied from the job (E1/W3/G12 — see
+# db/init.sql). reading_date/reading_time are the ESP32's capture time
+# (job.device_timestamp), not when OCR ran. image_error is only ever set
+# when error_type != 0 — the SAME filename the group's anchor image was
+# already stored under at upload time (no separate file, no re-upload —
+# the OCR client no longer attaches anything here at all), for a human
+# to review; never set on a clean successful read (error_type=0).
+# (Column used to be called ocr_image_filename.)
 # --------------------------------------------------------------------------
 class OcrMeterEntry(BaseModel):
     id: int
     meter_id: str
+    group_id: str
     reading_date: dt.date
     reading_time: dt.time
     ocr_reading: float | None
-    error_type: OcrErrorType | None
-    error_detail: str | None
-    ocr_image_filename: str | None
+    error_type: OcrErrorType
+    image_error: str | None
 
