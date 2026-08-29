@@ -418,6 +418,16 @@ BEGIN
     FROM information_schema.columns WHERE table_name = 'ocr_meter';
 
     IF actual_order IS DISTINCT FROM correct_order THEN
+        -- ocr_meter.id เดิมสร้างด้วย BIGSERIAL ตอน fresh install — Postgres
+        -- ผูก ocr_meter_id_seq ให้เป็นของ (OWNED BY) column นี้โดยอัตโนมัติ
+        -- ถ้าไม่ตัดความเป็นเจ้าของออกก่อน ตอน DROP TABLE ocr_meter ด้านล่าง
+        -- Postgres จะพยายามลบ sequence ตามไปด้วย (เพราะเป็นเจ้าของ) แต่ลบ
+        -- ไม่ได้เพราะ ocr_meter_reordered ที่เพิ่งสร้างก็อ้างอิง sequence
+        -- เดียวกันอยู่ — ชนกัน error "cannot drop table ... other objects
+        -- depend on it" (เจอจริงตอน deploy) แก้โดยตัดความเป็นเจ้าของออก
+        -- ก่อน ให้ sequence ลอยอิสระ ไม่ผูกกับตารางไหนจนกว่าจะผูกใหม่ด้านล่าง
+        ALTER SEQUENCE ocr_meter_id_seq OWNED BY NONE;
+
         CREATE TABLE ocr_meter_reordered (
             id            BIGINT      PRIMARY KEY DEFAULT nextval('ocr_meter_id_seq'),
             meter_id      TEXT        NOT NULL,
@@ -435,6 +445,10 @@ BEGIN
         ALTER TABLE ocr_meter_reordered RENAME TO ocr_meter;
         ALTER TABLE ocr_meter RENAME CONSTRAINT ocr_meter_reordered_pkey TO ocr_meter_pkey;
         ALTER TABLE ocr_meter RENAME CONSTRAINT ocr_meter_reordered_error_type_fkey TO ocr_meter_error_type_fkey;
+        -- ผูก sequence กลับเข้ากับ column ใหม่ให้เรียบร้อย (ไม่จำเป็นต่อการ
+        -- ทำงาน แค่ให้ Postgres จัดการ sequence ให้อัตโนมัติเวลา DROP TABLE
+        -- ในอนาคต เหมือนตอนที่เป็น BIGSERIAL แต่แรก)
+        ALTER SEQUENCE ocr_meter_id_seq OWNED BY ocr_meter.id;
     END IF;
 END $$;
 
