@@ -11,7 +11,7 @@ piece by piece against docs/config as they come in. Tracking here so
 nothing gets silently re-guessed or re-flipped:
 
 **Confirmed, implemented:**
-- `error_type` is a plain integer 0/1/2/3 (not free-form text) — meanings live in the `error_type` lookup table (`db/init.sql`), server owns the definitions, OCR client just reports the code. Case 3 ("read a value, but anomalous") replaces the old `reading_decreased`/`usage_anomaly` text values as one combined case — still client-computed, server doesn't run this check. `error_detail` column removed from `ocr_meter`. `reading_date`/`reading_time` derived server-side from the job's `device_timestamp` now, never client-supplied. **No file upload on `/result` at all anymore** — it's plain form fields, not multipart; the old `result_image` field is gone (see "ocr_meter" below for why — it was a real risk, not just unnecessary). `ocr_meter.ocr_image_filename` renamed to `image_error`, and its value is now just the job's own `original_filename` (the anchor's already-stored file), not a separately uploaded one. `GET /admin/images/{item_id}/ocr-result-file` (original spec) removed accordingly — use `/file` instead. `meter_id` stored uppercase everywhere (was lowercase). `ocr_jobs.last_error`/`admin_reason` columns removed (not persisted anywhere now — `/fail`'s error message only reaches the server log). `group_id` is now the E1/W3/G12-style text code directly (the old numeric `group_id`/self-reference anchor mechanism and the separate `group_label` column from an earlier revision are both gone — merged into one `group_id` column, with a new `is_anchor` boolean replacing the self-reference trick), on `images_*`/`ocr_jobs`. A group also now finalizes into `ocr_jobs` immediately once it reaches `IMAGE_GROUP_SIZE` (3) images, not just on the 60s window fallback. **`ocr_meter` does NOT carry `group_id`** — briefly did in an intermediate revision, confirmed removed: `ocr_meter` is exactly 6 fields (`meter_id`, `reading_date`, `reading_time`, `ocr_reading`, `error_type`, `image_error`), nothing else, group tracking is an `images_*`/`ocr_jobs`-internal concern only. See "ocr_meter", "group_id", and "Burst upload grouping" sections below.
+- `error_type` is a plain integer 0/1/2/3 (not free-form text) — meanings live in the `error_type` lookup table (`db/init.sql`), server owns the definitions, OCR client just reports the code. Case 3 ("read a value, but anomalous") replaces the old `reading_decreased`/`usage_anomaly` text values as one combined case — still client-computed, server doesn't run this check. `error_detail` column removed from `ocr_meter`. `capture_date`/`capture_time` derived server-side from the job's `device_timestamp` now, never client-supplied. **No file upload on `/result` at all anymore** — it's plain form fields, not multipart; the old `result_image` field is gone (see "ocr_meter" below for why — it was a real risk, not just unnecessary). `ocr_meter.ocr_image_filename` renamed to `image_error`, and its value is now just the job's own `original_filename` (the anchor's already-stored file), not a separately uploaded one. `GET /admin/images/{item_id}/ocr-result-file` (original spec) removed accordingly — use `/file` instead. `meter_id` stored uppercase everywhere (was lowercase). `ocr_jobs.last_error`/`admin_reason` columns removed (not persisted anywhere now — `/fail`'s error message only reaches the server log). `group_id` is now the E1/W3/G12-style text code directly (the old numeric `group_id`/self-reference anchor mechanism and the separate `group_label` column from an earlier revision are both gone — merged into one `group_id` column, with a new `is_anchor` boolean replacing the self-reference trick), on `images_*`/`ocr_jobs`. A group also now finalizes into `ocr_jobs` immediately once it reaches `IMAGE_GROUP_SIZE` (3) images, not just on the 60s window fallback. **`ocr_meter` does NOT carry `group_id`** — briefly did in an intermediate revision, confirmed removed: `ocr_meter` is exactly 6 fields (`meter_id`, `capture_date`, `capture_time`, `ocr_reading`, `error_type`, `image_error`), nothing else, group tracking is an `images_*`/`ocr_jobs`-internal concern only. See "ocr_meter", "group_id", and "Burst upload grouping" sections below.
 - `DB_HOST=timescaledb` (container name on `innovation_net`), **not** the host's own IP `192.168.248.199` — connecting via the host's external IP timed out from inside the container (self-referential/hairpin routing back to its own host), confirmed via `docker network inspect innovation_net` while debugging the actual deploy. `timescaledb` and `ocr-meter-store` are both already on that network, so Docker's internal DNS resolves it directly — no IP needed at all.
 - `ocr_jobs` is one shared table across meter types (per `db/init.sql`) — not split into `ocr_jobs_electric/water/gas`.
 - Upload filename convention: `{meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg`, meter_id/device_timestamp parsed from it (Thailand local time, UTC+7), invalid meter_id prefix → HTTP 400.
@@ -26,13 +26,12 @@ nothing gets silently re-guessed or re-flipped:
 - **New `ocr_meter` table** (replaces the old "ocr_jobs only" results model) — a clean, standalone results table with no FK back to `images_*`/`ocr_jobs`, meant to be handed off to the external Store system. `ocr_jobs` stays exactly as before as the *internal* job queue (state machine, `attempts` cap, retry-storm guard) — the two are deliberately decoupled. Confirmed via 3 explicit answers:
   - Queue (`ocr_jobs`) and results (`ocr_meter`) are two separate tables, not one.
   - The OCR client computes the month-over-month "reading decreased" comparison itself (pulls history via the new `GET /admin/meters/{meter_id}/ocr-readings` endpoint), not the server.
-  - `reading_date`/`reading_time` are two separate DB columns (`DATE` + `TIME`), not one combined timestamp.
+  - `capture_date`/`capture_time` are two separate DB columns (`DATE` + `TIME`), not one combined timestamp.
   - See `db/init.sql` and `app/routers/ocr_jobs.py`'s `/result` endpoint for the full design. (Previously shipped as a standalone `db/add-ocr-meter.sql` migration — merged into `init.sql` itself now, which is safe to (re-)run against any DB state: fresh, pre-`ocr_meter`, or already up to date.)
 
 **Still open — not confirmed from what you've shared:**
 - `get_admin_or_service()` (the combined admin-JWT-or-service-key dependency on the read-mostly `/admin/images*`/`/admin/meters/*` routes) is my own addition — I don't have confirmation this exists in your real code, or what it actually requires.
 - Whether the JWT-login path for `/images/upload` and `/admin/images/ocr/*` also requires `is_device`/`is_admin` on the logged-in user, or accepts any authenticated account.
-- `ocr_client_poller.py` — the version I wrote earlier in this conversation (text only, not yet a file) will need updating for the new `/result` request shape (multipart with `reading_date`/`reading_time`/`error_type`, not a plain JSON `ocr_reading`) and to call the new `/ocr-readings` endpoint for its own history check — ask if you want that regenerated.
 - `GET /admin/meters/{meter_id}/ocr-readings` is a brand new endpoint, not part of the original confirmed Swagger list — added specifically to support the OCR client's month-over-month comparison. Flag if it should be named/shaped differently, or if it should require `OCR_CLIENT_KEY` specifically rather than any admin-or-service credential.
 
 ## Endpoints implemented
@@ -189,7 +188,7 @@ multipart/form-data:
 | `ocr_reading` | codes 0, 3 only | must be omitted for codes 1, 2 |
 | `error_type` | always | integer 0/1/2/3 — see table above |
 
-**`reading_date`/`reading_time` are no longer sent by the client at
+**`capture_date`/`capture_time` are no longer sent by the client at
 all** — the server derives them itself from the job's own
 `device_timestamp` (when the ESP32 captured the photo), not from
 whenever OCR happened to run. **`error_detail` is gone too** — human-
@@ -326,7 +325,7 @@ shots a few seconds apart). Confirmed design:
    (plural — a list, one URL per image sharing the job's `group_id`).
 4. `POST /admin/images/ocr/{job_id}/result` — see the `ocr_meter` section
    above for the full current shape (`error_type` 0-3,
-   `reading_date`/`reading_time` no longer client-supplied, `error_detail`
+   `capture_date`/`capture_time` no longer client-supplied, `error_detail`
    gone). Internally, every image in the group gets `ocr_status` updated
    together (not just the anchor).
 
@@ -429,8 +428,7 @@ curl -s -X POST http://localhost:3003/admin/images/ocr/1/claim \
 
 curl -s -X POST http://localhost:3003/admin/images/ocr/1/result \
     -H 'X-OCR-Key: dev-ocr-key-not-for-production' \
-    -F 'reading_date=2026-08-18' -F 'reading_time=15:12:45' \
-    -F 'ocr_reading=12345'
+    -F 'ocr_reading=12345' -F 'error_type=0'
 
 # 5. list images as admin
 curl -s http://localhost:3003/admin/images -H "Authorization: Bearer $TOKEN"

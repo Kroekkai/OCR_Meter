@@ -214,6 +214,44 @@ BEGIN
     ALTER TABLE ocr_jobs DROP COLUMN IF EXISTS admin_reason;
 END $$;
 
+-- ย้าย group_id ให้อยู่หน้า original_filename (ตามที่ยืนยัน) — Postgres
+-- ไม่มีคำสั่ง "ย้ายคอลัมน์" ตรงๆ เลย (ต่างจาก RENAME/DROP ที่มีคำสั่ง
+-- ตรงๆ ให้ใช้) ทางเดียวที่ทำได้จริงคือสร้างตารางใหม่ด้วยลำดับคอลัมน์ที่
+-- ต้องการ ย้ายข้อมูลเข้าไป แล้วสลับตารางเก่ากับใหม่ — DB ที่ผ่านการ
+-- migrate มาหลายรอบ (image_id -> group_id -> group_label -> group_id
+-- อีกที) มักจบด้วย group_id ไปอยู่ท้ายตาราง (เพราะ ALTER TABLE ADD
+-- COLUMN ต่อท้ายเสมอ) ไม่ใช่อยู่หน้า meter_id/original_filename แบบที่
+-- CREATE TABLE ด้านบนกำหนดไว้ตอน fresh install — เช็คก่อนว่าลำดับตอนนี้
+-- ผิดจริงไหม (no-op ถ้าตรงอยู่แล้ว ปลอดภัยรันซ้ำได้)
+DO $$
+DECLARE
+    correct_order TEXT[] := ARRAY['id','group_id','meter_id','original_filename','device_timestamp','ocr_reading','status','attempts'];
+    actual_order TEXT[];
+BEGIN
+    SELECT array_agg(column_name ORDER BY ordinal_position) INTO actual_order
+    FROM information_schema.columns WHERE table_name = 'ocr_jobs';
+
+    IF actual_order IS DISTINCT FROM correct_order THEN
+        CREATE TABLE ocr_jobs_reordered (
+            id                BIGINT      PRIMARY KEY,
+            group_id          TEXT        NOT NULL,
+            meter_id          TEXT        NOT NULL,
+            original_filename TEXT,
+            device_timestamp  TIMESTAMPTZ,
+            ocr_reading       NUMERIC,
+            status            TEXT        NOT NULL DEFAULT 'queued',
+            attempts          BIGINT      NOT NULL DEFAULT 0
+        );
+        INSERT INTO ocr_jobs_reordered (id, group_id, meter_id, original_filename, device_timestamp, ocr_reading, status, attempts)
+            SELECT id, group_id, meter_id, original_filename, device_timestamp, ocr_reading, status, attempts
+            FROM ocr_jobs
+            ORDER BY id;
+        DROP TABLE ocr_jobs;
+        ALTER TABLE ocr_jobs_reordered RENAME TO ocr_jobs;
+        ALTER TABLE ocr_jobs ALTER COLUMN id SET DEFAULT nextval('ocr_jobs_id_seq');
+    END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_ocr_jobs_group_id ON ocr_jobs (group_id);
 
 -- error_type — ตาราง lookup อธิบายความหมายของรหัส error_type ที่ใช้ใน
@@ -255,9 +293,11 @@ ON CONFLICT (code) DO NOTHING;
 -- ดูคำอธิบายเต็มที่ตาราง error_type ด้านบน — OCR client ส่งแค่ตัวเลขนี้
 -- กลับมา ไม่ต้องรู้ความหมายเอง
 --
--- reading_date/reading_time: เวลาที่ ESP32 **ถ่ายภาพ** (มาจาก
+-- capture_date/capture_time: เวลาที่ ESP32 **ถ่ายภาพ** (มาจาก
 -- ocr_jobs.device_timestamp ของ job นั้น) ไม่ใช่เวลาที่ OCR ประมวลผล —
 -- server เป็นคนเติมให้เองจาก device_timestamp ไม่ใช่ค่าที่ OCR client ส่งมา
+-- (ชื่อเดิมคือ reading_date/reading_time — เปลี่ยนชื่อให้สื่อความหมาย
+-- ตรงขึ้นว่าเป็นเวลาที่ "ถ่ายภาพ" ไม่ใช่เวลาที่ "อ่านค่า/ประมวลผล")
 --
 -- image_error: ใส่เฉพาะตอน error_type != 0 เท่านั้น (1, 2, หรือ 3
 -- — ไม่ใส่ตอนสำเร็จเปล่าๆ error_type=0) เป็น**ชื่อไฟล์เดียวกับที่หัวกลุ่ม
@@ -267,18 +307,21 @@ ON CONFLICT (code) DO NOTHING;
 -- เสี่ยงชื่อไฟล์ชนกับภาพอื่นในกลุ่มเอง ไม่มีประโยชน์อะไรเพิ่ม) แค่ชี้กลับ
 -- ไปที่ไฟล์ที่มีอยู่แล้วในเครื่อง ให้คนอ่านตรวจสอบตอนเกิด error/ผิดปกติ
 -- (ชื่อคอลัมน์เดิมคือ ocr_image_filename — เปลี่ยนเป็น image_error ให้
--- สื่อความหมายตรงขึ้น เพราะมีค่าเฉพาะตอนเกิด error เท่านั้น)
+-- สื่อความหมายตรงขึ้น เพราะมีค่าเฉพาะตอนเกิด error เท่านั้น) — column
+-- นี้ตั้งใจให้อยู่**หลัง** error_type เสมอ (ลำดับคอลัมน์ที่เห็นตอน
+-- SELECT * — ดู DO block ท้าย section นี้ที่จัดลำดับให้ ถ้า DB เดิมมี
+-- image_error อยู่ก่อน error_type จากการ migrate มาหลายรอบ)
 --
--- ตารางนี้ตั้งใจให้มีแค่ 6 field ตามที่ยืนยัน (meter_id, reading_date,
--- reading_time, ocr_reading, error_type, image_error) — ไม่มี group_id
+-- ตารางนี้ตั้งใจให้มีแค่ 6 field ตามที่ยืนยัน (meter_id, capture_date,
+-- capture_time, ocr_reading, error_type, image_error) — ไม่มี group_id
 -- ในตารางนี้แล้ว (เคยมีอยู่ช่วงสั้นๆ ตอนรวม column กับ ocr_jobs แต่ตัด
 -- ออกตามที่ขอ — group_id ยังใช้เป็นกลไกภายในต่อใน images_*/ocr_jobs
 -- ตามเดิม แค่ไม่ก็อปมาใส่ตารางผลลัพธ์นี้อีกต่อไป)
 CREATE TABLE IF NOT EXISTS ocr_meter (
     id                  BIGSERIAL   PRIMARY KEY,
     meter_id            TEXT        NOT NULL,
-    reading_date        DATE        NOT NULL,
-    reading_time        TIME        NOT NULL,
+    capture_date        DATE        NOT NULL,
+    capture_time        TIME        NOT NULL,
     ocr_reading         NUMERIC,
     error_type          INTEGER     NOT NULL REFERENCES error_type(code),
     image_error         TEXT
@@ -327,23 +370,71 @@ BEGIN
     -- เหมือนเดิม แค่ไม่ไหลมาถึงตารางผลลัพธ์นี้)
     ALTER TABLE ocr_meter DROP COLUMN IF EXISTS group_id;
     ALTER TABLE ocr_meter DROP COLUMN IF EXISTS group_label;
+    -- reading_date/reading_time -> capture_date/capture_time (เปลี่ยนชื่อ
+    -- ให้สื่อความหมายตรงขึ้นว่าเป็นเวลาที่ถ่ายภาพ)
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'ocr_meter' AND column_name = 'reading_date'
+    ) THEN
+        ALTER TABLE ocr_meter RENAME COLUMN reading_date TO capture_date;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'ocr_meter' AND column_name = 'reading_time'
+    ) THEN
+        ALTER TABLE ocr_meter RENAME COLUMN reading_time TO capture_time;
+    END IF;
     -- reading_timestamp เดียว (TIMESTAMPTZ) จากรอบทดลองสั้นๆ ที่ยกเลิก
-    -- ไปแล้ว -> แยกกลับเป็น reading_date + reading_time เหมือนเดิม — แปลง
+    -- ไปแล้ว -> แยกกลับเป็น capture_date + capture_time เหมือนเดิม — แปลง
     -- กลับเป็นเวลาไทย (Bangkok, UTC+7) local ก่อนแยก เพราะ TIMESTAMPTZ
     -- เก็บเป็น UTC ภายใน ถ้าแยกตรงๆ โดยไม่แปลงโซนก่อน วันที่/เวลาจะเพี้ยน
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name = 'ocr_meter' AND column_name = 'reading_timestamp'
     ) THEN
-        ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS reading_date DATE;
-        ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS reading_time TIME;
+        ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS capture_date DATE;
+        ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS capture_time TIME;
         UPDATE ocr_meter
-        SET reading_date = (reading_timestamp AT TIME ZONE 'Asia/Bangkok')::DATE,
-            reading_time = (reading_timestamp AT TIME ZONE 'Asia/Bangkok')::TIME
-        WHERE reading_date IS NULL;
+        SET capture_date = (reading_timestamp AT TIME ZONE 'Asia/Bangkok')::DATE,
+            capture_time = (reading_timestamp AT TIME ZONE 'Asia/Bangkok')::TIME
+        WHERE capture_date IS NULL;
         ALTER TABLE ocr_meter DROP COLUMN reading_timestamp;
-        ALTER TABLE ocr_meter ALTER COLUMN reading_date SET NOT NULL;
-        ALTER TABLE ocr_meter ALTER COLUMN reading_time SET NOT NULL;
+        ALTER TABLE ocr_meter ALTER COLUMN capture_date SET NOT NULL;
+        ALTER TABLE ocr_meter ALTER COLUMN capture_time SET NOT NULL;
+    END IF;
+END $$;
+
+-- จัดลำดับคอลัมน์ให้ตรงกับ CREATE TABLE ด้านบนเป๊ะ (error_type ต้องมา
+-- ก่อน image_error เสมอ) — ใช้วิธีเดียวกับ ocr_jobs ด้านบน (สร้างตาราง
+-- ใหม่ตามลำดับที่ต้องการ ย้ายข้อมูล แล้วสลับตาราง) เพราะรับประกันลำดับ
+-- ที่ถูกต้องแน่นอน ต่างจากการ drop+recreate ทีละคอลัมน์ที่แค่ "ค่อนข้าง
+-- ถูก" — no-op ถ้าลำดับตรงอยู่แล้ว ปลอดภัยรันซ้ำได้
+DO $$
+DECLARE
+    correct_order TEXT[] := ARRAY['id','meter_id','capture_date','capture_time','ocr_reading','error_type','image_error'];
+    actual_order TEXT[];
+BEGIN
+    SELECT array_agg(column_name ORDER BY ordinal_position) INTO actual_order
+    FROM information_schema.columns WHERE table_name = 'ocr_meter';
+
+    IF actual_order IS DISTINCT FROM correct_order THEN
+        CREATE TABLE ocr_meter_reordered (
+            id            BIGINT      PRIMARY KEY DEFAULT nextval('ocr_meter_id_seq'),
+            meter_id      TEXT        NOT NULL,
+            capture_date  DATE        NOT NULL,
+            capture_time  TIME        NOT NULL,
+            ocr_reading   NUMERIC,
+            error_type    INTEGER     NOT NULL REFERENCES error_type(code),
+            image_error   TEXT
+        );
+        INSERT INTO ocr_meter_reordered (id, meter_id, capture_date, capture_time, ocr_reading, error_type, image_error)
+            SELECT id, meter_id, capture_date, capture_time, ocr_reading, error_type, image_error
+            FROM ocr_meter
+            ORDER BY id;
+        DROP TABLE ocr_meter;
+        ALTER TABLE ocr_meter_reordered RENAME TO ocr_meter;
+        ALTER TABLE ocr_meter RENAME CONSTRAINT ocr_meter_reordered_pkey TO ocr_meter_pkey;
+        ALTER TABLE ocr_meter RENAME CONSTRAINT ocr_meter_reordered_error_type_fkey TO ocr_meter_error_type_fkey;
     END IF;
 END $$;
 
@@ -352,8 +443,8 @@ ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_error_type_check;
 ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_error_type_fkey;
 ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_error_type_fkey FOREIGN KEY (error_type) REFERENCES error_type(code);
 
--- reading_date DESC, reading_time DESC รองรับ query แบบที่ OCR client
+-- capture_date DESC, capture_time DESC รองรับ query แบบที่ OCR client
 -- ต้องใช้บ่อยที่สุด: "ค่าล่าสุดของมิเตอร์นี้คือเท่าไหร่" — DROP ก่อนเผื่อ
 -- ยังมี index ชื่อเดิมค้างจาก definition ที่ต่างออกไป
 DROP INDEX IF EXISTS idx_ocr_meter_meter_id;
-CREATE INDEX IF NOT EXISTS idx_ocr_meter_meter_id ON ocr_meter (meter_id, reading_date DESC, reading_time DESC);
+CREATE INDEX IF NOT EXISTS idx_ocr_meter_meter_id ON ocr_meter (meter_id, capture_date DESC, capture_time DESC);

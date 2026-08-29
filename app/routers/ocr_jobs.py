@@ -22,15 +22,16 @@ def _meter_out(row) -> OcrMeterEntry:
     return OcrMeterEntry(**dict(row))
 
 
-def _reading_date_time_from_device_timestamp(device_timestamp: dt.datetime | None) -> tuple[dt.date, dt.time]:
+def _capture_date_time_from_device_timestamp(device_timestamp: dt.datetime | None) -> tuple[dt.date, dt.time]:
     """
-    reading_date/reading_time mean "when ESP32 captured the photo", not
+    capture_date/capture_time mean "when ESP32 captured the photo", not
     "when OCR ran" — pulled from the job's own device_timestamp (already
     stored, denormalized from the anchor image) rather than anything the
     OCR client sends. device_timestamp comes back from asyncpg as a
     UTC-aware datetime (Postgres stores TIMESTAMPTZ as UTC internally) —
     convert back to Bangkok local time first, or the date could be off
     by a day near midnight, and the time would be wrong by 7 hours.
+    (Function/columns used to be called reading_date/reading_time.)
 
     device_timestamp is nullable in the schema — falls back to the
     current server time (Bangkok) in the rare case it's missing, so this
@@ -144,7 +145,7 @@ async def admin_submit_ocr_result(
     client is still the one that checks history and decides, server just
     stores whichever code it reports.
 
-    reading_date/reading_time are no longer client-supplied — they're
+    capture_date/capture_time are no longer client-supplied — they're
     derived from the job's own device_timestamp (when ESP32 captured the
     photo), not from anything in this request. ocr_meter does NOT carry
     group_id (confirmed) — that's an internal images_*/ocr_jobs concern
@@ -197,7 +198,7 @@ async def admin_submit_ocr_result(
                     detail=f"Job {job_id} is '{job['status']}', not 'processing' — call /claim first",
                 )
 
-            reading_date, reading_time = _reading_date_time_from_device_timestamp(job["device_timestamp"])
+            capture_date, capture_time = _capture_date_time_from_device_timestamp(job["device_timestamp"])
 
             # No file write at all — just reference the anchor's filename,
             # already sitting on disk since the original ESP32 upload.
@@ -205,13 +206,13 @@ async def admin_submit_ocr_result(
 
             meter_row = await conn.fetchrow(
                 """
-                INSERT INTO ocr_meter (meter_id, reading_date, reading_time, ocr_reading, error_type, image_error)
+                INSERT INTO ocr_meter (meter_id, capture_date, capture_time, ocr_reading, error_type, image_error)
                 VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING *
                 """,
                 job["meter_id"],
-                reading_date,
-                reading_time,
+                capture_date,
+                capture_time,
                 ocr_reading,
                 error_type,
                 image_error,
