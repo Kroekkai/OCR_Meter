@@ -8,6 +8,7 @@ from app.db import pool, table_for_group_id
 from app.filename import BANGKOK_TZ
 from app.repo import get_group_images
 from app.schemas import JobStatus, OcrClaimResponse, OcrFailRequest, OcrJobOut, OcrMeterEntry
+from app import storage
 
 logger = logging.getLogger("ocr_meter_store.ocr_jobs")
 
@@ -153,11 +154,13 @@ async def admin_submit_ocr_result(
 
     No file upload here at all anymore — plain form fields, not
     multipart. ocr_meter.image_error (only set when error_type != 0) is
-    just the job's own original_filename — the SAME file the anchor
-    image was already stored under at upload time. The OCR client has no
-    image of its own to contribute here; it never captured anything,
-    ESP32 did, and that file is already on disk. An earlier version of
-    this endpoint accepted a re-uploaded copy via a result_image field —
+    the FULL disk path (via storage.original_path()) to the job's own
+    original_filename — the SAME file the anchor image was already
+    stored under at upload time, e.g. "/data/images/E101_..._01.jpg", not
+    just the bare filename. The OCR client has no image of its own to
+    contribute here; it never captured anything, ESP32 did, and that
+    file is already on disk. An earlier version of this endpoint
+    accepted a re-uploaded copy via a result_image field —
     removed, since it added nothing (the OCR client can only ever
     legitimately attach one of the group's own already-stored photos
     anyway) and could silently overwrite a *different* image in the same
@@ -202,7 +205,18 @@ async def admin_submit_ocr_result(
 
             # No file write at all — just reference the anchor's filename,
             # already sitting on disk since the original ESP32 upload.
-            image_error = job["original_filename"] if error_type != 0 else None
+            # image_error stores the FULL disk path now (e.g.
+            # "/data/images/E101_20260829_100000_01.jpg"), not just the
+            # bare filename — storage.original_path() is the single place
+            # that computes this path (same helper used to actually save/
+            # serve the file), so this is guaranteed to match reality.
+            # The filename itself (last path segment) is unchanged — still
+            # exactly the ESP32's original filename.
+            image_error = (
+                str(storage.original_path(job["group_id"], job["original_filename"]))
+                if error_type != 0
+                else None
+            )
 
             meter_row = await conn.fetchrow(
                 """

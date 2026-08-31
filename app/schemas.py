@@ -129,11 +129,14 @@ class OcrManualEditRequest(BaseModel):
 # for what each code means). capture_date/capture_time are the ESP32's
 # capture time (job.device_timestamp), not when OCR ran — column used to
 # be called reading_date/reading_time. image_error is only ever set when
-# error_type != 0 — the SAME filename the group's anchor image was
-# already stored under at upload time (no separate file, no re-upload —
-# the OCR client no longer attaches anything here at all), for a human
-# to review; never set on a clean successful read (error_type=0).
-# (Column used to be called ocr_image_filename.)
+# error_type != 0 — the FULL disk path to the group's anchor image (e.g.
+# "/data/images/E101_20260829_100000_01.jpg"), computed by
+# storage.original_path() — same file already stored at upload time, no
+# separate file, no re-upload (the OCR client no longer attaches
+# anything here at all), for a human to review; never set on a clean
+# successful read (error_type=0). (Column used to be called
+# ocr_image_filename, and before that stored just the bare filename
+# rather than the full path.)
 # --------------------------------------------------------------------------
 class OcrMeterEntry(BaseModel):
     id: int
