@@ -462,3 +462,41 @@ ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_error_type_fkey FOREIGN KEY (erro
 -- ยังมี index ชื่อเดิมค้างจาก definition ที่ต่างออกไป
 DROP INDEX IF EXISTS idx_ocr_meter_meter_id;
 CREATE INDEX IF NOT EXISTS idx_ocr_meter_meter_id ON ocr_meter (meter_id, capture_date DESC, capture_time DESC);
+
+-- --------------------------------------------------------------------------
+-- device_config — NOT part of the original confirmed spec. Added from a
+-- separate ESP32 "device configuration" API spec doc another team sent
+-- (GET /devices/config?meter_id=...) — see app/routers/device_config.py
+-- for the full explanation, including the gap this leaves open (no
+-- documented way for an admin to actually SET a meter's config, so the
+-- companion admin endpoint here is also my own addition, not in that spec).
+--
+-- date1/date2 stored as raw INTEGER[5] matching the wire format exactly
+-- ([Day, Month, Year, Hour, Minute]) — no attempt made to normalize this
+-- into real DATE/TIME columns, since the spec's own semantics don't map
+-- cleanly onto them (schedule_mode=0 uses only Hour/Minute and zeroes
+-- for Day/Month/Year; Postgres arrays round-trip through asyncpg as
+-- plain Python lists with no extra work, which is all this needs).
+CREATE TABLE IF NOT EXISTS device_config (
+    meter_id      TEXT      PRIMARY KEY,
+    schedule_mode INTEGER   NOT NULL DEFAULT 1 CHECK (schedule_mode IN (0, 1)),
+    date1         INTEGER[] NOT NULL DEFAULT ARRAY[26,0,0,8,0] CHECK (array_length(date1, 1) = 5),
+    date2         INTEGER[] NOT NULL DEFAULT ARRAY[0,0,0,0,0]  CHECK (array_length(date2, 1) = 5),
+    photo_count   INTEGER   NOT NULL DEFAULT 3 CHECK (photo_count BETWEEN 1 AND 10),
+    photo_delay   INTEGER   NOT NULL DEFAULT 5 CHECK (photo_delay BETWEEN 1 AND 60)
+);
+
+-- เผื่อ device_config มีอยู่แล้วจากรอบก่อนที่ยังไม่มี CHECK constraint —
+-- เพิ่มให้ครบ (DROP ก่อนกัน error "constraint already exists" ถ้าเคย
+-- เพิ่มไปแล้วบางส่วน) no-op บน fresh install เพราะ CREATE TABLE ด้านบน
+-- มี constraint ครบตั้งแต่ต้นอยู่แล้ว
+ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_schedule_mode_check;
+ALTER TABLE device_config ADD CONSTRAINT device_config_schedule_mode_check CHECK (schedule_mode IN (0, 1));
+ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_date1_check;
+ALTER TABLE device_config ADD CONSTRAINT device_config_date1_check CHECK (array_length(date1, 1) = 5);
+ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_date2_check;
+ALTER TABLE device_config ADD CONSTRAINT device_config_date2_check CHECK (array_length(date2, 1) = 5);
+ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_photo_count_check;
+ALTER TABLE device_config ADD CONSTRAINT device_config_photo_count_check CHECK (photo_count BETWEEN 1 AND 10);
+ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_photo_delay_check;
+ALTER TABLE device_config ADD CONSTRAINT device_config_photo_delay_check CHECK (photo_delay BETWEEN 1 AND 60);

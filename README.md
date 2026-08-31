@@ -58,6 +58,11 @@ GET    /admin/meters/{meter_id}/history
 GET    /admin/meters/{meter_id}/ocr-readings                     (NEW — not in original spec, see below)
 GET    /admin/images/{item_id}/file
 PUT    /admin/images/{item_id}/ocr-manual         [admin JWT]
+GET    /devices/config                                           (NEW — separate spec doc, see "device_config" below)
+GET    /admin/device-config                                      (NEW — not in that spec doc either, see below)
+GET    /admin/device-config/{meter_id}                           (NEW — not in that spec doc either, see below)
+PUT    /admin/device-config/{meter_id}            [admin JWT]     (NEW — not in that spec doc either, see below)
+DELETE /admin/device-config/{meter_id}            [admin JWT]     (NEW — not in that spec doc either, see below)
 ```
 
 `GET /admin/images/{item_id}/ocr-result-file` (in the original spec) was
@@ -475,6 +480,86 @@ docker compose exec ocr-meter-store python -m scripts.create_user \
   `docker-compose.yml` as specified; set `DB_USER`/
   `DB_PASSWORD`/`DB_NAME`/`JWT_SECRET`/`DEVICE_API_KEY`/
   `OCR_CLIENT_KEY` in `.env` (see `.env.example`).
+
+## `device_config` — ESP32 capture schedule, from a separate spec doc
+
+Not part of the original confirmed spec at all — came from a standalone
+"Device Configuration API Specification" doc another team sent,
+describing how ESP32 should fetch its own capture schedule.
+
+```bash
+curl "http://localhost:3003/devices/config?meter_id=E101" \
+    -H 'X-Device-Key: dev-device-key-not-for-production'
+```
+```json
+{"meter_id": "E101", "schedule_mode": 1, "date1": [26,0,0,8,0],
+ "date2": [0,0,0,0,0], "photo_count": 3, "photo_delay": 5}
+```
+
+- `schedule_mode`: `0` = program/daily mode, `1` = fix-date mode.
+- `date1`/`date2`: `[Day, Month, Year, Hour, Minute]`. In daily mode
+  only Hour/Minute are meaningful (Day/Month/Year sit at `0`); `date2`
+  stays `[0,0,0,0,0]` unless the meter has a second monthly cycle.
+- **A meter with no row yet always gets `DEFAULT_CONFIG` back, still
+  `200 OK`** — confirmed from the spec doc directly, never a 404.
+- **`is_default` (my own addition, not in the spec)** — `true` when this
+  response is `DEFAULT_CONFIG` because the meter has no row yet, `false`
+  when it's a genuinely stored config. ESP32 ignores the extra field
+  (harmless); a dashboard can use it to show "using default" vs
+  "customized" state.
+
+**Four things NOT in that spec doc, all my own additions — flag if
+any should be different:**
+
+1. **Auth** — the doc only showed a generic `Authorization: Bearer
+   <token>` example, no detail on what issues/validates that token.
+   This reuses `get_uploader` (the same dependency `/images/upload`
+   already uses) — accepts the existing `X-Device-Key`, an admin JWT,
+   **or** (confirmed against the real firmware source) the device key
+   sent RAW in the `Authorization` header with no `Bearer ` prefix at
+   all — `http.addHeader("Authorization", API_AUTH_BEARER_TOKEN)` in
+   `fetchDeviceConfigWiFi`/`fetchDeviceConfig4G`, no string
+   concatenation with `"Bearer "` anywhere in that code. A strict
+   `Authorization: Bearer <token>` parser would 401 this firmware
+   outright — `get_uploader` checks for the `bearer ` prefix first and
+   falls back to a direct key comparison when it's absent, so this
+   exact already-written ESP32 code works without any firmware changes.
+2. **`GET /admin/device-config`** — lists every meter that has an
+   explicit row (admin-or-service auth). Meters still running on
+   `DEFAULT_CONFIG` don't appear — there's nothing in the table for
+   them. `limit`/`offset` pagination, same pattern as everywhere else.
+3. **`GET /admin/device-config/{meter_id}`** — fetch one meter's config
+   for a dashboard's edit form to pre-fill. Falls back to
+   `DEFAULT_CONFIG` (`is_default: true`) the same way the ESP32-facing
+   endpoint does, rather than 404ing — opening "edit E999" for a
+   never-configured meter should show sensible starting values, not an
+   empty form.
+4. **`PUT /admin/device-config/{meter_id}`** — the spec doc only
+   describes ESP32 *reading* its config; it never says how one gets
+   *set* in the first place. Without some way to write a row, every
+   meter would read back the exact same hardcoded default forever. This
+   endpoint upserts by `meter_id` (admin JWT only, overwrites every
+   field — not a partial patch):
+```bash
+curl -X PUT http://localhost:3003/admin/device-config/E101 \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"schedule_mode":1,"date1":[26,0,0,8,0],"date2":[0,0,0,0,0],"photo_count":3,"photo_delay":5}'
+```
+5. **`DELETE /admin/device-config/{meter_id}`** — a dashboard "reset to
+   default" button. Removes the row entirely (admin JWT only);
+   idempotent — deleting an already-default meter is a no-op, not a
+   404. After this, every GET above goes back to `DEFAULT_CONFIG` for
+   that `meter_id`.
+
+`date1`/`date2` are stored as raw Postgres `INTEGER[]` (5 elements,
+`CHECK`-constrained to exactly 5), matching the wire format exactly —
+no attempt to normalize into real `DATE`/`TIME` columns, since
+`schedule_mode=0`'s semantics (only Hour/Minute meaningful) don't map
+cleanly onto them anyway. `schedule_mode`/`photo_count`/`photo_delay`
+also have `CHECK` constraints matching the spec's valid ranges
+(0-1, 1-10, 1-60) — enforced at the DB level, not just in the Pydantic
+request model, so a bad value can never land in the table regardless of
+how it got inserted.
 
 ## Things still worth double-checking
 

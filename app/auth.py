@@ -176,14 +176,31 @@ async def get_uploader(
     x_device_key: str | None = Header(default=None),
 ) -> CurrentUser:
     """
-    Auth for POST /images/upload: a real JWT login, OR (if configured)
-    DEVICE_API_KEY as a fixed shortcut for machine callers — see
-    settings.device_api_key / settings.device_api_key_username.
+    Auth for POST /images/upload and GET /devices/config: a real JWT
+    login, OR (if configured) DEVICE_API_KEY as a fixed shortcut for
+    machine callers — see settings.device_api_key /
+    settings.device_api_key_username.
+
+    Also accepts DEVICE_API_KEY sent RAW in the Authorization header,
+    with no "Bearer " prefix at all — confirmed from the actual ESP32
+    firmware source (fetchDeviceConfigWiFi/4G in the .ino):
+    `http.addHeader("Authorization", API_AUTH_BEARER_TOKEN)` — that's
+    the whole call, no string concatenation with "Bearer " anywhere. A
+    strict "Authorization: Bearer <token>" parser would reject this
+    firmware outright with 401. Checked BEFORE the JWT branch below,
+    since a real JWT always starts with "Bearer " and this raw form
+    never does — no ambiguity between the two.
     """
     settings = get_settings()
     via_key = await _try_static_key(x_device_key, settings.device_api_key, settings.device_api_key_username)
     if via_key is not None:
         return via_key
+    if authorization and not authorization.lower().startswith("bearer "):
+        via_raw_auth_header = await _try_static_key(
+            authorization, settings.device_api_key, settings.device_api_key_username
+        )
+        if via_raw_auth_header is not None:
+            return via_raw_auth_header
     if authorization:
         return await _user_from_header_token(authorization)
     raise HTTPException(

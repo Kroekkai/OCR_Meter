@@ -147,3 +147,35 @@ class OcrMeterEntry(BaseModel):
     error_type: OcrErrorType
     image_error: str | None
 
+
+# --------------------------------------------------------------------------
+# device_config — NOT part of the original confirmed spec. From a
+# separate ESP32 "device configuration" API spec doc another team sent
+# (GET /devices/config) — see app/routers/device_config.py.
+# --------------------------------------------------------------------------
+class DeviceConfigOut(BaseModel):
+    meter_id: str
+    schedule_mode: int  # 0 = program/daily mode, 1 = fix-date mode
+    date1: list[int]  # [Day, Month, Year, Hour, Minute] — primary schedule
+    date2: list[int]  # same shape — secondary schedule, [0,0,0,0,0] if unused
+    photo_count: int
+    photo_delay: int
+    # True เมื่อ meter_id นี้ยังไม่เคยถูกตั้งค่าเองเลย (ไม่มีแถวใน
+    # device_config จริง) — ค่าที่เห็นคือ DEFAULT_CONFIG ล้วนๆ ไม่ใช่ค่าที่
+    # เคยบันทึกไว้ — ไม่ได้อยู่ใน spec เดิม เพิ่มเองให้ dashboard แยกแยะได้
+    # ว่า "กำลังโชว์ค่า default" กับ "มีการตั้งค่าเองแล้ว" — ESP32 ไม่สนใจ
+    # field นี้เลย (แค่ไม่ได้ใช้ ไม่ทำให้ parse พัง)
+    is_default: bool = False
+
+
+class DeviceConfigSetRequest(BaseModel):
+    """
+    NOT in the spec doc at all — my own addition, since the doc only
+    describes ESP32 reading its config, never how one gets set in the
+    first place. See app/routers/device_config.py's docstring.
+    """
+    schedule_mode: int = Field(ge=0, le=1)
+    date1: list[int] = Field(min_length=5, max_length=5)
+    date2: list[int] = Field(min_length=5, max_length=5)
+    photo_count: int = Field(ge=1, le=10)
+    photo_delay: int = Field(ge=1, le=60)
