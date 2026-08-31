@@ -73,7 +73,7 @@ class Settings(BaseSettings):
     # first image in a burst before finalizing the group into a single
     # ocr_jobs row — whatever arrived by then, not necessarily all of
     # them. See app/grouping.py.
-    image_group_window_seconds: int = 60
+    image_group_window_seconds: int = 180
     # How often the background sweep checks for expired groups to
     # finalize. Independent of the window above — this is just the poll
     # interval, not the wait time itself.
