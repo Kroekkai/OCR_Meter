@@ -7,7 +7,7 @@ from app import db
 from app.config import get_settings
 from app.grouping import group_sweep_loop
 from app.prefix_middleware import StripPathPrefixMiddleware
-from app.routers import admin_users, auth_routes, health, images, meters, ocr_jobs
+from app.routers import admin_users, auth_routes, device_config, health, images, meters, ocr_jobs
 
 
 @asynccontextmanager
@@ -48,6 +48,10 @@ app.include_router(admin_users.router)
 app.include_router(ocr_jobs.router)
 app.include_router(images.router)
 app.include_router(meters.router)
+# No collision risk with anything above — "/devices/config" and
+# "/admin/device-config/{meter_id}" are both brand-new path prefixes
+# nothing else in this API uses, so include order doesn't matter here.
+app.include_router(device_config.router)
 
 # Strips BASE_PATH_PREFIX (e.g. "/iot") from the incoming request path
 # before routing, if present. No-op if the proxy already strips it, or if
