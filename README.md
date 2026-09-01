@@ -293,12 +293,20 @@ shots a few seconds apart). Confirmed design:
 
 - **The server** decides when a group is "complete", not the OCR client.
 - **Two paths to "complete", whichever comes first:**
-  - **Count-based (fast path)**: the moment a group reaches
-    `IMAGE_GROUP_SIZE` (3) images, that upload request finalizes the
-    group into `ocr_jobs` immediately, synchronously, in the same
-    request — no waiting at all.
-  - **Time-based (fallback)**: for a group that never reaches that
-    count (e.g. only 1-2 images ever arrive), the server waits
+  - **Count-based (fast path)**: the moment a group reaches its target
+    count, that upload request finalizes the group into `ocr_jobs`
+    immediately, synchronously, in the same request — no waiting at
+    all. **Target count is per-meter now** — `device_config.photo_count`
+    for that specific `meter_id` if it's been configured (via
+    `PUT /admin/device-config/{meter_id}` or the dashboard), falling
+    back to the system-wide `IMAGE_GROUP_SIZE` setting (3) only for a
+    meter that's never been configured — the same fallback
+    `GET /devices/config` itself uses via `DEFAULT_CONFIG`. Two meters
+    can have different burst sizes this way — one set to `photo_count=5`
+    finalizes its groups at 5 images, unaffected by another meter still
+    on the default of 3.
+  - **Time-based (fallback)**: for a group that never reaches its
+    target count (e.g. only 1-2 images ever arrive), the server waits
     `IMAGE_GROUP_WINDOW_SECONDS` (60, both local and production) after
     the *first* image, then finalizes with whatever showed up — it does
     not wait forever for a straggler.
@@ -312,19 +320,22 @@ shots a few seconds apart). Confirmed design:
    `meter_id` (an anchor image — `images_*.is_anchor = true` — received
    within the window, with no `ocr_jobs` row yet) and joins it, or
    starts a new group if none is open. After the insert, it counts how
-   many images now share that `group_id`; if the count has reached
-   `IMAGE_GROUP_SIZE`, it finalizes the group into `ocr_jobs` right then
-   and there, and `ocr_job_id` in the response is non-null on exactly
-   that request. Otherwise `ocr_job_id` stays `null` — the group isn't
-   done yet, and it'll either get more images or eventually get picked
-   up by the fallback below.
+   many images now share that `group_id`, looks up this `meter_id`'s
+   own `device_config.photo_count` (falling back to `IMAGE_GROUP_SIZE`
+   if unconfigured), and compares; if the count has reached that
+   target, it finalizes the group into `ocr_jobs` right then and there,
+   and `ocr_job_id` in the response is non-null on exactly that
+   request. Otherwise `ocr_job_id` stays `null` — the group isn't done
+   yet, and it'll either get more images or eventually get picked up by
+   the fallback below.
 2. A background task (`app/grouping.py`, started in `app/main.py`'s
    lifespan — not tied to any HTTP request) checks every
    `GROUP_SWEEP_INTERVAL_SECONDS` (default 5) for groups whose window has
    closed *and that don't already have an `ocr_jobs` row* — i.e. only
    the ones the fast path above never got to. Groups that already hit
-   `IMAGE_GROUP_SIZE` and got finalized immediately never show up in
-   this sweep at all.
+   their target count and got finalized immediately never show up in
+   this sweep at all — the sweep itself doesn't check `photo_count` at
+   all, since it only ever runs for groups that *didn't* reach it.
    Both paths funnel through the same `finalize_group()` helper in
    `app/grouping.py`, so the actual `INSERT INTO ocr_jobs` only exists
    in one place.
@@ -417,11 +428,13 @@ curl -s -X POST http://localhost:3003/images/upload \
     -H 'X-Device-Key: dev-device-key-not-for-production' \
     -F 'file=@E101_20260818_151230_01.jpg'
 # -> {"image": {...}, "group_id": "E1", "ocr_job_id": null}
-# ocr_job_id is null here — this group has only 1 image so far
-# (IMAGE_GROUP_SIZE is 3), so it hasn't finalized immediately. Either
-# upload 2 more within the window to trigger the fast path, or wait out
-# the full window (60s, matches production — see docker-compose.local.yml)
-# for the fallback sweep to pick it up with just this 1 image. Then:
+# ocr_job_id is null here — this group has only 1 image so far. E101's
+# target is IMAGE_GROUP_SIZE (3) unless it has its own device_config
+# row with a different photo_count. Either upload 2 more (or however
+# many the target is) within the window to trigger the fast path, or
+# wait out the full window (60s, matches production — see
+# docker-compose.local.yml) for the fallback sweep to pick it up with
+# just this 1 image. Then:
 
 curl -s "http://localhost:3003/admin/images/ocr?job_status=queued" \
     -H 'X-OCR-Key: dev-ocr-key-not-for-production'

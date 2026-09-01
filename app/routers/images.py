@@ -37,8 +37,13 @@ async def upload_image(
     image), or starts a new group if none is open. Two ways a group
     turns into exactly one ocr_jobs row:
       1. FAST PATH (this function, immediately): once the group reaches
-         settings.image_group_size images, this upload finalizes it into
+         this meter's target photo count, this upload finalizes it into
          ocr_jobs right here in the same request — no waiting at all.
+         Target count is device_config.photo_count for THIS meter_id if
+         it has been configured, else settings.image_group_size (the
+         system-wide fallback — same one GET /devices/config itself
+         falls back to via DEFAULT_CONFIG). Different meters can use
+         different burst sizes this way.
          ImageUploadResponse.ocr_job_id is non-null on exactly the
          request that completed the group.
       2. FALLBACK (app/grouping.py's background sweep): for groups that
@@ -122,17 +127,28 @@ async def upload_image(
                     new_group_id,
                 )
 
-            # --- Fast path: group just reached image_group_size? -------
+            # --- Fast path: group just reached this meter's target count? ---
             # Finalize into ocr_jobs immediately, right here, instead of
             # waiting for the sweep to notice on its next tick (up to
             # group_sweep_interval_seconds later) or for the window to
-            # close (up to image_group_window_seconds later).
+            # close (up to image_group_window_seconds later). The target
+            # count is THIS meter's own device_config.photo_count if it
+            # has been configured — falling back to the system-wide
+            # settings.image_group_size only for a meter that's never
+            # been configured (same fallback GET /devices/config itself
+            # uses via DEFAULT_CONFIG). Different meters can have
+            # different burst sizes this way.
             ocr_job_id = None
+            target_count = await conn.fetchval(
+                "SELECT photo_count FROM device_config WHERE meter_id = $1", meter_id
+            )
+            if target_count is None:
+                target_count = settings.image_group_size
             group_count = await conn.fetchval(
                 f"SELECT COUNT(*) FROM {table} WHERE group_id = $1",
                 image_row["group_id"],
             )
-            if group_count >= settings.image_group_size:
+            if group_count >= target_count:
                 # Re-fetch the anchor row locked — need its
                 # original_filename/device_timestamp to copy into
                 # ocr_jobs, and FOR UPDATE + the NOT EXISTS check right
