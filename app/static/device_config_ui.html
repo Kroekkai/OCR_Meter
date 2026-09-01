@@ -150,8 +150,8 @@
   .mode-toggle button { flex: 1; }
   .mode-toggle button.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
 
-  .row5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
-  .row5.daily-mode { grid-template-columns: repeat(2, 1fr); }
+  .row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .row3.daily-mode { grid-template-columns: repeat(2, 1fr); }
   .row2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
   .field label { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 5px; }
 
@@ -237,18 +237,10 @@
         <fieldset>
           <legend>รอบเวลาหลัก</legend>
           <div class="date-block" id="date1-block">
-            <div class="row5" id="d1-row">
-              <div class="field" id="d1-day-field">
-                <label>วัน</label>
-                <select id="d1-day"></select>
-              </div>
-              <div class="field" id="d1-month-field">
-                <label>เดือน</label>
-                <select id="d1-month"></select>
-              </div>
-              <div class="field" id="d1-year-field">
-                <label>ปี(พ.ศ.)</label>
-                <input type="number" id="d1-year" min="0" value="0">
+            <div class="row3" id="d1-row">
+              <div class="field" id="d1-date-field">
+                <label>วันที่</label>
+                <input type="date" id="d1-date">
               </div>
               <div class="field">
                 <label>ชั่วโมง</label>
@@ -262,7 +254,7 @@
           </div>
         </fieldset>
 
-        <fieldset>
+        <fieldset id="second-round-fieldset">
           <legend>
             <label class="switch" style="display:inline-flex;align-items:center;gap:8px;width:auto">
               <span style="font-size:13px;color:var(--text)">รอบเวลาที่สอง (ถ้ามี)</span>
@@ -276,18 +268,10 @@
             </label>
           </div>
           <div class="date-block disabled" id="date2-block">
-            <div class="row5" id="d2-row">
-              <div class="field" id="d2-day-field">
-                <label>วัน</label>
-                <select id="d2-day"></select>
-              </div>
-              <div class="field" id="d2-month-field">
-                <label>เดือน</label>
-                <select id="d2-month"></select>
-              </div>
-              <div class="field" id="d2-year-field">
-                <label>ปี(พ.ศ.)</label>
-                <input type="number" id="d2-year" min="0" value="0">
+            <div class="row3" id="d2-row">
+              <div class="field" id="d2-date-field">
+                <label>วันที่</label>
+                <input type="date" id="d2-date">
               </div>
               <div class="field">
                 <label>ชั่วโมง</label>
@@ -472,7 +456,7 @@
   }
 
   $("new-btn").addEventListener("click", () => {
-    const meterId = prompt("รหัสมิเตอร์ที่จะตั้งค่า เช่น E303, W201, G101");
+    const meterId = prompt("รหัสมิเตอร์ที่จะตั้งค่า เช่น E103, W201, G050");
     if (!meterId) return;
     selectMeter(meterId.trim().toUpperCase());
   });
@@ -510,18 +494,32 @@
     $("save-msg").textContent = "";
   }
 
+  // <input type="date"> gives "YYYY-MM-DD" (or "" if unset) — a native
+  // calendar picker guarantees any date it produces is a real one (no
+  // Feb 30, no month 13), so there's nothing left to range-check here
+  // the way the old separate day/month/year selects needed.
   function fillDate(prefix, arr) {
-    $(prefix + "-day").value = arr[0];
-    $(prefix + "-month").value = arr[1];
-    $(prefix + "-year").value = arr[2];
+    const [day, month, year] = arr;
+    $(prefix + "-date").value =
+      day && month && year
+        ? String(year).padStart(4, "0") + "-" + String(month).padStart(2, "0") + "-" + String(day).padStart(2, "0")
+        : "";
     $(prefix + "-hour").value = arr[3];
     $(prefix + "-minute").value = arr[4];
   }
   function readDate(prefix) {
+    const raw = $(prefix + "-date").value; // "YYYY-MM-DD" or ""
+    let day = 0, month = 0, year = 0;
+    if (raw) {
+      const parts = raw.split("-");
+      year = parseInt(parts[0], 10) || 0;
+      month = parseInt(parts[1], 10) || 0;
+      day = parseInt(parts[2], 10) || 0;
+    }
     return [
-      parseInt($(prefix + "-day").value, 10) || 0,
-      parseInt($(prefix + "-month").value, 10) || 0,
-      parseInt($(prefix + "-year").value, 10) || 0,
+      day,
+      month,
+      year,
       parseInt($(prefix + "-hour").value, 10) || 0,
       parseInt($(prefix + "-minute").value, 10) || 0,
     ];
@@ -531,21 +529,18 @@
     scheduleMode = mode;
     $("mode-0").classList.toggle("selected", mode === 0);
     $("mode-1").classList.toggle("selected", mode === 1);
-    // schedule_mode=0 (daily): Day/Month/Year are all meaningless —
-    // only Hour/Minute matter for a "same time every day" schedule.
-    // Hide all three rather than let someone set values that get
-    // silently ignored.
+    // schedule_mode=0 (daily): only Hour/Minute matter for a "same time
+    // every day" schedule — the calendar date is meaningless, and so is
+    // a second daily round (a single hour/minute already fires every
+    // day; a "second round" concept only makes sense for Fix date).
+    // Hide the date field and the whole second-round section rather
+    // than let someone set values that get silently ignored.
     const hide = mode === 0 ? "none" : "block";
-    $("d1-day-field").style.display = hide;
-    $("d1-month-field").style.display = hide;
-    $("d1-year-field").style.display = hide;
-    $("d2-day-field").style.display = hide;
-    $("d2-month-field").style.display = hide;
-    $("d2-year-field").style.display = hide;
+    $("d1-date-field").style.display = hide;
+    $("second-round-fieldset").style.display = hide;
     // Collapse the grid to 2 even columns (hour/minute) instead of
-    // leaving 3 empty column tracks where Day/Month/Year used to sit.
+    // leaving an empty column track where the date picker used to sit.
     $("d1-row").classList.toggle("daily-mode", mode === 0);
-    $("d2-row").classList.toggle("daily-mode", mode === 0);
   }
   $("mode-0").addEventListener("click", () => setMode(0));
   $("mode-1").addEventListener("click", () => setMode(1));
@@ -567,20 +562,20 @@
       return;
     }
     const date1 = readDate("d1");
-    if (scheduleMode === 1 && !(date1[0] >= 1 && date1[0] <= 31)) {
-      showSaveMsg("โหมด Fix date ต้องระบุวัน (1-31) ให้ถูกต้อง", true);
+    if (scheduleMode === 1 && !$("d1-date").value) {
+      showSaveMsg("โหมด Fix date ต้องเลือกวันที่", true);
       return;
     }
-    if (date1[2] < 0) {
-      showSaveMsg("ปี (รอบเวลาหลัก) ต้องไม่ติดลบ", true);
+    // Daily mode: second round doesn't apply at all (see setMode) —
+    // force date2 to [0,0,0,0,0] regardless of the checkbox's leftover
+    // state from a previous Fix-date session, rather than trust a
+    // checkbox the user can no longer even see.
+    const d2Enabled = scheduleMode === 1 && $("d2-enable").checked;
+    if (d2Enabled && !$("d2-date").value) {
+      showSaveMsg("รอบเวลาที่สองต้องเลือกวันที่ (หรือปิดสวิตช์ถ้าไม่ใช้)", true);
       return;
     }
-    const d2Enabled = $("d2-enable").checked;
     const date2 = d2Enabled ? readDate("d2") : [0, 0, 0, 0, 0];
-    if (d2Enabled && date2[2] < 0) {
-      showSaveMsg("ปี (รอบเวลาที่สอง) ต้องไม่ติดลบ", true);
-      return;
-    }
     const body = {
       schedule_mode: scheduleMode,
       date1: date1,
@@ -638,12 +633,8 @@
     }
   }
   function initSelects() {
-    fillSelect("d1-day", 1, 31);
-    fillSelect("d1-month", 0, 12);
     fillSelect("d1-hour", 0, 23);
     fillSelect("d1-minute", 0, 59);
-    fillSelect("d2-day", 1, 31);
-    fillSelect("d2-month", 0, 12);
     fillSelect("d2-hour", 0, 23);
     fillSelect("d2-minute", 0, 59);
     fillSelect("f-photo-count", 1, 10);
