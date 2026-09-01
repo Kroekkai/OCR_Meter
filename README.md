@@ -61,6 +61,7 @@ PUT    /admin/images/{item_id}/ocr-manual         [admin JWT]
 GET    /devices/config                                           (NEW — separate spec doc, see "device_config" below)
 GET    /admin/device-config                                      (NEW — not in that spec doc either, see below)
 GET    /admin/device-config/{meter_id}                           (NEW — not in that spec doc either, see below)
+GET    /admin/device-config-ui                                   (NEW — standalone dashboard, see below)
 PUT    /admin/device-config/{meter_id}            [admin JWT]     (NEW — not in that spec doc either, see below)
 DELETE /admin/device-config/{meter_id}            [admin JWT]     (NEW — not in that spec doc either, see below)
 ```
@@ -550,6 +551,25 @@ curl -X PUT http://localhost:3003/admin/device-config/E101 \
    idempotent — deleting an already-default meter is a no-op, not a
    404. After this, every GET above goes back to `DEFAULT_CONFIG` for
    that `meter_id`.
+6. **`GET /admin/device-config-ui`** — a small standalone dashboard
+   (`app/static/device_config_ui.html`, served as plain `HTMLResponse`
+   — no template engine, no build step) so a human can browse/edit
+   `device_config` from a browser instead of curl or Swagger. Own login
+   form (posts to `/login`, stores the JWT in `localStorage`), a list
+   pane of every configured meter (color-coded dot by type — amber
+   electric, blue water, coral gas), and a detail pane that edits one
+   meter's schedule and calls the four endpoints above. No FastAPI-side
+   auth on the route itself — it's static HTML/CSS/JS, nothing to
+   protect there; the page's own JS is what attaches the JWT to every
+   `/admin/device-config*` call it makes, same as any other admin
+   client. Every API call inside the page uses a relative URL (e.g.
+   `fetch("device-config")`, `fetch("../login")`) resolved against the
+   page's own path — works unmodified behind `BASE_PATH_PREFIX`
+   (production) and without it (local), no hardcoded domain anywhere in
+   the file. This is genuinely a from-scratch admin tool, not anything
+   from the spec doc — flag if a different auth story (e.g. its own
+   session cookie instead of reusing the JWT-in-localStorage pattern)
+   is wanted instead.
 
 `date1`/`date2` are stored as raw Postgres `INTEGER[]` (5 elements,
 `CHECK`-constrained to exactly 5), matching the wire format exactly —

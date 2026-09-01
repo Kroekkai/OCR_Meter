@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Meter config</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --surface: #1c1f26;
+    --surface-hover: #242832;
+    --border: #2a2e38;
+    --text: #e8e6e0;
+    --text-muted: #8b8980;
+    --accent: #4fb8a8;
+    --accent-dim: #2d6b62;
+    --electric: #e8b339;
+    --water: #4a9eda;
+    --gas: #d9714f;
+    --danger: #d9534f;
+    --danger-dim: #5c2b29;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 16px;
+    font-weight: 500;
+    margin: 0;
+    letter-spacing: 0.01em;
+  }
+  header h1 span { color: var(--text-muted); font-weight: 400; }
+  #whoami { color: var(--text-muted); font-size: 13px; display: flex; align-items: center; gap: 12px; }
+  button {
+    font-family: var(--sans);
+    font-size: 13px;
+    cursor: pointer;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    padding: 7px 14px;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  button:hover { background: var(--surface-hover); border-color: var(--accent-dim); }
+  button.primary { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
+  button.primary:hover { background: var(--accent); color: #0d1f1c; }
+  button.danger { color: #f5b8b5; }
+  button.danger:hover { background: var(--danger-dim); border-color: var(--danger); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  input, select {
+    font-family: var(--sans);
+    font-size: 14px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 8px 10px;
+    width: 100%;
+  }
+  input:focus, select:focus, button:focus-visible {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-dim);
+  }
+  input[type=number] { font-family: var(--mono); }
+
+  /* login screen */
+  #login-screen {
+    max-width: 320px;
+    margin: 96px auto;
+    padding: 0 24px;
+  }
+  #login-screen h2 { font-size: 16px; font-weight: 500; margin: 0 0 20px; }
+  #login-screen .field { margin-bottom: 14px; }
+  #login-screen label { display: block; font-size: 13px; color: var(--text-muted); margin-bottom: 6px; }
+  #login-error { color: var(--danger); font-size: 13px; margin-top: 10px; min-height: 18px; }
+
+  /* main layout */
+  #app { display: none; }
+  main {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    min-height: calc(100vh - 57px);
+  }
+  #list-pane {
+    border-right: 1px solid var(--border);
+    padding: 16px;
+    overflow-y: auto;
+  }
+  #list-pane .pane-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  #list-pane .pane-head h2 { font-size: 13px; font-weight: 500; color: var(--text-muted); margin: 0; }
+  .meter-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    margin-bottom: 2px;
+  }
+  .meter-row:hover { background: var(--surface); }
+  .meter-row.active { background: var(--accent-dim); }
+  .meter-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .meter-row .mid { font-family: var(--mono); font-size: 13px; }
+  #list-empty { color: var(--text-muted); font-size: 13px; padding: 12px 10px; }
+
+  #detail-pane { padding: 24px 32px; max-width: 560px; }
+  #detail-empty { color: var(--text-muted); padding: 24px 0; }
+  #detail-empty p { max-width: 360px; }
+
+  .detail-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+  .detail-head h2 { font-family: var(--mono); font-size: 20px; font-weight: 500; margin: 0; }
+  .badge { font-size: 12px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border); color: var(--text-muted); }
+  .badge.custom { border-color: var(--accent-dim); color: var(--accent); }
+  #detail-sub { color: var(--text-muted); font-size: 13px; margin-bottom: 24px; }
+
+  fieldset { border: none; padding: 0; margin: 0 0 22px; }
+  legend { font-size: 13px; color: var(--text-muted); margin-bottom: 10px; padding: 0; }
+  .mode-toggle { display: flex; gap: 8px; }
+  .mode-toggle button { flex: 1; }
+  .mode-toggle button.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
+
+  .row5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+  .row2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .field label { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 5px; }
+
+  .date-block { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+  .date-block-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .date-block-head span { font-size: 13px; }
+  .date-block.disabled { opacity: 0.4; }
+  .date-block.disabled input { pointer-events: none; }
+
+  .switch { position: relative; width: 34px; height: 20px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; inset: 0; background: var(--border); border-radius: 10px; cursor: pointer; transition: background 0.15s; }
+  .slider::before { content: ""; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; background: var(--text); border-radius: 50%; transition: transform 0.15s; }
+  .switch input:checked + .slider { background: var(--accent-dim); }
+  .switch input:checked + .slider::before { transform: translateX(14px); background: var(--accent); }
+
+  .actions { display: flex; gap: 10px; margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
+  #save-msg { font-size: 13px; margin-left: auto; align-self: center; }
+  #save-msg.ok { color: var(--accent); }
+  #save-msg.err { color: var(--danger); }
+
+  .hint { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <h2>Meter config — เข้าสู่ระบบ</h2>
+  <div class="field">
+    <label for="li-user">Username</label>
+    <input id="li-user" type="text" autocomplete="username">
+  </div>
+  <div class="field">
+    <label for="li-pass">Password</label>
+    <input id="li-pass" type="password" autocomplete="current-password">
+  </div>
+  <button class="primary" id="login-btn" style="width:100%">เข้าสู่ระบบ</button>
+  <div id="login-error"></div>
+</div>
+
+<div id="app">
+  <header>
+    <h1>Meter config <span>— ตารางถ่ายภาพ ESP32</span></h1>
+    <div id="whoami">
+      <span id="whoami-name"></span>
+      <button id="logout-btn">ออกจากระบบ</button>
+    </div>
+  </header>
+  <main>
+    <div id="list-pane">
+      <div class="pane-head">
+        <h2>มิเตอร์</h2>
+        <button id="new-btn" title="เพิ่มมิเตอร์ใหม่">+ ใหม่</button>
+      </div>
+      <div id="list-body"></div>
+    </div>
+    <div id="detail-pane">
+      <div id="detail-empty">
+        <p>เลือกมิเตอร์จากรายการด้านซ้าย หรือกด "+ ใหม่" เพื่อตั้งค่ามิเตอร์ที่ยังไม่เคยตั้งค่ามาก่อน</p>
+      </div>
+      <div id="detail-form" style="display:none">
+        <div class="detail-head">
+          <h2 id="d-meter-id"></h2>
+          <span class="badge" id="d-badge"></span>
+        </div>
+        <div id="detail-sub"></div>
+
+        <fieldset>
+          <legend>โหมดตารางเวลา</legend>
+          <div class="mode-toggle">
+            <button type="button" id="mode-0">ถ่ายทุกวัน (Daily)</button>
+            <button type="button" id="mode-1">ถ่ายวันที่กำหนด (Fix date)</button>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>รอบเวลาหลัก</legend>
+          <div class="date-block" id="date1-block">
+            <div class="row5">
+              <div class="field" id="d1-day-field">
+                <label>วัน (1-31)</label>
+                <input type="number" id="d1-day" min="0" max="31">
+              </div>
+              <div class="field">
+                <label>เดือน</label>
+                <input type="number" id="d1-month" min="0" max="12" value="0">
+              </div>
+              <div class="field">
+                <label>ปี</label>
+                <input type="number" id="d1-year" min="0" value="0">
+              </div>
+              <div class="field">
+                <label>ชั่วโมง (0-23)</label>
+                <input type="number" id="d1-hour" min="0" max="23">
+              </div>
+              <div class="field">
+                <label>นาที (0-59)</label>
+                <input type="number" id="d1-minute" min="0" max="59">
+              </div>
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>
+            <label class="switch" style="display:inline-flex;align-items:center;gap:8px;width:auto">
+              <span style="font-size:13px;color:var(--text)">รอบเวลาที่สอง (ถ้ามี)</span>
+            </label>
+          </legend>
+          <div class="date-block-head" style="margin-top:-6px">
+            <span></span>
+            <label class="switch">
+              <input type="checkbox" id="d2-enable">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="date-block disabled" id="date2-block">
+            <div class="row5">
+              <div class="field" id="d2-day-field">
+                <label>วัน (1-31)</label>
+                <input type="number" id="d2-day" min="0" max="31">
+              </div>
+              <div class="field">
+                <label>เดือน</label>
+                <input type="number" id="d2-month" min="0" max="12" value="0">
+              </div>
+              <div class="field">
+                <label>ปี</label>
+                <input type="number" id="d2-year" min="0" value="0">
+              </div>
+              <div class="field">
+                <label>ชั่วโมง (0-23)</label>
+                <input type="number" id="d2-hour" min="0" max="23">
+              </div>
+              <div class="field">
+                <label>นาที (0-59)</label>
+                <input type="number" id="d2-minute" min="0" max="59">
+              </div>
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>การถ่ายภาพ</legend>
+          <div class="row2">
+            <div class="field">
+              <label>จำนวนภาพต่อรอบ (1-10)</label>
+              <input type="number" id="f-photo-count" min="1" max="10">
+            </div>
+            <div class="field">
+              <label>ระยะห่างระหว่างภาพ วินาที (1-60)</label>
+              <input type="number" id="f-photo-delay" min="1" max="60">
+            </div>
+          </div>
+        </fieldset>
+
+        <div class="actions">
+          <button class="primary" id="save-btn">บันทึก</button>
+          <button class="danger" id="reset-btn">รีเซ็ตเป็นค่า default</button>
+          <span id="save-msg"></span>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+(function () {
+  const TOKEN_KEY = "meter_config_token";
+  const USER_KEY = "meter_config_username";
+  let scheduleMode = 1;
+  let currentMeterId = null;
+
+  const $ = (id) => document.getElementById(id);
+
+  function token() { return localStorage.getItem(TOKEN_KEY); }
+  function authHeaders() { return { "Authorization": "Bearer " + token() }; }
+
+  async function api(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({}, authHeaders(), opts.headers || {});
+    const res = await fetch(path, opts);
+    if (res.status === 401) {
+      localStorage.removeItem(TOKEN_KEY);
+      showLogin();
+      throw new Error("unauthorized");
+    }
+    return res;
+  }
+
+  // ---------- auth ----------
+  function showLogin() {
+    $("login-screen").style.display = "block";
+    $("app").style.display = "none";
+  }
+  function showApp() {
+    $("login-screen").style.display = "none";
+    $("app").style.display = "block";
+    $("whoami-name").textContent = localStorage.getItem(USER_KEY) || "";
+    loadList();
+  }
+
+  $("login-btn").addEventListener("click", async () => {
+    const username = $("li-user").value.trim();
+    const password = $("li-pass").value;
+    $("login-error").textContent = "";
+    if (!username || !password) {
+      $("login-error").textContent = "กรอก username และ password ให้ครบ";
+      return;
+    }
+    try {
+      // relative to /admin/device-config-ui -> "../login" = "/login"
+      const res = await fetch("../login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      if (!res.ok) {
+        $("login-error").textContent = "เข้าสู่ระบบไม่สำเร็จ — เช็ค username/password";
+        return;
+      }
+      const data = await res.json();
+      localStorage.setItem(TOKEN_KEY, data.access_token);
+      localStorage.setItem(USER_KEY, username);
+      showApp();
+    } catch (e) {
+      $("login-error").textContent = "เชื่อมต่อ server ไม่ได้";
+    }
+  });
+
+  $("li-pass").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") $("login-btn").click();
+  });
+
+  $("logout-btn").addEventListener("click", () => {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USER_KEY);
+    showLogin();
+  });
+
+  // ---------- list ----------
+  function dotColor(meterId) {
+    const c = (meterId || "").charAt(0).toUpperCase();
+    if (c === "E") return "var(--electric)";
+    if (c === "W") return "var(--water)";
+    if (c === "G") return "var(--gas)";
+    return "var(--text-muted)";
+  }
+
+  async function loadList() {
+    try {
+      const res = await api("device-config?limit=200");
+      const items = await res.json();
+      const body = $("list-body");
+      body.innerHTML = "";
+      if (!items.length) {
+        body.innerHTML = '<div id="list-empty">ยังไม่มีมิเตอร์ที่ตั้งค่าเองเลย — กด "+ ใหม่" เพื่อเริ่ม</div>';
+        return;
+      }
+      items.forEach((cfg) => {
+        const row = document.createElement("div");
+        row.className = "meter-row";
+        row.dataset.meterId = cfg.meter_id;
+        const dot = document.createElement("span");
+        dot.className = "meter-dot";
+        dot.style.background = dotColor(cfg.meter_id);
+        const label = document.createElement("span");
+        label.className = "mid";
+        label.textContent = cfg.meter_id;
+        row.append(dot, label);
+        row.addEventListener("click", () => selectMeter(cfg.meter_id));
+        body.appendChild(row);
+      });
+      highlightActive();
+    } catch (e) { /* handled in api() */ }
+  }
+
+  function highlightActive() {
+    document.querySelectorAll(".meter-row").forEach((r) => {
+      r.classList.toggle("active", r.dataset.meterId === currentMeterId);
+    });
+  }
+
+  $("new-btn").addEventListener("click", () => {
+    const meterId = prompt("รหัสมิเตอร์ที่จะตั้งค่า เช่น E103, W201, G050");
+    if (!meterId) return;
+    selectMeter(meterId.trim().toUpperCase());
+  });
+
+  // ---------- detail ----------
+  async function selectMeter(meterId) {
+    currentMeterId = meterId;
+    highlightActive();
+    try {
+      const res = await api("device-config/" + encodeURIComponent(meterId));
+      const cfg = await res.json();
+      renderDetail(cfg);
+    } catch (e) { /* handled in api() */ }
+  }
+
+  function renderDetail(cfg) {
+    $("detail-empty").style.display = "none";
+    $("detail-form").style.display = "block";
+    $("d-meter-id").textContent = cfg.meter_id;
+    $("d-badge").textContent = cfg.is_default ? "ใช้ค่า default" : "ตั้งค่าเองแล้ว";
+    $("d-badge").className = "badge" + (cfg.is_default ? "" : " custom");
+    $("detail-sub").textContent = cfg.is_default
+      ? "มิเตอร์นี้ยังไม่เคยตั้งค่าเอง — ค่าด้านล่างเป็นค่า default ปรับแล้วกด บันทึก เพื่อสร้างค่าเฉพาะมิเตอร์นี้"
+      : "แก้ไขแล้วกด บันทึก เพื่ออัปเดต";
+
+    setMode(cfg.schedule_mode);
+    fillDate("d1", cfg.date1);
+    const hasSecond = cfg.date2.some((v) => v !== 0);
+    $("d2-enable").checked = hasSecond;
+    toggleDate2(hasSecond);
+    fillDate("d2", cfg.date2[0] ? cfg.date2 : [1, 0, 0, 0, 0]);
+
+    $("f-photo-count").value = cfg.photo_count;
+    $("f-photo-delay").value = cfg.photo_delay;
+    $("save-msg").textContent = "";
+  }
+
+  function fillDate(prefix, arr) {
+    $(prefix + "-day").value = arr[0];
+    $(prefix + "-month").value = arr[1];
+    $(prefix + "-year").value = arr[2];
+    $(prefix + "-hour").value = arr[3];
+    $(prefix + "-minute").value = arr[4];
+  }
+  function readDate(prefix) {
+    return [
+      parseInt($(prefix + "-day").value, 10) || 0,
+      parseInt($(prefix + "-month").value, 10) || 0,
+      parseInt($(prefix + "-year").value, 10) || 0,
+      parseInt($(prefix + "-hour").value, 10) || 0,
+      parseInt($(prefix + "-minute").value, 10) || 0,
+    ];
+  }
+
+  function setMode(mode) {
+    scheduleMode = mode;
+    $("mode-0").classList.toggle("selected", mode === 0);
+    $("mode-1").classList.toggle("selected", mode === 1);
+    // schedule_mode=0 (daily): the Day field is meaningless — server spec
+    // says "ใส่ 0" for it in that mode. Hide it rather than let someone
+    // set a day that's silently ignored.
+    $("d1-day-field").style.display = mode === 0 ? "none" : "block";
+    $("d2-day-field").style.display = mode === 0 ? "none" : "block";
+  }
+  $("mode-0").addEventListener("click", () => setMode(0));
+  $("mode-1").addEventListener("click", () => setMode(1));
+
+  function toggleDate2(on) {
+    $("date2-block").classList.toggle("disabled", !on);
+  }
+  $("d2-enable").addEventListener("change", (e) => toggleDate2(e.target.checked));
+
+  async function saveConfig() {
+    const photoCount = parseInt($("f-photo-count").value, 10);
+    const photoDelay = parseInt($("f-photo-delay").value, 10);
+    if (!(photoCount >= 1 && photoCount <= 10)) {
+      showSaveMsg("จำนวนภาพต้องอยู่ระหว่าง 1-10", true);
+      return;
+    }
+    if (!(photoDelay >= 1 && photoDelay <= 60)) {
+      showSaveMsg("ระยะห่างต้องอยู่ระหว่าง 1-60 วินาที", true);
+      return;
+    }
+    const date1 = readDate("d1");
+    if (scheduleMode === 1 && !(date1[0] >= 1 && date1[0] <= 31)) {
+      showSaveMsg("โหมด Fix date ต้องระบุวัน (1-31) ให้ถูกต้อง", true);
+      return;
+    }
+    const body = {
+      schedule_mode: scheduleMode,
+      date1: date1,
+      date2: $("d2-enable").checked ? readDate("d2") : [0, 0, 0, 0, 0],
+      photo_count: photoCount,
+      photo_delay: photoDelay,
+    };
+    try {
+      const res = await api("device-config/" + encodeURIComponent(currentMeterId), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        showSaveMsg("บันทึกไม่สำเร็จ: " + (err.detail ? JSON.stringify(err.detail) : res.status), true);
+        return;
+      }
+      const cfg = await res.json();
+      renderDetail(cfg);
+      showSaveMsg("บันทึกแล้ว", false);
+      loadList();
+    } catch (e) { /* handled in api() */ }
+  }
+  $("save-btn").addEventListener("click", saveConfig);
+
+  function showSaveMsg(text, isErr) {
+    const el = $("save-msg");
+    el.textContent = text;
+    el.className = isErr ? "err" : "ok";
+  }
+
+  $("reset-btn").addEventListener("click", async () => {
+    if (!currentMeterId) return;
+    if (!confirm('รีเซ็ต "' + currentMeterId + '" กลับเป็นค่า default? การตั้งค่าที่บันทึกไว้จะหายไป')) return;
+    try {
+      await api("device-config/" + encodeURIComponent(currentMeterId), { method: "DELETE" });
+      await selectMeter(currentMeterId);
+      loadList();
+    } catch (e) { /* handled in api() */ }
+  });
+
+  // ---------- boot ----------
+  if (token()) {
+    showApp();
+  } else {
+    showLogin();
+  }
+})();
+</script>
+</body>
+</html>

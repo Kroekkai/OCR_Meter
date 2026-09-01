@@ -1,10 +1,34 @@
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import HTMLResponse
 
 from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_uploader
 from app.db import pool
 from app.schemas import DeviceConfigOut, DeviceConfigSetRequest
 
 router = APIRouter(tags=["default"])
+
+_UI_HTML_PATH = Path(__file__).resolve().parent.parent / "static" / "device_config_ui.html"
+
+
+@router.get("/admin/device-config-ui", response_class=HTMLResponse, summary="Admin Device Config Dashboard")
+async def admin_device_config_ui():
+    """
+    NOT in the spec doc — a small standalone dashboard for humans to
+    browse/edit device_config without curl or Swagger. No FastAPI-side
+    auth on this route itself (it's just static HTML/CSS/JS — there's
+    nothing here to protect); the page's own JS calls /login and stores
+    the JWT in the browser's localStorage, then sends it as a normal
+    Authorization: Bearer header on every /admin/device-config* call —
+    same auth path as any other admin client, just from a browser
+    instead of curl. All API calls in the page use relative URLs (e.g.
+    fetch("device-config"), fetch("../login")) resolved against this
+    page's own path, so it works unmodified behind BASE_PATH_PREFIX
+    (production) and without it (local) — no hardcoded domain anywhere.
+    """
+    return HTMLResponse(content=_UI_HTML_PATH.read_text(encoding="utf-8"))
+
 
 # Per the spec doc's example 1 (Fix Date mode, day 26 at 08:00) — used
 # whenever a meter has no device_config row yet, per the doc's own rule:
