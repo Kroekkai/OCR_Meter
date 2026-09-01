@@ -110,6 +110,15 @@
     margin-bottom: 12px;
   }
   #list-pane .pane-head h2 { font-size: 13px; font-weight: 500; color: var(--text-muted); margin: 0; }
+  .type-tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+  .type-tabs .tab {
+    flex: 1;
+    padding: 6px 4px;
+    font-size: 12px;
+    text-align: center;
+  }
+  .type-tabs .tab.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
+  #search-box { margin-bottom: 12px; font-size: 13px; padding: 7px 10px; }
   .meter-row {
     display: flex;
     align-items: center;
@@ -196,6 +205,13 @@
         <h2>มิเตอร์</h2>
         <button id="new-btn" title="เพิ่มมิเตอร์ใหม่">+ ใหม่</button>
       </div>
+      <div class="type-tabs" id="type-tabs">
+        <button type="button" class="tab selected" data-type="all">ทั้งหมด</button>
+        <button type="button" class="tab" data-type="E">ไฟฟ้า</button>
+        <button type="button" class="tab" data-type="W">น้ำ</button>
+        <button type="button" class="tab" data-type="G">แก๊ส</button>
+      </div>
+      <input type="text" id="search-box" placeholder="ค้นหา meter ID...">
       <div id="list-body"></div>
     </div>
     <div id="detail-pane">
@@ -230,7 +246,7 @@
                 <select id="d1-month"></select>
               </div>
               <div class="field">
-                <label>ปี (พ.ศ)</label>
+                <label>ปี</label>
                 <input type="number" id="d1-year" min="0" value="0">
               </div>
               <div class="field">
@@ -269,7 +285,7 @@
                 <select id="d2-month"></select>
               </div>
               <div class="field">
-                <label>ปี (พ.ศ)</label>
+                <label>ปี</label>
                 <input type="number" id="d2-year" min="0" value="0">
               </div>
               <div class="field">
@@ -391,33 +407,62 @@
     return "var(--text-muted)";
   }
 
+  let allConfigs = [];
+  let activeType = "all";
+
   async function loadList() {
     try {
       const res = await api("device-config?limit=200");
-      const items = await res.json();
-      const body = $("list-body");
-      body.innerHTML = "";
-      if (!items.length) {
-        body.innerHTML = '<div id="list-empty">ยังไม่มีมิเตอร์ที่ตั้งค่าเองเลย — กด "+ ใหม่" เพื่อเริ่ม</div>';
-        return;
-      }
-      items.forEach((cfg) => {
-        const row = document.createElement("div");
-        row.className = "meter-row";
-        row.dataset.meterId = cfg.meter_id;
-        const dot = document.createElement("span");
-        dot.className = "meter-dot";
-        dot.style.background = dotColor(cfg.meter_id);
-        const label = document.createElement("span");
-        label.className = "mid";
-        label.textContent = cfg.meter_id;
-        row.append(dot, label);
-        row.addEventListener("click", () => selectMeter(cfg.meter_id));
-        body.appendChild(row);
-      });
-      highlightActive();
+      allConfigs = await res.json();
+      renderList();
     } catch (e) { /* handled in api() */ }
   }
+
+  function renderList() {
+    const body = $("list-body");
+    const query = $("search-box").value.trim().toUpperCase();
+    let items = allConfigs;
+    if (activeType !== "all") {
+      items = items.filter((c) => c.meter_id.charAt(0).toUpperCase() === activeType);
+    }
+    if (query) {
+      items = items.filter((c) => c.meter_id.toUpperCase().includes(query));
+    }
+    body.innerHTML = "";
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.id = "list-empty";
+      empty.textContent = allConfigs.length
+        ? "ไม่พบมิเตอร์ที่ตรงกับเงื่อนไข"
+        : 'ยังไม่มีมิเตอร์ที่ตั้งค่าเองเลย — กด "+ ใหม่" เพื่อเริ่ม';
+      body.appendChild(empty);
+      return;
+    }
+    items.forEach((cfg) => {
+      const row = document.createElement("div");
+      row.className = "meter-row";
+      row.dataset.meterId = cfg.meter_id;
+      const dot = document.createElement("span");
+      dot.className = "meter-dot";
+      dot.style.background = dotColor(cfg.meter_id);
+      const label = document.createElement("span");
+      label.className = "mid";
+      label.textContent = cfg.meter_id;
+      row.append(dot, label);
+      row.addEventListener("click", () => selectMeter(cfg.meter_id));
+      body.appendChild(row);
+    });
+    highlightActive();
+  }
+
+  document.querySelectorAll("#type-tabs .tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      activeType = btn.dataset.type;
+      document.querySelectorAll("#type-tabs .tab").forEach((b) => b.classList.toggle("selected", b === btn));
+      renderList();
+    });
+  });
+  $("search-box").addEventListener("input", renderList);
 
   function highlightActive() {
     document.querySelectorAll(".meter-row").forEach((r) => {
