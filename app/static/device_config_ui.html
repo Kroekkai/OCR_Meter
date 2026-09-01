@@ -141,7 +141,7 @@
   .mode-toggle button { flex: 1; }
   .mode-toggle button.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
 
-  .row5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+  .row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
   .row2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
   .field label { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 5px; }
 
@@ -220,26 +220,18 @@
         <fieldset>
           <legend>รอบเวลาหลัก</legend>
           <div class="date-block" id="date1-block">
-            <div class="row5">
+            <div class="row3">
               <div class="field" id="d1-day-field">
-                <label>วัน (1-31)</label>
-                <input type="number" id="d1-day" min="0" max="31">
+                <label>วัน</label>
+                <select id="d1-day"></select>
               </div>
               <div class="field">
-                <label>เดือน</label>
-                <input type="number" id="d1-month" min="0" max="12" value="0">
+                <label>ชั่วโมง</label>
+                <select id="d1-hour"></select>
               </div>
               <div class="field">
-                <label>ปี</label>
-                <input type="number" id="d1-year" min="0" value="0">
-              </div>
-              <div class="field">
-                <label>ชั่วโมง (0-23)</label>
-                <input type="number" id="d1-hour" min="0" max="23">
-              </div>
-              <div class="field">
-                <label>นาที (0-59)</label>
-                <input type="number" id="d1-minute" min="0" max="59">
+                <label>นาที</label>
+                <select id="d1-minute"></select>
               </div>
             </div>
           </div>
@@ -259,26 +251,18 @@
             </label>
           </div>
           <div class="date-block disabled" id="date2-block">
-            <div class="row5">
+            <div class="row3">
               <div class="field" id="d2-day-field">
-                <label>วัน (1-31)</label>
-                <input type="number" id="d2-day" min="0" max="31">
+                <label>วัน</label>
+                <select id="d2-day"></select>
               </div>
               <div class="field">
-                <label>เดือน</label>
-                <input type="number" id="d2-month" min="0" max="12" value="0">
+                <label>ชั่วโมง</label>
+                <select id="d2-hour"></select>
               </div>
               <div class="field">
-                <label>ปี</label>
-                <input type="number" id="d2-year" min="0" value="0">
-              </div>
-              <div class="field">
-                <label>ชั่วโมง (0-23)</label>
-                <input type="number" id="d2-hour" min="0" max="23">
-              </div>
-              <div class="field">
-                <label>นาที (0-59)</label>
-                <input type="number" id="d2-minute" min="0" max="59">
+                <label>นาที</label>
+                <select id="d2-minute"></select>
               </div>
             </div>
           </div>
@@ -288,12 +272,12 @@
           <legend>การถ่ายภาพ</legend>
           <div class="row2">
             <div class="field">
-              <label>จำนวนภาพต่อรอบ (1-10)</label>
-              <input type="number" id="f-photo-count" min="1" max="10">
+              <label>จำนวนภาพต่อรอบ</label>
+              <select id="f-photo-count"></select>
             </div>
             <div class="field">
-              <label>ระยะห่างระหว่างภาพ วินาที (1-60)</label>
-              <input type="number" id="f-photo-delay" min="1" max="60">
+              <label>ระยะห่างระหว่างภาพ (วินาที)</label>
+              <select id="f-photo-delay"></select>
             </div>
           </div>
         </fieldset>
@@ -464,18 +448,19 @@
     $("save-msg").textContent = "";
   }
 
+  // Month/Year are always 0 per the spec ("Month: ใส่ 0", "Year: ใส่ 0")
+  // — never editable, hardcoded here rather than shown as always-0
+  // fields in the UI (dropped from the form entirely).
   function fillDate(prefix, arr) {
     $(prefix + "-day").value = arr[0];
-    $(prefix + "-month").value = arr[1];
-    $(prefix + "-year").value = arr[2];
     $(prefix + "-hour").value = arr[3];
     $(prefix + "-minute").value = arr[4];
   }
   function readDate(prefix) {
     return [
       parseInt($(prefix + "-day").value, 10) || 0,
-      parseInt($(prefix + "-month").value, 10) || 0,
-      parseInt($(prefix + "-year").value, 10) || 0,
+      0,
+      0,
       parseInt($(prefix + "-hour").value, 10) || 0,
       parseInt($(prefix + "-minute").value, 10) || 0,
     ];
@@ -556,6 +541,32 @@
       loadList();
     } catch (e) { /* handled in api() */ }
   });
+
+  // ---------- dropdown options ----------
+  // Dropdowns instead of free-typed numbers so an out-of-range value
+  // (e.g. minute=70) can never be entered in the first place — every
+  // option offered is already valid, nothing to validate on submit.
+  function fillSelect(id, start, end) {
+    const el = $(id);
+    el.innerHTML = "";
+    for (let i = start; i <= end; i++) {
+      const opt = document.createElement("option");
+      opt.value = String(i);
+      opt.textContent = String(i).padStart(2, "0");
+      el.appendChild(opt);
+    }
+  }
+  function initSelects() {
+    fillSelect("d1-day", 1, 31);
+    fillSelect("d1-hour", 0, 23);
+    fillSelect("d1-minute", 0, 59);
+    fillSelect("d2-day", 1, 31);
+    fillSelect("d2-hour", 0, 23);
+    fillSelect("d2-minute", 0, 59);
+    fillSelect("f-photo-count", 1, 10);
+    fillSelect("f-photo-delay", 1, 60);
+  }
+  initSelects();
 
   // ---------- boot ----------
   if (token()) {
