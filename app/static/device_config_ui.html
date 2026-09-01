@@ -141,7 +141,7 @@
   .mode-toggle button { flex: 1; }
   .mode-toggle button.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
 
-  .row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .row5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
   .row2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
   .field label { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 5px; }
 
@@ -220,10 +220,18 @@
         <fieldset>
           <legend>รอบเวลาหลัก</legend>
           <div class="date-block" id="date1-block">
-            <div class="row3">
+            <div class="row5">
               <div class="field" id="d1-day-field">
                 <label>วัน</label>
                 <select id="d1-day"></select>
+              </div>
+              <div class="field">
+                <label>เดือน</label>
+                <select id="d1-month"></select>
+              </div>
+              <div class="field">
+                <label>ปี</label>
+                <input type="number" id="d1-year" min="0" value="0">
               </div>
               <div class="field">
                 <label>ชั่วโมง</label>
@@ -251,10 +259,18 @@
             </label>
           </div>
           <div class="date-block disabled" id="date2-block">
-            <div class="row3">
+            <div class="row5">
               <div class="field" id="d2-day-field">
                 <label>วัน</label>
                 <select id="d2-day"></select>
+              </div>
+              <div class="field">
+                <label>เดือน</label>
+                <select id="d2-month"></select>
+              </div>
+              <div class="field">
+                <label>ปี</label>
+                <input type="number" id="d2-year" min="0" value="0">
               </div>
               <div class="field">
                 <label>ชั่วโมง</label>
@@ -448,19 +464,18 @@
     $("save-msg").textContent = "";
   }
 
-  // Month/Year are always 0 per the spec ("Month: ใส่ 0", "Year: ใส่ 0")
-  // — never editable, hardcoded here rather than shown as always-0
-  // fields in the UI (dropped from the form entirely).
   function fillDate(prefix, arr) {
     $(prefix + "-day").value = arr[0];
+    $(prefix + "-month").value = arr[1];
+    $(prefix + "-year").value = arr[2];
     $(prefix + "-hour").value = arr[3];
     $(prefix + "-minute").value = arr[4];
   }
   function readDate(prefix) {
     return [
       parseInt($(prefix + "-day").value, 10) || 0,
-      0,
-      0,
+      parseInt($(prefix + "-month").value, 10) || 0,
+      parseInt($(prefix + "-year").value, 10) || 0,
       parseInt($(prefix + "-hour").value, 10) || 0,
       parseInt($(prefix + "-minute").value, 10) || 0,
     ];
@@ -500,10 +515,20 @@
       showSaveMsg("โหมด Fix date ต้องระบุวัน (1-31) ให้ถูกต้อง", true);
       return;
     }
+    if (date1[2] < 0) {
+      showSaveMsg("ปี (รอบเวลาหลัก) ต้องไม่ติดลบ", true);
+      return;
+    }
+    const d2Enabled = $("d2-enable").checked;
+    const date2 = d2Enabled ? readDate("d2") : [0, 0, 0, 0, 0];
+    if (d2Enabled && date2[2] < 0) {
+      showSaveMsg("ปี (รอบเวลาที่สอง) ต้องไม่ติดลบ", true);
+      return;
+    }
     const body = {
       schedule_mode: scheduleMode,
       date1: date1,
-      date2: $("d2-enable").checked ? readDate("d2") : [0, 0, 0, 0, 0],
+      date2: date2,
       photo_count: photoCount,
       photo_delay: photoDelay,
     };
@@ -558,9 +583,11 @@
   }
   function initSelects() {
     fillSelect("d1-day", 1, 31);
+    fillSelect("d1-month", 0, 12);
     fillSelect("d1-hour", 0, 23);
     fillSelect("d1-minute", 0, 59);
     fillSelect("d2-day", 1, 31);
+    fillSelect("d2-month", 0, 12);
     fillSelect("d2-hour", 0, 23);
     fillSelect("d2-minute", 0, 59);
     fillSelect("f-photo-count", 1, 10);
