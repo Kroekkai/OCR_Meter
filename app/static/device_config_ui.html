@@ -151,6 +151,7 @@
   .mode-toggle button.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
 
   .row5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+  .row5.daily-mode { grid-template-columns: repeat(2, 1fr); }
   .row2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
   .field label { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 5px; }
 
@@ -236,16 +237,16 @@
         <fieldset>
           <legend>รอบเวลาหลัก</legend>
           <div class="date-block" id="date1-block">
-            <div class="row5">
+            <div class="row5" id="d1-row">
               <div class="field" id="d1-day-field">
                 <label>วัน</label>
                 <select id="d1-day"></select>
               </div>
-              <div class="field">
+              <div class="field" id="d1-month-field">
                 <label>เดือน</label>
                 <select id="d1-month"></select>
               </div>
-              <div class="field">
+              <div class="field" id="d1-year-field">
                 <label>ปี(พ.ศ.)</label>
                 <input type="number" id="d1-year" min="0" value="0">
               </div>
@@ -275,16 +276,16 @@
             </label>
           </div>
           <div class="date-block disabled" id="date2-block">
-            <div class="row5">
+            <div class="row5" id="d2-row">
               <div class="field" id="d2-day-field">
                 <label>วัน</label>
                 <select id="d2-day"></select>
               </div>
-              <div class="field">
+              <div class="field" id="d2-month-field">
                 <label>เดือน</label>
                 <select id="d2-month"></select>
               </div>
-              <div class="field">
+              <div class="field" id="d2-year-field">
                 <label>ปี(พ.ศ.)</label>
                 <input type="number" id="d2-year" min="0" value="0">
               </div>
@@ -530,11 +531,21 @@
     scheduleMode = mode;
     $("mode-0").classList.toggle("selected", mode === 0);
     $("mode-1").classList.toggle("selected", mode === 1);
-    // schedule_mode=0 (daily): the Day field is meaningless — server spec
-    // says "ใส่ 0" for it in that mode. Hide it rather than let someone
-    // set a day that's silently ignored.
-    $("d1-day-field").style.display = mode === 0 ? "none" : "block";
-    $("d2-day-field").style.display = mode === 0 ? "none" : "block";
+    // schedule_mode=0 (daily): Day/Month/Year are all meaningless —
+    // only Hour/Minute matter for a "same time every day" schedule.
+    // Hide all three rather than let someone set values that get
+    // silently ignored.
+    const hide = mode === 0 ? "none" : "block";
+    $("d1-day-field").style.display = hide;
+    $("d1-month-field").style.display = hide;
+    $("d1-year-field").style.display = hide;
+    $("d2-day-field").style.display = hide;
+    $("d2-month-field").style.display = hide;
+    $("d2-year-field").style.display = hide;
+    // Collapse the grid to 2 even columns (hour/minute) instead of
+    // leaving 3 empty column tracks where Day/Month/Year used to sit.
+    $("d1-row").classList.toggle("daily-mode", mode === 0);
+    $("d2-row").classList.toggle("daily-mode", mode === 0);
   }
   $("mode-0").addEventListener("click", () => setMode(0));
   $("mode-1").addEventListener("click", () => setMode(1));
