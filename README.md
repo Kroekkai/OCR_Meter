@@ -13,7 +13,7 @@ nothing gets silently re-guessed or re-flipped:
 **Confirmed, implemented:**
 - `error_type` is a plain integer 0/1/2/3 (not free-form text) — meanings live in the `error_type` lookup table (`db/init.sql`), server owns the definitions, OCR client just reports the code. Case 3 ("read a value, but anomalous") replaces the old `reading_decreased`/`usage_anomaly` text values as one combined case — still client-computed, server doesn't run this check. `error_detail` column removed from `ocr_meter`. `capture_date`/`capture_time` derived server-side from the job's `device_timestamp` now, never client-supplied. **No file upload on `/result` at all anymore** — it's plain form fields, not multipart; the old `result_image` field is gone (see "ocr_meter" below for why — it was a real risk, not just unnecessary). `ocr_meter.ocr_image_filename` renamed to `image_error`, and its value is now the FULL disk path (e.g. `/data/images/E101_..._01.jpg`, not just the bare filename) to the job's own `original_filename` (the anchor's already-stored file), not a separately uploaded one. `GET /admin/images/{item_id}/ocr-result-file` (original spec) removed accordingly — use `/file` instead. `meter_id` stored uppercase everywhere (was lowercase). `ocr_jobs.last_error`/`admin_reason` columns removed (not persisted anywhere now — `/fail`'s error message only reaches the server log). `group_id` is now the E1/W3/G12-style text code directly (the old numeric `group_id`/self-reference anchor mechanism and the separate `group_label` column from an earlier revision are both gone — merged into one `group_id` column, with a new `is_anchor` boolean replacing the self-reference trick), on `images_*`/`ocr_jobs`. A group also now finalizes into `ocr_jobs` immediately once it reaches `IMAGE_GROUP_SIZE` (3) images, not just on the 60s window fallback. **`ocr_meter` does NOT carry `group_id`** — briefly did in an intermediate revision, confirmed removed: `ocr_meter` is exactly 6 fields (`meter_id`, `capture_date`, `capture_time`, `ocr_reading`, `error_type`, `image_error`), nothing else, group tracking is an `images_*`/`ocr_jobs`-internal concern only. See "ocr_meter", "group_id", and "Burst upload grouping" sections below.
 - `DB_HOST=timescaledb` (container name on `innovation_net`), **not** the host's own IP `192.168.248.199` — connecting via the host's external IP timed out from inside the container (self-referential/hairpin routing back to its own host), confirmed via `docker network inspect innovation_net` while debugging the actual deploy. `timescaledb` and `ocr-meter-store` are both already on that network, so Docker's internal DNS resolves it directly — no IP needed at all.
-- **`is_test`/`ocr_meter_test`** — every group is checked server-side against that meter's `device_config` schedule (never the filename) and tagged `is_test` accordingly; results for `is_test=true` jobs go to the new `ocr_meter_test` table instead of `ocr_meter`. At most one normal (non-`is_test`) group per meter per Bangkok calendar day may reach `ocr_jobs` — a same-day duplicate is silently dropped (no job, no error, `images_*` rows left as-is, never deleted); test groups are exempt from this limit entirely. See "Scheduled vs. test captures" below.
+- **`is_test_filename()`/`ocr_meter_test`** — every group is checked server-side against that meter's `device_config` schedule (never the filename ESP32 sent) and, when off-schedule, has `_Test` appended to its *stored* filename (both disk and DB) — there is no separate `is_test` column anywhere (tried, then removed); `is_test_filename(original_filename)` is the sole source of truth end to end. Results for test jobs go to the new `ocr_meter_test` table instead of `ocr_meter`. At most one normal (non-test) group per meter per Bangkok calendar day may reach `ocr_jobs` — a same-day duplicate is silently dropped (no job, no error, `images_*` rows left as-is, never deleted); test groups are exempt from this limit entirely. See "Scheduled vs. test captures" below.
 - `ocr_jobs` is one shared table across meter types (per `db/init.sql`) — not split into `ocr_jobs_electric/water/gas`.
 - Upload filename convention: `{meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg`, meter_id/device_timestamp parsed from it (Thailand local time, UTC+7), invalid meter_id prefix → HTTP 400.
 - Auth is fixed-secret-per-deployment: `DEVICE_API_KEY`/`DEVICE_API_KEY_USERNAME` and `OCR_CLIENT_KEY`/`OCR_CLIENT_KEY_USERNAME`, each an *optional shortcut* alongside real JWT login (blank pair = login required). See `app/auth.py`.
@@ -376,15 +376,16 @@ a group that's already been queued and never get processed).
 still-present siblings — see that endpoint's docstring in
 `app/routers/images.py`. Flag if you want that hardened.
 
-## Scheduled vs. test captures (`is_test`, `ocr_meter_test`)
+## Scheduled vs. test captures (`is_test_filename()`, `ocr_meter_test`)
 
 **Not in either original spec doc — a later addition, confirmed design
-across a few rounds.** Every new group gets checked against that
-meter's own `device_config` schedule, and is tagged as either a normal
-scheduled capture or a one-off test — the two are kept completely
-separate all the way through to two different result tables.
+across a few rounds, including a mid-course redesign (see below).**
+Every new group gets checked against that meter's own `device_config`
+schedule, and is treated as either a normal scheduled capture or a
+one-off test — the two are kept completely separate all the way through
+to two different result tables.
 
-**How `is_test` gets decided — confirmed server-side, never
+**How the schedule check itself works — confirmed server-side, never
 client-side:**
 ```
 app/schedule_match.py::is_on_schedule(meter_id, device_timestamp)
@@ -395,27 +396,44 @@ against that meter's `device_config.date1`/`date2` (or `DEFAULT_CONFIG`
 if unconfigured), within `SCHEDULE_MATCH_TOLERANCE_MINUTES` (default
 5 — only the anchor is checked, so this covers "how close is the
 wake-up shot to the scheduled time", not the whole burst's duration;
-see `app/config.py`). Within tolerance of *either* slot →
-`is_test = false`; otherwise `true`. Every other image joining that
-group inherits the anchor's `is_test` rather than being checked
-individually — a single burst is always entirely normal or entirely
-test, never a mix.
+see `app/config.py`).
 
-**Confirmed: the incoming filename is never trusted or parsed for
-this** — there's no `_Test`-suffix convention the server looks *for* on
-the way in; whatever naming convention (if any) the ESP32 firmware uses
-is a firmware-side concern only, and the server independently
-re-derives `is_test` every time from `device_config`, never from a
-self-reported flag in the filename.
+**Confirmed: the incoming filename from ESP32 is never trusted or
+parsed for this decision** — whatever naming convention (if any) the
+firmware uses on the way in is a firmware-side concern only; the server
+always independently re-derives the answer from `device_config`.
 
-**What the server *stores* is a different matter — confirmed it does
-rename on the way out.** Once `is_test` is decided, `_stored_filename()`
-appends `_Test` right before the extension — e.g.
+**No separate `is_test` column exists anywhere — this was tried, then
+removed (confirmed).** `images_*`/`ocr_jobs` briefly had an `is_test
+BOOLEAN` column and `OcrJobOut` briefly had an `is_test` field; all
+three are gone now. Instead, the moment `is_on_schedule()` decides,
+that result is baked straight into the **stored filename** —
+`app/routers/images.py::_stored_filename()` appends `_Test` right
+before the extension when off-schedule, e.g.
 `E101_20260901_130000_1.jpg` → `E101_20260901_130000_1_Test.jpg` —
 applied identically to the actual file on disk and to
-`images_*.original_filename`, so the two can never disagree. Every
-image in a test group gets this, not just the anchor (the join branch
-re-applies it too, using the anchor's already-decided `is_test`).
+`images_*.original_filename`/`ocr_jobs.original_filename`, so all three
+(disk, DB, and whatever the OCR client sees) can never disagree. Every
+image in a test group gets this, not just the anchor — an image joining
+an existing group re-derives whether it's a test group from the
+anchor's *already-decided filename*
+(`app/filename.py::is_test_filename()`) rather than the schedule being
+re-checked per image, so a single burst is always entirely normal or
+entirely test, never a mix.
+
+**`is_test_filename()` is now the single source of truth, everywhere,
+confirmed:**
+```
+app/filename.py::is_test_filename(filename) -> bool
+```
+Matches a case-insensitive `_Test` immediately before `.jpg`/`.jpeg` at
+the end of the string — not "test" appearing anywhere else (a meter_id
+containing those letters won't false-positive). Every place that used
+to check the `is_test` column now calls this instead, against
+`original_filename`: the daily-limit check, the `/result` table
+routing, and the OCR client itself if it wants to tell test jobs apart
+(the API response no longer tells it directly — it has to look at
+`original_filename` the same way).
 
 **One normal group per meter per (Bangkok) calendar day — confirmed
 rule, applies only to non-test groups:**
@@ -433,23 +451,26 @@ stays `null` forever for that group. **Confirmed: the dropped group's
 `images_*` rows are left exactly as they are — never deleted, `is_anchor`
 stays `true`, `ocr_status` stays `'pending'` indefinitely.** The limit
 resets at Bangkok midnight (`00:00` local), computed fresh on every
-check — not a stored "last reset" timestamp anywhere.
+check — not a stored "last reset" timestamp anywhere. The check itself
+is now a Postgres regex (`original_filename !~* '_test\.jpe?g$'`)
+mirroring `is_test_filename()` exactly — keep the two in sync if either
+ever changes.
 
-**Test groups (`is_test = true`) are completely exempt from this daily
-limit** — a meter can produce any number of test groups/jobs in a
-single day, confirmed. Checked identically in both finalization paths
-(the upload handler's fast path and `app/grouping.py`'s sweep), via the
-same `has_normal_group_today()` helper — one place the rule lives, not
+**Test groups are completely exempt from this daily limit** — a meter
+can produce any number of test groups/jobs in a single day, confirmed.
+Checked identically in both finalization paths (the upload handler's
+fast path and `app/grouping.py`'s sweep), via the same
+`has_normal_group_today()` helper — one place the rule lives, not
 duplicated.
 
 **`ocr_meter_test`** — a table structurally identical to `ocr_meter`
 (same 6 columns, own sequence, own index), confirmed to hold *only*
-results from `is_test = true` jobs, completely separate from normal
+results from off-schedule jobs, completely separate from normal
 `ocr_meter` data. `POST /admin/images/ocr/{job_id}/result` picks the
-target table by checking `ocr_jobs.is_test` at write time — everything
-else about that endpoint (validation, `capture_date`/`capture_time`
-derivation, `image_error` path) is identical regardless of which table
-the row lands in.
+target table by calling `is_test_filename(job["original_filename"])`
+at write time — everything else about that endpoint (validation,
+`capture_date`/`capture_time` derivation, `image_error` path) is
+identical regardless of which table the row lands in.
 
 **Reading them back — two explicitly separate endpoints, confirmed
 request:**
