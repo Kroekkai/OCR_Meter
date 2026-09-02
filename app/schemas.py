@@ -91,6 +91,14 @@ class OcrJobOut(BaseModel):
     id: int
     group_id: str
     meter_id: str
+    # Confirmed: whether this job is a "test" capture is NOT a separate
+    # field anywhere in this response (there briefly was an is_test bool
+    # here — removed). Check original_filename for a "_Test" suffix
+    # right before the extension instead (case-insensitive) — the exact
+    # same signal the server itself uses to decide ocr_meter vs
+    # ocr_meter_test at /result time (app/filename.py::is_test_filename()).
+    # The OCR client is expected to apply the identical check if it
+    # needs to tell test jobs apart itself.
     original_filename: str | None
     device_timestamp: dt.datetime | None
     ocr_reading: float | None

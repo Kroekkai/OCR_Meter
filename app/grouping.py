@@ -20,30 +20,36 @@ import asyncpg
 
 from app.config import get_settings
 from app.db import METER_TABLES, pool
-from app.filename import BANGKOK_TZ
+from app.filename import BANGKOK_TZ, is_test_filename
 
 logger = logging.getLogger("ocr_meter_store.grouping")
 
 
 async def has_normal_group_today(conn: asyncpg.Connection, table: str, meter_id: str) -> bool:
     """
-    True if this meter already has a NON-test group (is_test=false) that
-    was finalized into ocr_jobs today — "today" meaning the current
-    Bangkok calendar day, resetting at Bangkok midnight (confirmed
-    design). Confirmed rule: at most ONE normal group per meter per day
-    may ever reach ocr_jobs — a second normal group the same day is
-    silently dropped (never gets an ocr_jobs row; its images_* rows are
-    left exactly as they are, is_anchor=true, ocr_status stays 'pending'
-    forever — confirmed NOT deleted). Test groups (is_test=true) are
-    exempt from this limit entirely — they can produce as many jobs as
-    they like on any given day, confirmed.
+    True if this meter already has a NON-test group (its anchor's
+    original_filename does NOT carry the "_Test" suffix — see
+    app/filename.py::is_test_filename(), the sole source of truth for
+    this, no separate column anywhere) that was finalized into ocr_jobs
+    today — "today" meaning the current Bangkok calendar day, resetting
+    at Bangkok midnight (confirmed design). Confirmed rule: at most ONE
+    normal group per meter per day may ever reach ocr_jobs — a second
+    normal group the same day is silently dropped (never gets an
+    ocr_jobs row; its images_* rows are left exactly as they are,
+    is_anchor=true, ocr_status stays 'pending' forever — confirmed NOT
+    deleted). Test groups are exempt from this limit entirely — they can
+    produce as many jobs as they like on any given day, confirmed. The
+    regex here mirrors is_test_filename() exactly (case-insensitive
+    "_test" right before .jpg/.jpeg) — keep the two in sync if either
+    changes.
     """
     today_midnight_bangkok = dt.datetime.now(BANGKOK_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     row = await conn.fetchval(
         f"""
         SELECT 1 FROM {table} img
         JOIN ocr_jobs j ON j.group_id = img.group_id
-        WHERE img.meter_id = $1 AND img.is_anchor = true AND img.is_test = false
+        WHERE img.meter_id = $1 AND img.is_anchor = true
+          AND img.original_filename !~* '_test\\.jpe?g$'
           AND img.received_at >= $2
         LIMIT 1
         """,
@@ -56,11 +62,16 @@ async def has_normal_group_today(conn: asyncpg.Connection, table: str, meter_id:
 async def finalize_group(conn: asyncpg.Connection, anchor_row: asyncpg.Record) -> int:
     """
     Creates the one ocr_jobs row for a group, given its anchor row's data
-    (id, meter_id, group_id, original_filename, device_timestamp, is_test
-    — any images_electric/water/gas row has all of these). Shared by both
+    (id, meter_id, group_id, original_filename, device_timestamp — any
+    images_electric/water/gas row has all of these). Shared by both
     the immediate fast path (app/routers/images.py, right after a group
     reaches its target photo count) and this module's time-based sweep —
     so the INSERT itself only needs to be written once.
+
+    original_filename carries whether this group is a test group (the
+    "_Test" suffix — see app/filename.py::is_test_filename()) straight
+    through into ocr_jobs unchanged; no separate is_test column exists
+    to copy.
 
     Caller is responsible for the transaction, the FOR UPDATE lock on
     anchor_row, checking NOT EXISTS(ocr_jobs WHERE group_id = ...) first,
@@ -70,15 +81,14 @@ async def finalize_group(conn: asyncpg.Connection, anchor_row: asyncpg.Record) -
     """
     row = await conn.fetchrow(
         """
-        INSERT INTO ocr_jobs (group_id, meter_id, original_filename, device_timestamp, status, is_test)
-        VALUES ($1, $2, $3, $4, 'queued', $5)
+        INSERT INTO ocr_jobs (group_id, meter_id, original_filename, device_timestamp, status)
+        VALUES ($1, $2, $3, $4, 'queued')
         RETURNING id
         """,
         anchor_row["group_id"],
         anchor_row["meter_id"],
         anchor_row["original_filename"],
         anchor_row["device_timestamp"],
-        anchor_row["is_test"],
     )
     return row["id"]
 
@@ -114,7 +124,7 @@ async def finalize_expired_groups() -> int:
                 # state.
                 rows = await conn.fetch(
                     f"""
-                    SELECT id, meter_id, group_id, original_filename, device_timestamp, is_test
+                    SELECT id, meter_id, group_id, original_filename, device_timestamp
                     FROM {table}
                     WHERE is_anchor = true
                       AND received_at <= now() - ($1 * interval '1 second')
@@ -124,7 +134,8 @@ async def finalize_expired_groups() -> int:
                     settings.image_group_window_seconds,
                 )
                 for row in rows:
-                    if not row["is_test"] and await has_normal_group_today(conn, table, row["meter_id"]):
+                    is_test = is_test_filename(row["original_filename"])
+                    if not is_test and await has_normal_group_today(conn, table, row["meter_id"]):
                         dropped += 1
                         logger.info(
                             "dropped duplicate normal group %s for meter %s — already has one today",

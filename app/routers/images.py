@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_uploader
 from app.config import get_settings
 from app.db import GROUP_ID_INFO, pool, table_for_meter_id
-from app.filename import FilenameParseError, parse_upload_filename
+from app.filename import FilenameParseError, is_test_filename, parse_upload_filename
 from app.grouping import finalize_group, has_normal_group_today
 from app.repo import get_image_row, image_out
 from app.schedule_match import is_on_schedule
@@ -102,7 +102,7 @@ async def upload_image(
             # not any old numeric self-reference.
             open_anchor = await conn.fetchrow(
                 f"""
-                SELECT id, group_id, is_test FROM {table}
+                SELECT id, group_id, original_filename FROM {table}
                 WHERE meter_id = $1
                   AND is_anchor = true
                   AND received_at > now() - ($2 * interval '1 second')
@@ -117,51 +117,55 @@ async def upload_image(
 
             if open_anchor is not None:
                 # Joins the still-open group — this image is NOT the
-                # anchor, so it just copies the anchor's existing
-                # group_id (and is_test) rather than pulling a new
-                # group_id or recomputing the schedule check — a single
+                # anchor, so it just matches whether the anchor's own
+                # stored filename got "_Test" appended (rather than
+                # recomputing the schedule check itself) — a single
                 # burst is always entirely on-schedule or entirely test,
-                # never a mix (confirmed). Stored filename gets "_Test"
-                # too, matching the anchor — see _stored_filename().
-                stored_filename = _stored_filename(file.filename, open_anchor["is_test"])
+                # never a mix (confirmed). is_test_filename() is the
+                # SOLE source of truth for this now — no separate
+                # column anywhere — see app/filename.py.
+                anchor_is_test = is_test_filename(open_anchor["original_filename"])
+                stored_filename = _stored_filename(file.filename, anchor_is_test)
                 image_row = await conn.fetchrow(
                     f"""
-                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, is_test)
-                    VALUES ($1, $2, $3, 'pending', $4, false, $5)
+                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor)
+                    VALUES ($1, $2, $3, 'pending', $4, false)
                     RETURNING *
                     """,
                     meter_id,
                     stored_filename,
                     device_timestamp,
                     open_anchor["group_id"],
-                    open_anchor["is_test"],
                 )
             else:
                 # No open group — this image starts a new one as its own
                 # anchor. group_id pulls from the per-type sequence (E1,
                 # E2, ... / W1, W2, ... / G1, G2, ...) — human-readable,
                 # unlike the raw row id which jumps around since all 3
-                # tables share images_id_seq. is_test is computed ONCE
-                # here (server-side comparison against device_config —
-                # confirmed NOT based on the filename at all) and
-                # inherited by every later image that joins this group.
-                # Stored filename gets "_Test" appended when off-schedule
-                # — see _stored_filename().
+                # tables share images_id_seq. The schedule check
+                # (server-side against device_config — confirmed NOT
+                # based on the filename ESP32 sent) happens ONCE here,
+                # per new group — the RESULT is baked directly into the
+                # stored filename via _stored_filename() ("_Test"
+                # appended or not) rather than kept in a separate
+                # column; every later image joining this group re-derives
+                # the same answer from THIS row's filename (see the
+                # open_anchor branch above), never recomputes the
+                # schedule check itself.
                 new_seq_n = await conn.fetchval(f"SELECT nextval('{group_seq}')")
                 new_group_id = f"{group_prefix}{new_seq_n}"
                 is_test = not await is_on_schedule(conn, meter_id, device_timestamp)
                 stored_filename = _stored_filename(file.filename, is_test)
                 image_row = await conn.fetchrow(
                     f"""
-                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, is_test)
-                    VALUES ($1, $2, $3, 'pending', $4, true, $5)
+                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor)
+                    VALUES ($1, $2, $3, 'pending', $4, true)
                     RETURNING *
                     """,
                     meter_id,
                     stored_filename,
                     device_timestamp,
                     new_group_id,
-                    is_test,
                 )
 
             # --- Fast path: group just reached this meter's target count? ---
@@ -201,7 +205,8 @@ async def upload_image(
                     "SELECT 1 FROM ocr_jobs WHERE group_id = $1", image_row["group_id"]
                 )
                 if anchor_row is not None and not already_has_job:
-                    if not anchor_row["is_test"] and await has_normal_group_today(conn, table, meter_id):
+                    anchor_is_test = is_test_filename(anchor_row["original_filename"])
+                    if not anchor_is_test and await has_normal_group_today(conn, table, meter_id):
                         # Confirmed rule: at most one normal (non-test)
                         # group per meter per day may reach ocr_jobs —
                         # this meter already has one today, so drop this

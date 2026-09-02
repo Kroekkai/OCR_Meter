@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Query, status
 
 from app.auth import CurrentUser, get_admin_or_service, get_ocr_client
 from app.db import pool, table_for_group_id
-from app.filename import BANGKOK_TZ
+from app.filename import BANGKOK_TZ, is_test_filename
 from app.repo import get_group_images
 from app.schemas import JobStatus, OcrClaimResponse, OcrFailRequest, OcrJobOut, OcrMeterEntry
 from app import storage
@@ -218,7 +218,7 @@ async def admin_submit_ocr_result(
                 else None
             )
 
-            target_table = "ocr_meter_test" if job["is_test"] else "ocr_meter"
+            target_table = "ocr_meter_test" if is_test_filename(job["original_filename"]) else "ocr_meter"
             meter_row = await conn.fetchrow(
                 f"""
                 INSERT INTO {target_table}

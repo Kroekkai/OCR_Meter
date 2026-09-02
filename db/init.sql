@@ -73,8 +73,7 @@ CREATE TABLE IF NOT EXISTS images_electric (
     ocr_status        TEXT        NOT NULL DEFAULT 'pending',  -- pending | done | failed
     group_id          TEXT        NOT NULL,
     is_anchor         BOOLEAN     NOT NULL DEFAULT false,
-    received_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    is_test            BOOLEAN     NOT NULL DEFAULT false
+    received_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS images_water (LIKE images_electric INCLUDING ALL);
 CREATE TABLE IF NOT EXISTS images_gas   (LIKE images_electric INCLUDING ALL);
@@ -126,21 +125,14 @@ BEGIN
         -- meter_id เก็บเป็นตัวพิมพ์ใหญ่เสมอตั้งแต่นี้ไป — บรรทัดนี้แปลง
         -- แถวเก่าที่อาจยังเป็นตัวพิมพ์เล็กอยู่ ให้ตรงกันหมดครั้งเดียว
         EXECUTE format('UPDATE %I SET meter_id = UPPER(meter_id) WHERE meter_id != UPPER(meter_id)', tbl);
-        -- is_test = server เทียบ device_timestamp ของภาพนี้กับตาราง
-        -- schedule ใน device_config ของ meter_id นั้น (schedule_mode/
-        -- date1/date2, ใช้ DEFAULT_CONFIG ถ้ายังไม่เคยตั้งค่า) — ถ้าห่าง
-        -- จากเวลาที่ตั้งไว้เกิน SCHEDULE_MATCH_TOLERANCE_MINUTES ถือว่า
-        -- เป็นภาพทดสอบ (ไม่ตรงตาราง) ไม่ใช่การอ่านชื่อไฟล์เลย (ยืนยันแล้ว
-        -- ว่าไม่สนใจชื่อไฟล์ ESP32 เรื่องนี้) คำนวณครั้งเดียวตอนเปิดกลุ่ม
-        -- ใหม่ (แถว is_anchor=true) ภาพอื่นที่เข้าร่วมกลุ่มเดียวกันทีหลัง
-        -- ก็อปค่าจากหัวกลุ่ม ไม่คำนวณซ้ำ (กลุ่มเดียวกันต้องเป็นประเภท
-        -- เดียวกันเสมอ ไม่ปนกัน) — ใช้ตัดสินว่ากลุ่มนี้ต้องเช็คกฎ "1
-        -- มิเตอร์ 1 กลุ่มต่อวัน" ไหม (เฉพาะกลุ่มที่ is_test=false) และตอน
-        -- ส่งผลจะเขียนลง ocr_meter หรือ ocr_meter_test
-        EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS is_test BOOLEAN', tbl);
-        EXECUTE format('UPDATE %I SET is_test = false WHERE is_test IS NULL', tbl);
-        EXECUTE format('ALTER TABLE %I ALTER COLUMN is_test SET NOT NULL', tbl);
-        EXECUTE format('ALTER TABLE %I ALTER COLUMN is_test SET DEFAULT false', tbl);
+        -- is_test เคยเป็นคอลัมน์แยกอยู่ช่วงสั้นๆ (server เทียบ
+        -- device_timestamp กับตาราง schedule ใน device_config ตอนเปิด
+        -- กลุ่มใหม่ แล้วเก็บผลไว้ตรงนี้) — ตัดออกตามที่ยืนยัน เปลี่ยนไปดู
+        -- จากชื่อไฟล์แทน (ชื่อไฟล์มี "_Test" ต่อท้ายอยู่แล้วถ้าไม่ตรง
+        -- ตาราง — ดู app/filename.py::is_test_filename() และ
+        -- app/routers/images.py::_stored_filename()) ไม่มีการเก็บ
+        -- boolean แยกอีกต่อไป ชื่อไฟล์เป็นแหล่งความจริงเดียวตั้งแต่นี้ไป
+        EXECUTE format('ALTER TABLE %I DROP COLUMN IF EXISTS is_test', tbl);
     END LOOP;
 END $$;
 
@@ -195,8 +187,7 @@ CREATE TABLE IF NOT EXISTS ocr_jobs (
     device_timestamp  TIMESTAMPTZ,
     ocr_reading       NUMERIC,
     status            TEXT        NOT NULL DEFAULT 'queued',  -- queued | processing | done | failed
-    attempts          BIGINT      NOT NULL DEFAULT 0,
-    is_test           BOOLEAN     NOT NULL DEFAULT false  -- copied from the group's anchor image — /result writes to ocr_meter_test instead of ocr_meter when true
+    attempts          BIGINT      NOT NULL DEFAULT 0
 );
 
 -- อัปเกรด DB ที่มี ocr_jobs อยู่แล้วจาก schema เก่ากว่า ให้ตรงกับ schema
@@ -229,7 +220,10 @@ BEGIN
     ALTER TABLE ocr_jobs DROP COLUMN IF EXISTS group_label;
     ALTER TABLE ocr_jobs DROP COLUMN IF EXISTS last_error;
     ALTER TABLE ocr_jobs DROP COLUMN IF EXISTS admin_reason;
-    ALTER TABLE ocr_jobs ADD COLUMN IF NOT EXISTS is_test BOOLEAN NOT NULL DEFAULT false;
+    -- is_test เคยเป็นคอลัมน์แยกอยู่ช่วงสั้นๆ — ตัดออกตามที่ยืนยัน ดูจาก
+    -- ชื่อไฟล์ (original_filename ที่ยังมีอยู่แล้ว) แทน — ดูคำอธิบายเต็ม
+    -- ที่ migration ของ images_*/is_test ด้านบน
+    ALTER TABLE ocr_jobs DROP COLUMN IF EXISTS is_test;
 END $$;
 
 -- ย้าย group_id ให้อยู่หน้า original_filename (ตามที่ยืนยัน) — Postgres
@@ -243,7 +237,7 @@ END $$;
 -- ผิดจริงไหม (no-op ถ้าตรงอยู่แล้ว ปลอดภัยรันซ้ำได้)
 DO $$
 DECLARE
-    correct_order TEXT[] := ARRAY['id','group_id','meter_id','original_filename','device_timestamp','ocr_reading','status','attempts','is_test'];
+    correct_order TEXT[] := ARRAY['id','group_id','meter_id','original_filename','device_timestamp','ocr_reading','status','attempts'];
     actual_order TEXT[];
 BEGIN
     SELECT array_agg(column_name ORDER BY ordinal_position) INTO actual_order
@@ -258,11 +252,10 @@ BEGIN
             device_timestamp  TIMESTAMPTZ,
             ocr_reading       NUMERIC,
             status            TEXT        NOT NULL DEFAULT 'queued',
-            attempts          BIGINT      NOT NULL DEFAULT 0,
-            is_test           BOOLEAN     NOT NULL DEFAULT false
+            attempts          BIGINT      NOT NULL DEFAULT 0
         );
-        INSERT INTO ocr_jobs_reordered (id, group_id, meter_id, original_filename, device_timestamp, ocr_reading, status, attempts, is_test)
-            SELECT id, group_id, meter_id, original_filename, device_timestamp, ocr_reading, status, attempts, is_test
+        INSERT INTO ocr_jobs_reordered (id, group_id, meter_id, original_filename, device_timestamp, ocr_reading, status, attempts)
+            SELECT id, group_id, meter_id, original_filename, device_timestamp, ocr_reading, status, attempts
             FROM ocr_jobs
             ORDER BY id;
         DROP TABLE ocr_jobs;
@@ -484,7 +477,8 @@ CREATE INDEX IF NOT EXISTS idx_ocr_meter_meter_id ON ocr_meter (meter_id, captur
 
 -- ocr_meter_test — โครงสร้างเหมือน ocr_meter เป๊ะทุกคอลัมน์ แค่แยกตาราง
 -- เก็บผลจากภาพที่ server ตัดสินว่า "ไม่ตรงตารางเวลาใน device_config"
--- (is_test=true ใน ocr_jobs ของ job นั้น) เท่านั้น — ผลจากภาพที่ถ่ายตรง
+-- (ชื่อไฟล์ของ job นั้นมี "_Test" ต่อท้าย — ดู
+-- app/filename.py::is_test_filename()) เท่านั้น — ผลจากภาพที่ถ่ายตรง
 -- ตามตารางเวลาจริงยังคงลงที่ ocr_meter ตามปกติ ไม่มายุ่งกับตารางนี้เลย
 -- ไม่มี FK เชื่อมกับ ocr_meter เลย เป็นคนละตารางแยกขาดจากกันสนิท
 CREATE TABLE IF NOT EXISTS ocr_meter_test (

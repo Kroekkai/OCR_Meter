@@ -90,10 +90,14 @@ class Settings(BaseSettings):
     # A capture counts as "on schedule" if its device_timestamp falls within
     # this many minutes of any configured slot (date1 or date2) in that
     # meter's device_config (or DEFAULT_CONFIG if it has none). Outside this
-    # tolerance, the whole group is marked is_test=true — confirmed: this is
-    # a server-side comparison against device_config, never based on the
-    # uploaded filename itself. Only the FIRST image of a burst (the group's
-    # anchor) is checked — is_test is computed once per group and every
+    # tolerance, the whole group is treated as a test capture (its stored
+    # filename gets "_Test" appended — see
+    # app/routers/images.py::_stored_filename() and
+    # app/filename.py::is_test_filename(), the sole source of truth for this
+    # end to end) — confirmed: this decision is a server-side comparison
+    # against device_config, never based on the uploaded filename itself.
+    # Only the FIRST image of a burst (the group's
+    # anchor) is checked — computed once per group and every
     # later image in the same burst inherits it — so this only needs to
     # cover "how close is the wake-up shot to the scheduled time", not the
     # whole burst's duration; a tight 5 minutes leaves little room for

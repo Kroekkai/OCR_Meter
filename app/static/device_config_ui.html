@@ -290,7 +290,8 @@
           <div class="row2">
             <div class="field">
               <label>จำนวนภาพต่อรอบ</label>
-              <select id="f-photo-count"></select>
+              <select id="f-photo-count" disabled></select>
+              <div class="hint">ตอนนี้ fix ไว้ที่ 3 ภาพเสมอ ปรับไม่ได้</div>
             </div>
             <div class="field">
               <label>ระยะห่างระหว่างภาพ (วินาที)</label>
@@ -456,7 +457,7 @@
   }
 
   $("new-btn").addEventListener("click", () => {
-    const meterId = prompt("รหัสมิเตอร์ที่จะตั้งค่า เช่น E103, W201, G101");
+    const meterId = prompt("รหัสมิเตอร์ที่จะตั้งค่า เช่น E103, W201, G050");
     if (!meterId) return;
     selectMeter(meterId.trim().toUpperCase());
   });
@@ -637,7 +638,7 @@
     fillSelect("d1-minute", 0, 59);
     fillSelect("d2-hour", 0, 23);
     fillSelect("d2-minute", 0, 59);
-    fillSelect("f-photo-count", 1, 10);
+    fillSelect("f-photo-count", 3, 3);
     fillSelect("f-photo-delay", 1, 60);
   }
   initSelects();

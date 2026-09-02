@@ -10,9 +10,12 @@ would have told that meter to follow (falling back to DEFAULT_CONFIG for
 an unconfigured meter, exactly like that endpoint does).
 
 Used once per NEW group (the anchor image only) in app/routers/images.py's
-upload handler — every other image joining that group inherits the
-anchor's is_test rather than being checked independently, so a single
-burst is always entirely on-schedule or entirely test, never a mix.
+upload handler — the result decides whether "_Test" gets appended to the
+stored filename (see _stored_filename() there); every other image joining
+that group re-derives the same answer from the anchor's already-decided
+filename (app/filename.py::is_test_filename()) rather than being checked
+independently, so a single burst is always entirely on-schedule or
+entirely test, never a mix.
 """
 import datetime as dt
 
