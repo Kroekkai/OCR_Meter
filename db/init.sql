@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS images_electric (
     meter_id          TEXT        NOT NULL,
     original_filename TEXT,
     device_timestamp  TIMESTAMPTZ,
-    ocr_status        TEXT        NOT NULL DEFAULT 'pending',  -- pending | done | failed
+    ocr_status        TEXT        NOT NULL DEFAULT 'pending',  -- pending | done | failed | dropped
     group_id          TEXT        NOT NULL,
     is_anchor         BOOLEAN     NOT NULL DEFAULT false,
     received_at       TIMESTAMPTZ NOT NULL DEFAULT now()

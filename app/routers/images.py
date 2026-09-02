@@ -9,7 +9,7 @@ from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_u
 from app.config import get_settings
 from app.db import GROUP_ID_INFO, pool, table_for_meter_id
 from app.filename import FilenameParseError, is_test_filename, parse_upload_filename
-from app.grouping import finalize_group, has_normal_group_today
+from app.grouping import finalize_group, has_normal_group_today, mark_group_dropped
 from app.repo import get_image_row, image_out
 from app.schedule_match import is_on_schedule
 from app.schemas import ImageOut, ImageUploadResponse, MeterType, OcrManualEditRequest, OcrStatus
@@ -100,11 +100,21 @@ async def upload_image(
             # instant — see app/grouping.py's matching FOR UPDATE. Locks
             # the ANCHOR row (is_anchor=true) representing the group,
             # not any old numeric self-reference.
+            #
+            # ocr_status = 'pending' matters just as much as the
+            # NOT EXISTS(ocr_jobs...) check now — a dropped group never
+            # gets an ocr_jobs row at all (see
+            # app/grouping.py::mark_group_dropped()), so NOT EXISTS alone
+            # would still be true for it and a new image could wrongly
+            # think it's still "open" and try to join it. Excluding
+            # anything not 'pending' (i.e. already 'done' or 'dropped')
+            # closes that gap.
             open_anchor = await conn.fetchrow(
                 f"""
                 SELECT id, group_id, original_filename FROM {table}
                 WHERE meter_id = $1
                   AND is_anchor = true
+                  AND ocr_status = 'pending'
                   AND received_at > now() - ($2 * interval '1 second')
                   AND NOT EXISTS (SELECT 1 FROM ocr_jobs WHERE group_id = {table}.group_id)
                 ORDER BY id DESC
@@ -192,11 +202,11 @@ async def upload_image(
             if group_count >= target_count:
                 # Re-fetch the anchor row locked — need its
                 # original_filename/device_timestamp to copy into
-                # ocr_jobs, and FOR UPDATE + the NOT EXISTS check right
-                # after is what prevents two uploads that both push the
-                # count over the line at nearly the same instant from
-                # both creating a job for the same group (mirrors the
-                # same race-safety the sweep already has).
+                # ocr_jobs, and FOR UPDATE + the checks right after are
+                # what prevent two uploads that both push the count over
+                # the line at nearly the same instant from both acting
+                # on the same group twice (mirrors the same race-safety
+                # the sweep already has).
                 anchor_row = await conn.fetchrow(
                     f"SELECT * FROM {table} WHERE group_id = $1 AND is_anchor = true FOR UPDATE",
                     image_row["group_id"],
@@ -204,29 +214,31 @@ async def upload_image(
                 already_has_job = await conn.fetchval(
                     "SELECT 1 FROM ocr_jobs WHERE group_id = $1", image_row["group_id"]
                 )
-                if anchor_row is not None and not already_has_job:
+                # anchor_row["ocr_status"] != "pending" catches the case
+                # where a concurrent transaction already called
+                # mark_group_dropped() on this exact group between our
+                # SELECT above and now — belt-and-suspenders alongside
+                # already_has_job, since a dropped group has no ocr_jobs
+                # row to catch it via that check alone.
+                if anchor_row is not None and not already_has_job and anchor_row["ocr_status"] == "pending":
                     anchor_is_test = is_test_filename(anchor_row["original_filename"])
                     if not anchor_is_test and await has_normal_group_today(conn, table, meter_id):
                         # Confirmed rule: at most one normal (non-test)
                         # group per meter per day may be QUEUED for OCR —
-                        # this meter already has one today, so this group
-                        # gets a 'dropped' status row instead of 'queued'
-                        # (confirmed design — a real ocr_jobs row either
-                        # way, never skipping the INSERT entirely; an
-                        # earlier version that skipped it caused this
-                        # group to silently get queued a day late once
-                        # Bangkok midnight rolled over). ocr_job_id stays
-                        # null in THIS response either way — a dropped
-                        # job was never meant to be picked up by anyone,
-                        # so there's nothing meaningful to hand back here.
-                        # images_* rows are left exactly as they are
-                        # (confirmed: never deleted, ocr_status stays
-                        # 'pending' forever). Test groups skip this
-                        # check entirely — no daily limit for them.
-                        await finalize_group(conn, anchor_row, status="dropped")
+                        # this meter already has one today, so this
+                        # group is dropped instead: ocr_status='dropped'
+                        # on every image sharing this group_id, and NO
+                        # ocr_jobs row at all (confirmed design — see
+                        # app/grouping.py::mark_group_dropped()). ocr_job_id
+                        # stays null in THIS response either way — a
+                        # dropped group was never meant to be picked up
+                        # by anyone, so there's nothing meaningful to
+                        # hand back here. Test groups skip this check
+                        # entirely — no daily limit for them.
+                        await mark_group_dropped(conn, table, image_row["group_id"])
                         logger.info(
                             "dropped duplicate normal group %s for meter %s — already has one today "
-                            "(ocr_jobs row created with status='dropped', not skipped)",
+                            "(ocr_status='dropped' on images_*, no ocr_jobs row created)",
                             image_row["group_id"],
                             meter_id,
                         )
