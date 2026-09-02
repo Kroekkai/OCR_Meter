@@ -110,65 +110,26 @@ async def admin_claim_ocr_job(job_id: int, _: CurrentUser = Depends(get_ocr_clie
     return OcrClaimResponse(job=_job_out(updated), image_file_urls=urls)
 
 
-@router.post("/{job_id}/result", response_model=OcrMeterEntry, summary="Admin Submit Ocr Result")
-async def admin_submit_ocr_result(
+async def _submit_ocr_result(
     job_id: int,
-    ocr_reading: float | None = Form(
-        default=None,
-        description="Required when error_type is 0 or 3. Must be omitted for error_type 1 or 2 — there is no reading to report.",
-    ),
-    error_type: int = Form(
-        ...,
-        description=(
-            "Always required. 0 = read successfully, 1 = found the meter but couldn't read the "
-            "digits, 2 = couldn't find any digits/meter in the image at all, 3 = read a value "
-            "successfully but it's anomalous (decreased from last time, or usage spike — the OCR "
-            "client checks this itself against GET .../ocr-readings history, server doesn't compute "
-            "it). Full definitions live server-side in the error_type table — the OCR client just "
-            "reports which code applies. Must be 0, 1, 2, or 3 — validated by hand in the function "
-            "body rather than via a Literal[0,1,2,3] type: that type annotation on a Form() field "
-            "doesn't reliably coerce the string \"0\"/\"1\"/etc. that multipart/form-data always sends "
-            "into the matching int, and rejects it outright with a confusing 422 instead — confirmed "
-            "against a real request while testing, not just theoretical."
-        ),
-    ),
-    _: CurrentUser = Depends(get_ocr_client),
-):
+    ocr_reading: float | None,
+    error_type: int,
+    *,
+    expected_test: bool,
+    wrong_endpoint_hint: str,
+) -> OcrMeterEntry:
     """
-    processing -> done (ocr_jobs), plus one new row in ocr_meter — the
-    clean, standalone results table with no FK back to images_*/ocr_jobs.
-
-    error_type is always required now (0/1/2/3, not free-form business
-    error strings) — see db/init.sql's error_type lookup table for what
-    each code means; the server owns those definitions, the OCR client
-    only ever reports which one applies. Case 3 covers what used to be
-    two separate cases (reading_decreased/usage_anomaly) — the OCR
-    client is still the one that checks history and decides, server just
-    stores whichever code it reports.
-
-    capture_date/capture_time are no longer client-supplied — they're
-    derived from the job's own device_timestamp (when ESP32 captured the
-    photo), not from anything in this request. ocr_meter does NOT carry
-    group_id (confirmed) — that's an internal images_*/ocr_jobs concern
-    only; ocr_meter stays just the 6 confirmed fields.
-
-    No file upload here at all anymore — plain form fields, not
-    multipart. ocr_meter.image_error (only set when error_type != 0) is
-    the FULL disk path (via storage.original_path()) to the job's own
-    original_filename — the SAME file the anchor image was already
-    stored under at upload time, e.g. "/data/images/E101_..._01.jpg", not
-    just the bare filename. The OCR client has no image of its own to
-    contribute here; it never captured anything, ESP32 did, and that
-    file is already on disk. An earlier version of this endpoint
-    accepted a re-uploaded copy via a result_image field —
-    removed, since it added nothing (the OCR client can only ever
-    legitimately attach one of the group's own already-stored photos
-    anyway) and could silently overwrite a *different* image in the same
-    group on disk (the save path was always computed from the anchor's
-    filename, regardless of which photo's bytes were actually attached).
-
-    Only allowed on a job this client actually claimed (status='processing') —
-    same state-machine guard as /claim and /fail.
+    Shared logic behind POST .../result and POST .../result-test —
+    confirmed request: explicit separate endpoints instead of one
+    endpoint that silently picks ocr_meter vs ocr_meter_test for you.
+    Each public endpoint below only accepts jobs of its own type — if
+    the job's actual type (via is_test_filename() on its
+    original_filename, still the sole source of truth) doesn't match
+    which endpoint was called, this rejects with 409 and points at the
+    correct one instead of writing to a table the caller didn't ask
+    for. That's the only thing that makes the split more than
+    cosmetic — without this check, calling either endpoint for any job
+    would silently do the same thing the old single endpoint did.
     """
     VALID_CODES = (0, 1, 2, 3)
     NO_READING_CODES = (1, 2)
@@ -201,6 +162,17 @@ async def admin_submit_ocr_result(
                     detail=f"Job {job_id} is '{job['status']}', not 'processing' — call /claim first",
                 )
 
+            actual_is_test = is_test_filename(job["original_filename"])
+            if actual_is_test != expected_test:
+                kind = "a test capture" if actual_is_test else "a normal (on-schedule) capture"
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Job {job_id} ({job['original_filename']!r}) is {kind} — "
+                        f"use {wrong_endpoint_hint} instead"
+                    ),
+                )
+
             capture_date, capture_time = _capture_date_time_from_device_timestamp(job["device_timestamp"])
 
             # No file write at all — just reference the anchor's filename,
@@ -210,15 +182,13 @@ async def admin_submit_ocr_result(
             # bare filename — storage.original_path() is the single place
             # that computes this path (same helper used to actually save/
             # serve the file), so this is guaranteed to match reality.
-            # The filename itself (last path segment) is unchanged — still
-            # exactly the ESP32's original filename.
             image_error = (
                 str(storage.original_path(job["group_id"], job["original_filename"]))
                 if error_type != 0
                 else None
             )
 
-            target_table = "ocr_meter_test" if is_test_filename(job["original_filename"]) else "ocr_meter"
+            target_table = "ocr_meter_test" if expected_test else "ocr_meter"
             meter_row = await conn.fetchrow(
                 f"""
                 INSERT INTO {target_table}
@@ -246,6 +216,118 @@ async def admin_submit_ocr_result(
             await conn.execute(f"UPDATE {table} SET ocr_status = 'done' WHERE group_id = $1", job["group_id"])
 
     return _meter_out(meter_row)
+
+
+@router.post("/{job_id}/result", response_model=OcrMeterEntry, summary="Admin Submit Ocr Result")
+async def admin_submit_ocr_result(
+    job_id: int,
+    ocr_reading: float | None = Form(
+        default=None,
+        description="Required when error_type is 0 or 3. Must be omitted for error_type 1 or 2 — there is no reading to report.",
+    ),
+    error_type: int = Form(
+        ...,
+        description=(
+            "Always required. 0 = read successfully, 1 = found the meter but couldn't read the "
+            "digits, 2 = couldn't find any digits/meter in the image at all, 3 = read a value "
+            "successfully but it's anomalous (decreased from last time, or usage spike — the OCR "
+            "client checks this itself against GET .../ocr-readings history, server doesn't compute "
+            "it). Full definitions live server-side in the error_type table — the OCR client just "
+            "reports which code applies. Must be 0, 1, 2, or 3 — validated by hand in the function "
+            "body rather than via a Literal[0,1,2,3] type: that type annotation on a Form() field "
+            "doesn't reliably coerce the string \"0\"/\"1\"/etc. that multipart/form-data always sends "
+            "into the matching int, and rejects it outright with a confusing 422 instead — confirmed "
+            "against a real request while testing, not just theoretical."
+        ),
+    ),
+    _: CurrentUser = Depends(get_ocr_client),
+):
+    """
+    processing -> done (ocr_jobs), plus one new row in ocr_meter — the
+    clean, standalone results table with no FK back to images_*/ocr_jobs.
+
+    **Only accepts NORMAL (on-schedule) jobs** — confirmed: if this
+    job's filename carries the "_Test" suffix (is_test_filename()), this
+    rejects with 409 and tells you to call POST .../result-test instead.
+    Explicit separate endpoints per confirmed request, rather than one
+    endpoint silently picking ocr_meter vs ocr_meter_test — see
+    admin_submit_ocr_result_test right below for the test counterpart;
+    both share _submit_ocr_result() so the actual INSERT logic lives
+    once.
+
+    error_type is always required now (0/1/2/3, not free-form business
+    error strings) — see db/init.sql's error_type lookup table for what
+    each code means; the server owns those definitions, the OCR client
+    only ever reports which one applies. Case 3 covers what used to be
+    two separate cases (reading_decreased/usage_anomaly) — the OCR
+    client is still the one that checks history and decides, server just
+    stores whichever code it reports.
+
+    capture_date/capture_time are no longer client-supplied — they're
+    derived from the job's own device_timestamp (when ESP32 captured the
+    photo), not from anything in this request. ocr_meter does NOT carry
+    group_id (confirmed) — that's an internal images_*/ocr_jobs concern
+    only; ocr_meter stays just the 6 confirmed fields.
+
+    No file upload here at all anymore — plain form fields, not
+    multipart. The OCR client has no image of its own to contribute
+    here; it never captured anything, ESP32 did, and that file is
+    already on disk. An earlier version of this endpoint accepted a
+    re-uploaded copy via a result_image field — removed, since it added
+    nothing and could silently overwrite a *different* image in the
+    same group on disk.
+
+    Only allowed on a job this client actually claimed (status='processing') —
+    same state-machine guard as /claim and /fail.
+    """
+    return await _submit_ocr_result(
+        job_id,
+        ocr_reading,
+        error_type,
+        expected_test=False,
+        wrong_endpoint_hint="POST .../result-test",
+    )
+
+
+@router.post("/{job_id}/result-test", response_model=OcrMeterEntry, summary="Admin Submit Ocr Test Result")
+async def admin_submit_ocr_result_test(
+    job_id: int,
+    ocr_reading: float | None = Form(
+        default=None,
+        description="Required when error_type is 0 or 3. Must be omitted for error_type 1 or 2 — there is no reading to report.",
+    ),
+    error_type: int = Form(
+        ...,
+        description=(
+            "Always required. Same 0/1/2/3 meaning as POST .../result — see that endpoint's "
+            "description. This endpoint is identical in every way except which table it writes to "
+            "and which jobs it accepts."
+        ),
+    ),
+    _: CurrentUser = Depends(get_ocr_client),
+):
+    """
+    Mirror of POST .../result directly above — identical request shape,
+    identical validation, identical response shape (OcrMeterEntry) —
+    the only differences: writes to ocr_meter_test instead of
+    ocr_meter, and **only accepts jobs whose filename carries the
+    "_Test" suffix** (is_test_filename()). Calling this for a normal job
+    rejects with 409 and points you at POST .../result instead.
+
+    Confirmed request: an explicitly separate endpoint for test results,
+    mirroring GET /admin/meters/ocr-meter-test on the read side, rather
+    than one shared endpoint that silently routes based on the job's
+    filename. See _submit_ocr_result() — both endpoints share that one
+    implementation, so there's exactly one place the actual INSERT
+    logic lives.
+    """
+    return await _submit_ocr_result(
+        job_id,
+        ocr_reading,
+        error_type,
+        expected_test=True,
+        wrong_endpoint_hint="POST .../result",
+    )
 
 
 @router.post("/{job_id}/fail", response_model=OcrJobOut, summary="Admin Report Ocr Failure")
