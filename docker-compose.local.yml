@@ -69,6 +69,7 @@ services:
       - IMAGE_GROUP_WINDOW_SECONDS=60
       - GROUP_SWEEP_INTERVAL_SECONDS=2
       - IMAGE_GROUP_SIZE=3
+      - SCHEDULE_MATCH_TOLERANCE_MINUTES=5
     volumes:
       - ocr_images_local:/data/images
 

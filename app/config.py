@@ -73,7 +73,7 @@ class Settings(BaseSettings):
     # first image in a burst before finalizing the group into a single
     # ocr_jobs row — whatever arrived by then, not necessarily all of
     # them. See app/grouping.py.
-    image_group_window_seconds: int = 180
+    image_group_window_seconds: int = 60
     # How often the background sweep checks for expired groups to
     # finalize. Independent of the window above — this is just the poll
     # interval, not the wait time itself.
@@ -85,6 +85,21 @@ class Settings(BaseSettings):
     # the full image_group_window_seconds via the background sweep, same
     # as before. See app/routers/images.py's upload handler.
     image_group_size: int = 3
+
+    # --- Scheduled-vs-test capture detection ---------------------------------
+    # A capture counts as "on schedule" if its device_timestamp falls within
+    # this many minutes of any configured slot (date1 or date2) in that
+    # meter's device_config (or DEFAULT_CONFIG if it has none). Outside this
+    # tolerance, the whole group is marked is_test=true — confirmed: this is
+    # a server-side comparison against device_config, never based on the
+    # uploaded filename itself. Only the FIRST image of a burst (the group's
+    # anchor) is checked — is_test is computed once per group and every
+    # later image in the same burst inherits it — so this only needs to
+    # cover "how close is the wake-up shot to the scheduled time", not the
+    # whole burst's duration; a tight 5 minutes leaves little room for
+    # ESP32 clock drift or network delay before that first image reaches
+    # the server, so tighten further only with real drift data in hand.
+    schedule_match_tolerance_minutes: int = 5
 
 
 @lru_cache

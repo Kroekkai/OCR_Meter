@@ -1,4 +1,6 @@
 import datetime as dt
+import logging
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
@@ -7,12 +9,34 @@ from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_u
 from app.config import get_settings
 from app.db import GROUP_ID_INFO, pool, table_for_meter_id
 from app.filename import FilenameParseError, parse_upload_filename
-from app.grouping import finalize_group
+from app.grouping import finalize_group, has_normal_group_today
 from app.repo import get_image_row, image_out
+from app.schedule_match import is_on_schedule
 from app.schemas import ImageOut, ImageUploadResponse, MeterType, OcrManualEditRequest, OcrStatus
 from app import storage
 
+logger = logging.getLogger("ocr_meter_store.images")
+
 router = APIRouter(tags=["default"])
+
+
+def _stored_filename(original: str, is_test: bool) -> str:
+    """
+    Appends "_Test" right before the extension when this capture was
+    determined off-schedule (server-side, via schedule_match.is_on_schedule
+    — never based on anything ESP32 sent) — e.g.
+    "E101_20260901_130000_1.jpg" becomes "E101_20260901_130000_1_Test.jpg".
+    Applied identically to the file saved on disk and to
+    images_*.original_filename, so the two can never disagree — whatever
+    filename a human sees browsing /data/images is exactly what's in the
+    DB, and vice versa. Every image in a test group gets this treatment,
+    not just the anchor (called with that group's shared is_test for
+    every insert, both the anchor-creating branch and the join branch).
+    """
+    if not is_test:
+        return original
+    p = Path(original)
+    return f"{p.stem}_Test{p.suffix}"
 
 
 @router.post(
@@ -78,7 +102,7 @@ async def upload_image(
             # not any old numeric self-reference.
             open_anchor = await conn.fetchrow(
                 f"""
-                SELECT id, group_id FROM {table}
+                SELECT id, group_id, is_test FROM {table}
                 WHERE meter_id = $1
                   AND is_anchor = true
                   AND received_at > now() - ($2 * interval '1 second')
@@ -94,37 +118,50 @@ async def upload_image(
             if open_anchor is not None:
                 # Joins the still-open group — this image is NOT the
                 # anchor, so it just copies the anchor's existing
-                # group_id rather than pulling a new one from the
-                # sequence.
+                # group_id (and is_test) rather than pulling a new
+                # group_id or recomputing the schedule check — a single
+                # burst is always entirely on-schedule or entirely test,
+                # never a mix (confirmed). Stored filename gets "_Test"
+                # too, matching the anchor — see _stored_filename().
+                stored_filename = _stored_filename(file.filename, open_anchor["is_test"])
                 image_row = await conn.fetchrow(
                     f"""
-                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor)
-                    VALUES ($1, $2, $3, 'pending', $4, false)
+                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, is_test)
+                    VALUES ($1, $2, $3, 'pending', $4, false, $5)
                     RETURNING *
                     """,
                     meter_id,
-                    file.filename,
+                    stored_filename,
                     device_timestamp,
                     open_anchor["group_id"],
+                    open_anchor["is_test"],
                 )
             else:
                 # No open group — this image starts a new one as its own
                 # anchor. group_id pulls from the per-type sequence (E1,
                 # E2, ... / W1, W2, ... / G1, G2, ...) — human-readable,
                 # unlike the raw row id which jumps around since all 3
-                # tables share images_id_seq.
+                # tables share images_id_seq. is_test is computed ONCE
+                # here (server-side comparison against device_config —
+                # confirmed NOT based on the filename at all) and
+                # inherited by every later image that joins this group.
+                # Stored filename gets "_Test" appended when off-schedule
+                # — see _stored_filename().
                 new_seq_n = await conn.fetchval(f"SELECT nextval('{group_seq}')")
                 new_group_id = f"{group_prefix}{new_seq_n}"
+                is_test = not await is_on_schedule(conn, meter_id, device_timestamp)
+                stored_filename = _stored_filename(file.filename, is_test)
                 image_row = await conn.fetchrow(
                     f"""
-                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor)
-                    VALUES ($1, $2, $3, 'pending', $4, true)
+                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, is_test)
+                    VALUES ($1, $2, $3, 'pending', $4, true, $5)
                     RETURNING *
                     """,
                     meter_id,
-                    file.filename,
+                    stored_filename,
                     device_timestamp,
                     new_group_id,
+                    is_test,
                 )
 
             # --- Fast path: group just reached this meter's target count? ---
@@ -164,9 +201,30 @@ async def upload_image(
                     "SELECT 1 FROM ocr_jobs WHERE group_id = $1", image_row["group_id"]
                 )
                 if anchor_row is not None and not already_has_job:
-                    ocr_job_id = await finalize_group(conn, anchor_row)
+                    if not anchor_row["is_test"] and await has_normal_group_today(conn, table, meter_id):
+                        # Confirmed rule: at most one normal (non-test)
+                        # group per meter per day may reach ocr_jobs —
+                        # this meter already has one today, so drop this
+                        # group silently. No job, no error, ocr_job_id
+                        # just stays null — looks identical to a group
+                        # that simply hasn't finished yet, and the
+                        # images_* rows are left exactly as they are
+                        # (confirmed: never deleted, ocr_status stays
+                        # 'pending' forever). Test groups skip this
+                        # check entirely — no daily limit for them.
+                        logger.info(
+                            "dropped duplicate normal group %s for meter %s — already has one today",
+                            image_row["group_id"],
+                            meter_id,
+                        )
+                    else:
+                        ocr_job_id = await finalize_group(conn, anchor_row)
 
-    await storage.save_upload(image_row["id"], file.filename, data)
+    # Save under the STORED filename (image_row["original_filename"]),
+    # not the raw file.filename ESP32 sent — these now differ whenever
+    # is_test appended "_Test" above. Using the stored one keeps the disk
+    # file and the DB row in exact agreement always.
+    await storage.save_upload(image_row["id"], image_row["original_filename"], data)
 
     return ImageUploadResponse(
         image=image_out(table, image_row),

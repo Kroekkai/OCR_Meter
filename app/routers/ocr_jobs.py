@@ -218,9 +218,11 @@ async def admin_submit_ocr_result(
                 else None
             )
 
+            target_table = "ocr_meter_test" if job["is_test"] else "ocr_meter"
             meter_row = await conn.fetchrow(
-                """
-                INSERT INTO ocr_meter (meter_id, capture_date, capture_time, ocr_reading, error_type, image_error)
+                f"""
+                INSERT INTO {target_table}
+                    (meter_id, capture_date, capture_time, ocr_reading, error_type, image_error)
                 VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING *
                 """,
