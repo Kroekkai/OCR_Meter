@@ -261,6 +261,21 @@ BEGIN
         DROP TABLE ocr_jobs;
         ALTER TABLE ocr_jobs_reordered RENAME TO ocr_jobs;
         ALTER TABLE ocr_jobs ALTER COLUMN id SET DEFAULT nextval('ocr_jobs_id_seq');
+        ALTER TABLE ocr_jobs RENAME CONSTRAINT ocr_jobs_reordered_pkey TO ocr_jobs_pkey;
+    END IF;
+END $$;
+
+-- เผื่อเคยรัน reorder migration ด้านบนไปแล้วรอบก่อน (ตอนนั้นยังไม่มี
+-- RENAME CONSTRAINT บรรทัดนี้) — constraint ยังค้างชื่อ
+-- ocr_jobs_reordered_pkey อยู่ ทั้งที่ตารางชื่อ ocr_jobs ไปแล้ว (RENAME
+-- TABLE ไม่ rename ชื่อ constraint ตามให้อัตโนมัติ) แก้แยกเป็น
+-- idempotent block ของตัวเอง เช็คว่าชื่อเก่ายังอยู่ก่อนค่อย rename กัน
+-- error ตอนรันซ้ำ (คนละสถานการณ์กับ IF ด้านบนที่เช็คแค่ตอน column
+-- ยังไม่ถูกจัดเรียง — เคสนี้จัดเรียงไปแล้ว เหลือแค่ชื่อ constraint ที่ยังไม่ตรง)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ocr_jobs_reordered_pkey') THEN
+        ALTER TABLE ocr_jobs RENAME CONSTRAINT ocr_jobs_reordered_pkey TO ocr_jobs_pkey;
     END IF;
 END $$;
 
