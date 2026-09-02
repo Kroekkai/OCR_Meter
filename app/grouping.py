@@ -33,15 +33,23 @@ async def has_normal_group_today(conn: asyncpg.Connection, table: str, meter_id:
     this, no separate column anywhere) that was finalized into ocr_jobs
     today — "today" meaning the current Bangkok calendar day, resetting
     at Bangkok midnight (confirmed design). Confirmed rule: at most ONE
-    normal group per meter per day may ever reach ocr_jobs — a second
-    normal group the same day is silently dropped (never gets an
-    ocr_jobs row; its images_* rows are left exactly as they are,
-    is_anchor=true, ocr_status stays 'pending' forever — confirmed NOT
-    deleted). Test groups are exempt from this limit entirely — they can
-    produce as many jobs as they like on any given day, confirmed. The
-    regex here mirrors is_test_filename() exactly (case-insensitive
-    "_test" right before .jpg/.jpeg) — keep the two in sync if either
-    changes.
+    normal group per meter per day may ever be QUEUED for OCR — a
+    second normal group the same day still gets an ocr_jobs row
+    (confirmed design, added after an earlier version that skipped the
+    INSERT entirely caused a real bug: the group would silently get
+    queued a day late once midnight rolled over and stopped counting
+    yesterday's winner), just with status='dropped' rather than
+    'queued' — see app/grouping.py::finalize_group()'s status param and
+    JobStatus in app/schemas.py. This function itself doesn't care
+    which status an existing row has, only that one exists — so once a
+    group gets EITHER a 'queued' or a 'dropped' row, it permanently
+    stops being reconsidered by anything. images_* rows for a dropped
+    group are left exactly as they are, is_anchor=true, ocr_status
+    stays 'pending' forever — confirmed NOT deleted. Test groups are
+    exempt from this limit entirely — they can produce as many jobs as
+    they like on any given day, confirmed. The regex here mirrors
+    is_test_filename() exactly (case-insensitive "_test" right before
+    .jpg/.jpeg) — keep the two in sync if either changes.
     """
     today_midnight_bangkok = dt.datetime.now(BANGKOK_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     row = await conn.fetchval(
@@ -59,7 +67,7 @@ async def has_normal_group_today(conn: asyncpg.Connection, table: str, meter_id:
     return row is not None
 
 
-async def finalize_group(conn: asyncpg.Connection, anchor_row: asyncpg.Record) -> int:
+async def finalize_group(conn: asyncpg.Connection, anchor_row: asyncpg.Record, status: str = "queued") -> int:
     """
     Creates the one ocr_jobs row for a group, given its anchor row's data
     (id, meter_id, group_id, original_filename, device_timestamp — any
@@ -73,6 +81,16 @@ async def finalize_group(conn: asyncpg.Connection, anchor_row: asyncpg.Record) -
     through into ocr_jobs unchanged; no separate is_test column exists
     to copy.
 
+    status defaults to 'queued' (the normal case — a real job for the
+    OCR client to pick up) but callers pass 'dropped' for a same-day
+    duplicate normal group instead (confirmed design) — inserting a row
+    either way, never skipping the INSERT entirely, is what makes the
+    NOT EXISTS(ocr_jobs WHERE group_id=...) check in both the fast path
+    and the sweep permanently true for this group from here on, so it's
+    never reconsidered again — including after Bangkok midnight rolls
+    over has_normal_group_today() to a new day. See JobStatus in
+    app/schemas.py for the bug this fixes.
+
     Caller is responsible for the transaction, the FOR UPDATE lock on
     anchor_row, checking NOT EXISTS(ocr_jobs WHERE group_id = ...) first,
     and (for non-test groups) checking has_normal_group_today() first —
@@ -82,13 +100,14 @@ async def finalize_group(conn: asyncpg.Connection, anchor_row: asyncpg.Record) -
     row = await conn.fetchrow(
         """
         INSERT INTO ocr_jobs (group_id, meter_id, original_filename, device_timestamp, status)
-        VALUES ($1, $2, $3, $4, 'queued')
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING id
         """,
         anchor_row["group_id"],
         anchor_row["meter_id"],
         anchor_row["original_filename"],
         anchor_row["device_timestamp"],
+        status,
     )
     return row["id"]
 
@@ -97,16 +116,18 @@ async def finalize_expired_groups() -> int:
     """
     Finds every burst group whose window has closed and that doesn't have
     an ocr_jobs row yet, and creates one ocr_jobs row per group via
-    finalize_group() — UNLESS that group is a non-test duplicate for a
-    meter that already has a normal group today, per
-    has_normal_group_today() (dropped silently instead: no job, no error,
-    the group's images just stay pending forever). Whatever images
-    arrived within the window join the group; nothing waits for an exact
-    count here — groups that DID already reach their target count were
-    already finalized immediately by the upload handler and won't show
-    up in this query at all (they already have an ocr_jobs row). Returns
-    how many jobs were actually created (used for logging/tests only —
-    does not count groups that were dropped).
+    finalize_group() — status='queued' normally, or status='dropped'
+    (still a real row, confirmed design — see JobStatus in
+    app/schemas.py for why: a truly-skipped INSERT let a dropped group
+    get silently re-queued a day late once Bangkok midnight rolled over)
+    for a non-test duplicate when a meter already has a normal group
+    today, per has_normal_group_today(). Whatever images arrived within
+    the window join the group; nothing waits for an exact count here —
+    groups that DID already reach their target count were already
+    finalized immediately by the upload handler and won't show up in
+    this query at all (they already have an ocr_jobs row, regardless of
+    its status). Returns how many jobs were created with status='queued'
+    (used for logging/tests only — does not count dropped ones).
     """
     settings = get_settings()
     created = 0
@@ -136,9 +157,11 @@ async def finalize_expired_groups() -> int:
                 for row in rows:
                     is_test = is_test_filename(row["original_filename"])
                     if not is_test and await has_normal_group_today(conn, table, row["meter_id"]):
+                        await finalize_group(conn, row, status="dropped")
                         dropped += 1
                         logger.info(
-                            "dropped duplicate normal group %s for meter %s — already has one today",
+                            "dropped duplicate normal group %s for meter %s — already has one today "
+                            "(ocr_jobs row created with status='dropped', not skipped)",
                             row["group_id"],
                             row["meter_id"],
                         )

@@ -208,17 +208,25 @@ async def upload_image(
                     anchor_is_test = is_test_filename(anchor_row["original_filename"])
                     if not anchor_is_test and await has_normal_group_today(conn, table, meter_id):
                         # Confirmed rule: at most one normal (non-test)
-                        # group per meter per day may reach ocr_jobs —
-                        # this meter already has one today, so drop this
-                        # group silently. No job, no error, ocr_job_id
-                        # just stays null — looks identical to a group
-                        # that simply hasn't finished yet, and the
+                        # group per meter per day may be QUEUED for OCR —
+                        # this meter already has one today, so this group
+                        # gets a 'dropped' status row instead of 'queued'
+                        # (confirmed design — a real ocr_jobs row either
+                        # way, never skipping the INSERT entirely; an
+                        # earlier version that skipped it caused this
+                        # group to silently get queued a day late once
+                        # Bangkok midnight rolled over). ocr_job_id stays
+                        # null in THIS response either way — a dropped
+                        # job was never meant to be picked up by anyone,
+                        # so there's nothing meaningful to hand back here.
                         # images_* rows are left exactly as they are
                         # (confirmed: never deleted, ocr_status stays
                         # 'pending' forever). Test groups skip this
                         # check entirely — no daily limit for them.
+                        await finalize_group(conn, anchor_row, status="dropped")
                         logger.info(
-                            "dropped duplicate normal group %s for meter %s — already has one today",
+                            "dropped duplicate normal group %s for meter %s — already has one today "
+                            "(ocr_jobs row created with status='dropped', not skipped)",
                             image_row["group_id"],
                             meter_id,
                         )

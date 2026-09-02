@@ -5,7 +5,19 @@ from pydantic import BaseModel, Field
 
 MeterType = Literal["electric", "water", "gas"]
 OcrStatus = Literal["pending", "done", "failed"]
-JobStatus = Literal["queued", "processing", "done", "failed"]
+JobStatus = Literal["queued", "processing", "done", "failed", "dropped"]
+"""
+"dropped" (added later, confirmed request): a normal group finalized on
+a day its meter already has one — never queued for OCR at all, exists
+only so the sweep's NOT EXISTS(ocr_jobs WHERE group_id=...) check finds
+it and never reconsiders this group again, including after Bangkok
+midnight rolls over (the bug this fixes: without a row here, a dropped
+group's images_* row keeps satisfying the sweep's "no job yet" query
+forever, and the very next midnight makes has_normal_group_today()
+stop counting yesterday's winner — so the dropped group would
+silently get queued a day late otherwise). ocr_reading stays NULL,
+attempts stays 0 — nothing ever claims or processes a dropped job.
+"""
 # 0 = อ่านสำเร็จ, 1 = อ่านเลขมิเตอร์ไม่ได้, 2 = หาตัวเลข/มิเตอร์ไม่เจอเลย,
 # 3 = อ่านได้ค่าแต่ผิดปกติ (รวม reading_decreased/usage_anomaly เดิม) —
 # ความหมายเต็มอยู่ที่ตาราง error_type ใน DB (single source of truth)

@@ -13,7 +13,7 @@ nothing gets silently re-guessed or re-flipped:
 **Confirmed, implemented:**
 - `error_type` is a plain integer 0/1/2/3 (not free-form text) — meanings live in the `error_type` lookup table (`db/init.sql`), server owns the definitions, OCR client just reports the code. Case 3 ("read a value, but anomalous") replaces the old `reading_decreased`/`usage_anomaly` text values as one combined case — still client-computed, server doesn't run this check. `error_detail` column removed from `ocr_meter`. `capture_date`/`capture_time` derived server-side from the job's `device_timestamp` now, never client-supplied. **No file upload on `/result` at all anymore** — it's plain form fields, not multipart; the old `result_image` field is gone (see "ocr_meter" below for why — it was a real risk, not just unnecessary). `ocr_meter.ocr_image_filename` renamed to `image_error`, and its value is now the FULL disk path (e.g. `/data/images/E101_..._01.jpg`, not just the bare filename) to the job's own `original_filename` (the anchor's already-stored file), not a separately uploaded one. `GET /admin/images/{item_id}/ocr-result-file` (original spec) removed accordingly — use `/file` instead. `meter_id` stored uppercase everywhere (was lowercase). `ocr_jobs.last_error`/`admin_reason` columns removed (not persisted anywhere now — `/fail`'s error message only reaches the server log). `group_id` is now the E1/W3/G12-style text code directly (the old numeric `group_id`/self-reference anchor mechanism and the separate `group_label` column from an earlier revision are both gone — merged into one `group_id` column, with a new `is_anchor` boolean replacing the self-reference trick), on `images_*`/`ocr_jobs`. A group also now finalizes into `ocr_jobs` immediately once it reaches `IMAGE_GROUP_SIZE` (3) images, not just on the 60s window fallback. **`ocr_meter` does NOT carry `group_id`** — briefly did in an intermediate revision, confirmed removed: `ocr_meter` is exactly 6 fields (`meter_id`, `capture_date`, `capture_time`, `ocr_reading`, `error_type`, `image_error`), nothing else, group tracking is an `images_*`/`ocr_jobs`-internal concern only. See "ocr_meter", "group_id", and "Burst upload grouping" sections below.
 - `DB_HOST=timescaledb` (container name on `innovation_net`), **not** the host's own IP `192.168.248.199` — connecting via the host's external IP timed out from inside the container (self-referential/hairpin routing back to its own host), confirmed via `docker network inspect innovation_net` while debugging the actual deploy. `timescaledb` and `ocr-meter-store` are both already on that network, so Docker's internal DNS resolves it directly — no IP needed at all.
-- **`is_test_filename()`/`ocr_meter_test`** — every group is checked server-side against that meter's `device_config` schedule (never the filename ESP32 sent) and, when off-schedule, has `_Test` appended to its *stored* filename (both disk and DB) — there is no separate `is_test` column anywhere (tried, then removed); `is_test_filename(original_filename)` is the sole source of truth end to end. Results for test jobs go to the new `ocr_meter_test` table instead of `ocr_meter`. At most one normal (non-test) group per meter per Bangkok calendar day may reach `ocr_jobs` — a same-day duplicate is silently dropped (no job, no error, `images_*` rows left as-is, never deleted); test groups are exempt from this limit entirely. See "Scheduled vs. test captures" below.
+- **`is_test_filename()`/`ocr_meter_test`** — every group is checked server-side against that meter's `device_config` schedule (never the filename ESP32 sent) and, when off-schedule, has `_Test` appended to its *stored* filename (both disk and DB) — there is no separate `is_test` column anywhere (tried, then removed); `is_test_filename(original_filename)` is the sole source of truth end to end. Results for test jobs go to the new `ocr_meter_test` table instead of `ocr_meter`. At most one normal (non-test) group per meter per Bangkok calendar day may be *queued* — a same-day duplicate still gets an `ocr_jobs` row, just with `status='dropped'` rather than `'queued'` (a real row, not skipped — an earlier version that skipped the row entirely had a bug: the duplicate would silently get queued a day late once midnight rolled over); test groups are exempt from this limit entirely. See "Scheduled vs. test captures" below.
 - `ocr_jobs` is one shared table across meter types (per `db/init.sql`) — not split into `ocr_jobs_electric/water/gas`.
 - Upload filename convention: `{meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg`, meter_id/device_timestamp parsed from it (Thailand local time, UTC+7), invalid meter_id prefix → HTTP 400.
 - Auth is fixed-secret-per-deployment: `DEVICE_API_KEY`/`DEVICE_API_KEY_USERNAME` and `OCR_CLIENT_KEY`/`OCR_CLIENT_KEY_USERNAME`, each an *optional shortcut* alongside real JWT login (blank pair = login required). See `app/auth.py`.
@@ -51,6 +51,7 @@ GET    /admin/images
 GET    /admin/images/ocr
 POST   /admin/images/ocr/{job_id}/claim            [X-OCR-Key]
 POST   /admin/images/ocr/{job_id}/result           [X-OCR-Key]   (plain form fields, not multipart — see "ocr_meter" below)
+POST   /admin/images/ocr/{job_id}/result-test      [X-OCR-Key]   (NEW — mirror of /result, writes ocr_meter_test instead, see below)
 POST   /admin/images/ocr/{job_id}/fail             [X-OCR-Key]
 POST   /admin/images/{item_id}/reprocess           [admin JWT]
 GET    /admin/images/{item_id}
@@ -185,10 +186,12 @@ Case 3 covers what used to be two separate string values
 that pulls history and decides (server doesn't compute this), it just
 reports one combined code now instead of two.
 
-`POST /admin/images/ocr/{job_id}/result` covers both a successful read
-AND all 3 error/anomaly outcomes — as opposed to `/fail`, which is only
-for a transient/technical failure where OCR never got far enough to
-reach any outcome at all (network error, `OCR_API_URL` missing, etc.).
+`POST /admin/images/ocr/{job_id}/result` (or its test counterpart,
+`/result-test` — see "Scheduled vs. test captures" below) covers both a
+successful read AND all 3 error/anomaly outcomes — as opposed to
+`/fail`, which is only for a transient/technical failure where OCR
+never got far enough to reach any outcome at all (network error,
+`OCR_API_URL` missing, etc.).
 **No file upload at all anymore** — plain form fields, not
 multipart/form-data:
 
@@ -443,18 +446,37 @@ app/grouping.py::has_normal_group_today(table, meter_id)
 If a meter's burst times out and re-splits into two separate groups the
 same day (e.g. images 1-2 group into `E1` and finalize via the sweep
 before image 3 arrives, so image 3 opens a fresh `E2`) — only the
-*first* group of the day to reach `ocr_jobs` is kept. Any later normal
-group for that same `meter_id` the same day is **silently dropped**
-right before it would have been finalized: no `ocr_jobs` row is
-created, no error is raised, `ocr_job_id` in the upload response just
-stays `null` forever for that group. **Confirmed: the dropped group's
-`images_*` rows are left exactly as they are — never deleted, `is_anchor`
-stays `true`, `ocr_status` stays `'pending'` indefinitely.** The limit
-resets at Bangkok midnight (`00:00` local), computed fresh on every
-check — not a stored "last reset" timestamp anywhere. The check itself
-is now a Postgres regex (`original_filename !~* '_test\.jpe?g$'`)
-mirroring `is_test_filename()` exactly — keep the two in sync if either
-ever changes.
+*first* group of the day to be **queued** is kept. Any later normal
+group for that same `meter_id` the same day still gets an `ocr_jobs`
+row — **with `status='dropped'` instead of `'queued'`, confirmed
+design** (not skipped entirely — see the bug this fixes below).
+`ocr_job_id` in the upload response stays `null` for a dropped group
+either way (nothing meaningful to hand back — it's never going to be
+processed). **Confirmed: the dropped group's `images_*` rows are left
+exactly as they are — never deleted, `is_anchor` stays `true`,
+`ocr_status` stays `'pending'` indefinitely.** The limit resets at
+Bangkok midnight (`00:00` local), computed fresh on every check — not a
+stored "last reset" timestamp anywhere. The check itself is a Postgres
+regex (`original_filename !~* '_test\.jpe?g$'`) mirroring
+`is_test_filename()` exactly — keep the two in sync if either ever
+changes.
+
+**Why a real row instead of skipping the INSERT — a real bug this
+fixes (confirmed, found in production):** an earlier version skipped
+creating any `ocr_jobs` row at all for a dropped group. That group's
+`images_*` anchor kept satisfying the sweep's
+`NOT EXISTS (SELECT 1 FROM ocr_jobs WHERE group_id = ...)` check
+forever, since nothing ever got inserted for it — so the very next
+Bangkok midnight, `has_normal_group_today()` stopped counting
+yesterday's winner (its `received_at` no longer falls within "today"),
+and the sweep would silently queue the previously-dropped group a full
+day late, with a `capture_date` from the day before. Giving the dropped
+group its own `status='dropped'` row closes this permanently: the
+`NOT EXISTS` check becomes false for that `group_id` forever, regardless
+of how many midnights pass, so it's never reconsidered again by either
+the sweep or the fast path. `app/grouping.py::finalize_group()` takes a
+`status` parameter (default `'queued'`) precisely for this — one INSERT
+statement, one code path, for both outcomes.
 
 **Test groups are completely exempt from this daily limit** — a meter
 can produce any number of test groups/jobs in a single day, confirmed.
@@ -466,11 +488,26 @@ duplicated.
 **`ocr_meter_test`** — a table structurally identical to `ocr_meter`
 (same 6 columns, own sequence, own index), confirmed to hold *only*
 results from off-schedule jobs, completely separate from normal
-`ocr_meter` data. `POST /admin/images/ocr/{job_id}/result` picks the
-target table by calling `is_test_filename(job["original_filename"])`
-at write time — everything else about that endpoint (validation,
-`capture_date`/`capture_time` derivation, `image_error` path) is
-identical regardless of which table the row lands in.
+`ocr_meter` data.
+
+**Writing them — two explicitly separate endpoints too, confirmed
+(a later change; there was briefly one shared endpoint that picked the
+table for you — replaced with this):**
+```
+POST /admin/images/ocr/{job_id}/result        -> ocr_meter only
+POST /admin/images/ocr/{job_id}/result-test   -> ocr_meter_test only
+```
+Both share one implementation, `_submit_ocr_result()`
+(`app/routers/ocr_jobs.py`) — identical request shape, identical
+validation, identical response shape (`OcrMeterEntry`); the only
+difference is which table each writes to and which jobs each accepts.
+**Each endpoint checks the job's actual type against which one was
+called** — `is_test_filename(job["original_filename"])` — and rejects
+with `409` (naming the other endpoint to use instead) on a mismatch,
+rather than silently writing to whichever table the filename implies
+regardless of which URL was hit. This is what makes the split more
+than cosmetic: calling `/result` for a test job (or `/result-test` for
+a normal one) is a hard error, not a silent misroute.
 
 **Reading them back — two explicitly separate endpoints, confirmed
 request:**

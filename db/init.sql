@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS ocr_jobs (
     original_filename TEXT,
     device_timestamp  TIMESTAMPTZ,
     ocr_reading       NUMERIC,
-    status            TEXT        NOT NULL DEFAULT 'queued',  -- queued | processing | done | failed
+    status            TEXT        NOT NULL DEFAULT 'queued',  -- queued | processing | done | failed | dropped
     attempts          BIGINT      NOT NULL DEFAULT 0
 );
 
