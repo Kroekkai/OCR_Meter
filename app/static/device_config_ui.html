@@ -214,9 +214,8 @@
   .mode-toggle button { flex: 1; }
   .mode-toggle button.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
 
-  .row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-  .row3.daily-mode { grid-template-columns: repeat(2, 1fr); }
   .row2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .row2.daily-mode { grid-template-columns: 1fr; }
   .field label { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 5px; }
 
   .date-block { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
@@ -301,18 +300,14 @@
         <fieldset>
           <legend>รอบเวลาหลัก</legend>
           <div class="date-block" id="date1-block">
-            <div class="row3" id="d1-row">
-              <div class="field" id="d1-date-field">
-                <label>วันที่</label>
-                <input type="date" id="d1-date">
+            <div class="row2" id="d1-row">
+              <div class="field" id="d1-day-field">
+                <label>วัน (1-31)</label>
+                <select id="d1-day"></select>
               </div>
               <div class="field">
-                <label>ชั่วโมง</label>
-                <select id="d1-hour"></select>
-              </div>
-              <div class="field">
-                <label>นาที</label>
-                <select id="d1-minute"></select>
+                <label>เวลา</label>
+                <input type="time" id="d1-time">
               </div>
             </div>
           </div>
@@ -332,18 +327,14 @@
             </label>
           </div>
           <div class="date-block disabled" id="date2-block">
-            <div class="row3" id="d2-row">
-              <div class="field" id="d2-date-field">
-                <label>วันที่</label>
-                <input type="date" id="d2-date">
+            <div class="row2" id="d2-row">
+              <div class="field" id="d2-day-field">
+                <label>วัน (1-31)</label>
+                <select id="d2-day"></select>
               </div>
               <div class="field">
-                <label>ชั่วโมง</label>
-                <select id="d2-hour"></select>
-              </div>
-              <div class="field">
-                <label>นาที</label>
-                <select id="d2-minute"></select>
+                <label>เวลา</label>
+                <input type="time" id="d2-time">
               </div>
             </div>
           </div>
@@ -574,48 +565,43 @@
   // calendar picker guarantees any date it produces is a real one (no
   // Feb 30, no month 13), so there's nothing left to range-check here
   // the way the old separate day/month/year selects needed.
+  // Month/Year are always 0 per the spec ("Month: ใส่ 0", "Year: ใส่ 0")
+  // — hardcoded here, no longer collected from the UI at all (a
+  // calendar <input type="date"> briefly replaced Day/Month/Year
+  // entirely — reverted per confirmed request back to a plain Day
+  // (1-31) dropdown, paired with a single <input type="time"> instead
+  // of separate Hour/Minute dropdowns).
   function fillDate(prefix, arr) {
-    const [day, month, year] = arr;
-    $(prefix + "-date").value =
-      day && month && year
-        ? String(year).padStart(4, "0") + "-" + String(month).padStart(2, "0") + "-" + String(day).padStart(2, "0")
-        : "";
-    $(prefix + "-hour").value = arr[3];
-    $(prefix + "-minute").value = arr[4];
+    $(prefix + "-day").value = arr[0] || 1;
+    $(prefix + "-time").value = String(arr[3]).padStart(2, "0") + ":" + String(arr[4]).padStart(2, "0");
   }
   function readDate(prefix) {
-    const raw = $(prefix + "-date").value; // "YYYY-MM-DD" or ""
-    let day = 0, month = 0, year = 0;
+    const day = parseInt($(prefix + "-day").value, 10) || 0;
+    const raw = $(prefix + "-time").value; // "HH:MM" or ""
+    let hour = 0, minute = 0;
     if (raw) {
-      const parts = raw.split("-");
-      year = parseInt(parts[0], 10) || 0;
-      month = parseInt(parts[1], 10) || 0;
-      day = parseInt(parts[2], 10) || 0;
+      const parts = raw.split(":");
+      hour = parseInt(parts[0], 10) || 0;
+      minute = parseInt(parts[1], 10) || 0;
     }
-    return [
-      day,
-      month,
-      year,
-      parseInt($(prefix + "-hour").value, 10) || 0,
-      parseInt($(prefix + "-minute").value, 10) || 0,
-    ];
+    return [day, 0, 0, hour, minute];
   }
 
   function setMode(mode) {
     scheduleMode = mode;
     $("mode-0").classList.toggle("selected", mode === 0);
     $("mode-1").classList.toggle("selected", mode === 1);
-    // schedule_mode=0 (daily): only Hour/Minute matter for a "same time
-    // every day" schedule — the calendar date is meaningless, and so is
-    // a second daily round (a single hour/minute already fires every
-    // day; a "second round" concept only makes sense for Fix date).
-    // Hide the date field and the whole second-round section rather
-    // than let someone set values that get silently ignored.
+    // schedule_mode=0 (daily): only the Time matters for a "same time
+    // every day" schedule — the Day is meaningless, and so is a second
+    // daily round (a single time already fires every day; a "second
+    // round" concept only makes sense for Fix date). Hide the day field
+    // and the whole second-round section rather than let someone set
+    // values that get silently ignored.
     const hide = mode === 0 ? "none" : "block";
-    $("d1-date-field").style.display = hide;
+    $("d1-day-field").style.display = hide;
     $("second-round-fieldset").style.display = hide;
-    // Collapse the grid to 2 even columns (hour/minute) instead of
-    // leaving an empty column track where the date picker used to sit.
+    // Collapse the grid to 1 full-width column (just Time) instead of
+    // leaving an empty column track where Day used to sit.
     $("d1-row").classList.toggle("daily-mode", mode === 0);
   }
   $("mode-0").addEventListener("click", () => setMode(0));
@@ -638,8 +624,12 @@
       return;
     }
     const date1 = readDate("d1");
-    if (scheduleMode === 1 && !$("d1-date").value) {
-      showSaveMsg("โหมด Fix date ต้องเลือกวันที่", true);
+    // Day is a <select> now (always has some value, 1-31, never
+    // "empty") — Time is the one that can genuinely be unset, and
+    // matters in BOTH modes (Daily only cares about time; Fix date
+    // needs both, but day alone can't be missing anymore either way).
+    if (!$("d1-time").value) {
+      showSaveMsg("ต้องเลือกเวลา", true);
       return;
     }
     // Daily mode: second round doesn't apply at all (see setMode) —
@@ -647,8 +637,8 @@
     // state from a previous Fix-date session, rather than trust a
     // checkbox the user can no longer even see.
     const d2Enabled = scheduleMode === 1 && $("d2-enable").checked;
-    if (d2Enabled && !$("d2-date").value) {
-      showSaveMsg("รอบเวลาที่สองต้องเลือกวันที่ (หรือปิดสวิตช์ถ้าไม่ใช้)", true);
+    if (d2Enabled && !$("d2-time").value) {
+      showSaveMsg("รอบเวลาที่สองต้องเลือกเวลา (หรือปิดสวิตช์ถ้าไม่ใช้)", true);
       return;
     }
     const date2 = d2Enabled ? readDate("d2") : [0, 0, 0, 0, 0];
@@ -709,10 +699,8 @@
     }
   }
   function initSelects() {
-    fillSelect("d1-hour", 0, 23);
-    fillSelect("d1-minute", 0, 59);
-    fillSelect("d2-hour", 0, 23);
-    fillSelect("d2-minute", 0, 59);
+    fillSelect("d1-day", 1, 31);
+    fillSelect("d2-day", 1, 31);
     fillSelect("f-photo-count", 3, 3);
     fillSelect("f-photo-delay", 1, 60);
   }
