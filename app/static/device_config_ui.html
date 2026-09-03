@@ -214,8 +214,9 @@
   .mode-toggle button { flex: 1; }
   .mode-toggle button.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
 
+  .row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .row3.daily-mode { grid-template-columns: repeat(2, 1fr); }
   .row2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-  .row2.daily-mode { grid-template-columns: 1fr; }
   .field label { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 5px; }
 
   .date-block { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
@@ -237,6 +238,17 @@
   #save-msg.err { color: var(--danger); }
 
   .hint { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+  .static-box {
+    font-family: var(--mono);
+    font-size: 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    border-radius: 6px;
+    padding: 8px 10px;
+    width: 100%;
+    box-sizing: border-box;
+  }
 </style>
 </head>
 <body>
@@ -300,14 +312,18 @@
         <fieldset>
           <legend>รอบเวลาหลัก</legend>
           <div class="date-block" id="date1-block">
-            <div class="row2" id="d1-row">
+            <div class="row3" id="d1-row">
               <div class="field" id="d1-day-field">
                 <label>วัน (1-31)</label>
                 <select id="d1-day"></select>
               </div>
               <div class="field">
-                <label>เวลา</label>
-                <input type="time" id="d1-time">
+                <label>ชั่วโมง</label>
+                <select id="d1-hour"></select>
+              </div>
+              <div class="field">
+                <label>นาที</label>
+                <select id="d1-minute"></select>
               </div>
             </div>
           </div>
@@ -327,14 +343,18 @@
             </label>
           </div>
           <div class="date-block disabled" id="date2-block">
-            <div class="row2" id="d2-row">
+            <div class="row3" id="d2-row">
               <div class="field" id="d2-day-field">
                 <label>วัน (1-31)</label>
                 <select id="d2-day"></select>
               </div>
               <div class="field">
-                <label>เวลา</label>
-                <input type="time" id="d2-time">
+                <label>ชั่วโมง</label>
+                <select id="d2-hour"></select>
+              </div>
+              <div class="field">
+                <label>นาที</label>
+                <select id="d2-minute"></select>
               </div>
             </div>
           </div>
@@ -345,7 +365,7 @@
           <div class="row2">
             <div class="field">
               <label>จำนวนภาพต่อรอบ</label>
-              <select id="f-photo-count" disabled></select>
+              <div class="static-box" id="f-photo-count">3</div>
               <div class="hint">ตอนนี้ fix ไว้ที่ 3 ภาพเสมอ ปรับไม่ได้</div>
             </div>
             <div class="field">
@@ -556,7 +576,7 @@
     toggleDate2(hasSecond);
     fillDate("d2", cfg.date2[0] ? cfg.date2 : [1, 0, 0, 0, 0]);
 
-    $("f-photo-count").value = cfg.photo_count;
+    $("f-photo-count").textContent = cfg.photo_count;
     $("f-photo-delay").value = cfg.photo_delay;
     $("save-msg").textContent = "";
   }
@@ -566,25 +586,25 @@
   // Feb 30, no month 13), so there's nothing left to range-check here
   // the way the old separate day/month/year selects needed.
   // Month/Year are always 0 per the spec ("Month: ใส่ 0", "Year: ใส่ 0")
-  // — hardcoded here, no longer collected from the UI at all (a
-  // calendar <input type="date"> briefly replaced Day/Month/Year
-  // entirely — reverted per confirmed request back to a plain Day
-  // (1-31) dropdown, paired with a single <input type="time"> instead
-  // of separate Hour/Minute dropdowns).
+  // — hardcoded here, no longer collected from the UI at all. Day,
+  // Hour, Minute are three separate <select> dropdowns (confirmed:
+  // Hour/Minute must stay separate, not merged into a single
+  // <input type="time"> — a brief earlier version tried that merge in
+  // the JS here without actually updating the HTML to match, which was
+  // a real bug — this fixes that mismatch).
   function fillDate(prefix, arr) {
     $(prefix + "-day").value = arr[0] || 1;
-    $(prefix + "-time").value = String(arr[3]).padStart(2, "0") + ":" + String(arr[4]).padStart(2, "0");
+    $(prefix + "-hour").value = arr[3];
+    $(prefix + "-minute").value = arr[4];
   }
   function readDate(prefix) {
-    const day = parseInt($(prefix + "-day").value, 10) || 0;
-    const raw = $(prefix + "-time").value; // "HH:MM" or ""
-    let hour = 0, minute = 0;
-    if (raw) {
-      const parts = raw.split(":");
-      hour = parseInt(parts[0], 10) || 0;
-      minute = parseInt(parts[1], 10) || 0;
-    }
-    return [day, 0, 0, hour, minute];
+    return [
+      parseInt($(prefix + "-day").value, 10) || 0,
+      0,
+      0,
+      parseInt($(prefix + "-hour").value, 10) || 0,
+      parseInt($(prefix + "-minute").value, 10) || 0,
+    ];
   }
 
   function setMode(mode) {
@@ -613,7 +633,7 @@
   $("d2-enable").addEventListener("change", (e) => toggleDate2(e.target.checked));
 
   async function saveConfig() {
-    const photoCount = parseInt($("f-photo-count").value, 10);
+    const photoCount = parseInt($("f-photo-count").textContent, 10);
     const photoDelay = parseInt($("f-photo-delay").value, 10);
     if (!(photoCount >= 1 && photoCount <= 10)) {
       showSaveMsg("จำนวนภาพต้องอยู่ระหว่าง 1-10", true);
@@ -624,23 +644,14 @@
       return;
     }
     const date1 = readDate("d1");
-    // Day is a <select> now (always has some value, 1-31, never
-    // "empty") — Time is the one that can genuinely be unset, and
-    // matters in BOTH modes (Daily only cares about time; Fix date
-    // needs both, but day alone can't be missing anymore either way).
-    if (!$("d1-time").value) {
-      showSaveMsg("ต้องเลือกเวลา", true);
-      return;
-    }
+    // Day, Hour, Minute are all <select> dropdowns now — every one of
+    // them always has some value (never "empty" the way a text/date/time
+    // input could be), so there's nothing left to validate here.
     // Daily mode: second round doesn't apply at all (see setMode) —
     // force date2 to [0,0,0,0,0] regardless of the checkbox's leftover
     // state from a previous Fix-date session, rather than trust a
     // checkbox the user can no longer even see.
     const d2Enabled = scheduleMode === 1 && $("d2-enable").checked;
-    if (d2Enabled && !$("d2-time").value) {
-      showSaveMsg("รอบเวลาที่สองต้องเลือกเวลา (หรือปิดสวิตช์ถ้าไม่ใช้)", true);
-      return;
-    }
     const date2 = d2Enabled ? readDate("d2") : [0, 0, 0, 0, 0];
     const body = {
       schedule_mode: scheduleMode,
@@ -700,8 +711,11 @@
   }
   function initSelects() {
     fillSelect("d1-day", 1, 31);
+    fillSelect("d1-hour", 0, 23);
+    fillSelect("d1-minute", 0, 59);
     fillSelect("d2-day", 1, 31);
-    fillSelect("f-photo-count", 3, 3);
+    fillSelect("d2-hour", 0, 23);
+    fillSelect("d2-minute", 0, 59);
     fillSelect("f-photo-delay", 1, 60);
   }
   initSelects();
