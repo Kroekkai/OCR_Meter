@@ -554,12 +554,14 @@ row's own `capture_date`/`capture_time` via Postgres's
 place — see `_capture_date_time_from_device_timestamp()` in
 `app/routers/ocr_jobs.py`). A `LEFT` (not inner) join so a row without
 a matching image still comes back with `anchor_image_path: null`
-instead of vanishing from the list. `OcrMeterTestEntry`
-(`app/schemas.py`) is `OcrMeterEntry` plus this one optional field —
-used only by this one listing endpoint; `POST .../result-test` itself
-still returns a plain `OcrMeterEntry`, same as `POST .../result`, and
-`ocr_meter`/`ocr_meter_test`'s actual table shapes remain identical to
-each other and untouched.
+instead of vanishing from the list. `group_id` (confirmed request —
+lets the dashboard show which burst a card came from) rides along on
+the exact same join, same `null`-on-miss behavior — no second query.
+`OcrMeterTestEntry` (`app/schemas.py`) is `OcrMeterEntry` plus these two
+optional fields — used only by this one listing endpoint;
+`POST .../result-test` itself still returns a plain `OcrMeterEntry`,
+same as `POST .../result`, and `ocr_meter`/`ocr_meter_test`'s actual
+table shapes remain identical to each other and untouched.
 
 **`GET /admin/images-by-filename/{filename}/file`** — a second
 image-serving endpoint alongside the existing `GET
@@ -797,18 +799,24 @@ curl -X PUT http://localhost:3003/admin/device-config/E101 \
    session cookie instead of reusing the JWT-in-localStorage pattern)
    is wanted instead.
 
-   **"ผลทดสอบ" (test results) tab — confirmed request, added later,
-   same page.** A top-level tab switcher in the header swaps the whole
-   `<main>` between the config UI above and a second view: an optional
-   meter-ID filter plus a card list pulling from
-   `GET /admin/meters/ocr-meter-test` — each card shows the group's
-   anchor image (loaded via `GET /admin/images-by-filename/{filename}/file`,
-   `fetch()`ed with the JWT attached and shown through a
-   `URL.createObjectURL()` blob, since a plain `<img src>` can't send an
-   `Authorization` header), the reading, and a color-coded
-   `error_type` badge. Confirmed scope: anchor image only (not every
-   image in the group) and only for `ocr_meter_test` — `ocr_meter`
-   itself has no equivalent view.
+   **"ผลทดสอบล่าสุด" (recent test results) section — confirmed request,
+   same page, integrated into the meter detail form itself (a brief
+   earlier version put this behind a separate top-level tab instead —
+   replaced with this after confirming it should live on the config
+   page, scoped to whichever meter is currently selected).** Loads
+   automatically every time `selectMeter()` runs — a card list pulling
+   from `GET /admin/meters/ocr-meter-test?meter_id=...&limit=10` — each
+   card shows the group's `group_id` (E1/W3/G12-style — rides the same
+   query-time `LEFT JOIN` `anchor_image_path` comes from, see
+   `app/routers/meters.py`), the anchor image (loaded via
+   `GET /admin/images-by-filename/{filename}/file`, `fetch()`ed with the
+   JWT attached and shown through a `URL.createObjectURL()` blob, since
+   a plain `<img src>` can't send an `Authorization` header), the
+   reading, and a color-coded `error_type` badge. Clicking a thumbnail
+   opens it full-size in a simple fixed-position lightbox overlay
+   (click anywhere to close) — confirmed request. Confirmed scope:
+   anchor image only (not every image in the group) and only for
+   `ocr_meter_test` — `ocr_meter` itself has no equivalent section.
 
 `date1`/`date2` are stored as raw Postgres `INTEGER[]` (5 elements,
 `CHECK`-constrained to exactly 5), matching the wire format exactly —

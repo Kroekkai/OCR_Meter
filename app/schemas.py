@@ -193,6 +193,14 @@ class OcrMeterEntry(BaseModel):
 # --------------------------------------------------------------------------
 class OcrMeterTestEntry(OcrMeterEntry):
     anchor_image_path: str | None
+    group_id: str | None
+    """
+    E1/W3/G12-style — rides along on the same LEFT JOIN as
+    anchor_image_path (see app/routers/meters.py), so it's null under
+    the exact same condition (the anchor image row couldn't be matched).
+    Confirmed request: lets the dashboard's per-meter test-results
+    section show which burst each card came from.
+    """
 
 
 # --------------------------------------------------------------------------

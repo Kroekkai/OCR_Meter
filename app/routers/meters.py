@@ -46,8 +46,14 @@ async def _list_ocr_meter_test_rows(meter_id: str | None, limit: int, offset: in
     reinterprets a naive timestamp as Bangkok-local and converts it back
     to the UTC-based timestamptz device_timestamp actually is. A LEFT
     (not INNER) JOIN so a row without a matching image still comes back
-    with anchor_image_path=null rather than disappearing from the list
-    entirely.
+    with anchor_image_path=null (and group_id=null) rather than
+    disappearing from the list entirely.
+
+    group_id (E1/W3/G12-style, confirmed request — added for the
+    dashboard's per-meter test-results section, so an admin can tell
+    which burst each card came from) rides along on the exact same JOIN
+    — no second query needed, it's just another column on the same
+    images_* row anchor_image_path already comes from.
     """
     clauses, params = [], []
     if meter_id:
@@ -57,14 +63,14 @@ async def _list_ocr_meter_test_rows(meter_id: str | None, limit: int, offset: in
     params.extend([limit, offset])
     rows = await pool().fetch(
         f"""
-        SELECT o.*, i.original_filename AS anchor_filename
+        SELECT o.*, i.original_filename AS anchor_filename, i.group_id AS anchor_group_id
         FROM ocr_meter_test o
         LEFT JOIN (
-            SELECT meter_id, device_timestamp, original_filename FROM images_electric WHERE is_anchor = true
+            SELECT meter_id, device_timestamp, original_filename, group_id FROM images_electric WHERE is_anchor = true
             UNION ALL
-            SELECT meter_id, device_timestamp, original_filename FROM images_water WHERE is_anchor = true
+            SELECT meter_id, device_timestamp, original_filename, group_id FROM images_water WHERE is_anchor = true
             UNION ALL
-            SELECT meter_id, device_timestamp, original_filename FROM images_gas WHERE is_anchor = true
+            SELECT meter_id, device_timestamp, original_filename, group_id FROM images_gas WHERE is_anchor = true
         ) i ON i.meter_id = o.meter_id
            AND i.device_timestamp = (o.capture_date + o.capture_time) AT TIME ZONE 'Asia/Bangkok'
         {where}
@@ -78,6 +84,7 @@ async def _list_ocr_meter_test_rows(meter_id: str | None, limit: int, offset: in
     for r in rows:
         d = dict(r)
         filename = d.pop("anchor_filename")
+        d["group_id"] = d.pop("anchor_group_id")
         d["anchor_image_path"] = str(upload_dir / filename) if filename else None
         results.append(OcrMeterTestEntry(**d))
     return results
