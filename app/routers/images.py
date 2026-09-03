@@ -365,6 +365,35 @@ async def admin_get_image_file(item_id: int, _: CurrentUser = Depends(get_admin_
     return FileResponse(path, media_type="image/jpeg")
 
 
+@router.get("/admin/images-by-filename/{filename}/file", summary="Admin Get Image File By Filename")
+async def admin_get_image_file_by_filename(filename: str, _: CurrentUser = Depends(get_admin_or_service)):
+    """
+    NOT in either original spec — added for the dashboard's test-results
+    view (app/static/device_config_ui.html), which only has
+    OcrMeterTestEntry.anchor_image_path (a full disk path, e.g.
+    "/data/images/E101_..._Test.jpg" — see app/schemas.py) to work with,
+    not an images_*.id the way GET /admin/images/{item_id}/file needs.
+    The dashboard extracts just the filename from that path client-side
+    and calls this instead.
+
+    filename is validated to reject any path separator or ".." before
+    ever touching the filesystem — confirmed necessary: this endpoint
+    takes a caller-supplied string and joins it onto settings.upload_dir,
+    so without this check a crafted filename could walk outside that
+    directory (e.g. "../../etc/passwd"). Deliberately stricter than
+    storage.original_path() (used by the item_id-based endpoint above),
+    which only ever receives filenames already validated at upload time
+    by app/filename.py's regex — this one has no such guarantee, since
+    it comes straight from the request path.
+    """
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid filename")
+    path = Path(get_settings().upload_dir) / filename
+    if not path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image file missing on disk")
+    return FileResponse(path, media_type="image/jpeg")
+
+
 # GET .../ocr-result-file removed — there's no separate "OCR result"
 # file anymore (see app/routers/ocr_jobs.py's /result docstring). For
 # the same image on an error/anomaly row, use this same endpoint
