@@ -177,6 +177,25 @@ class OcrMeterEntry(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# OcrMeterTestEntry — NOT a DB table shape (confirmed: no schema change
+# on ocr_meter_test for this — an earlier version added a stored
+# anchor_image_path column there, reverted). anchor_image_path here is
+# computed at read time only, by
+# app/routers/meters.py::_list_ocr_meter_test_rows() — a LEFT JOIN
+# against every images_* table's is_anchor=true rows, matched on
+# meter_id + device_timestamp (reconstructed from this row's own
+# capture_date/capture_time). Optional because the join can miss (the
+# anchor image was deleted, or in some future edge case) — the row still
+# comes back rather than silently disappearing from the list, just
+# without a picture. Used only by GET /admin/meters/ocr-meter-test;
+# POST .../result-test itself still returns a plain OcrMeterEntry, same
+# as POST .../result — this field only exists for that one listing view.
+# --------------------------------------------------------------------------
+class OcrMeterTestEntry(OcrMeterEntry):
+    anchor_image_path: str | None
+
+
+# --------------------------------------------------------------------------
 # device_config — NOT part of the original confirmed spec. From a
 # separate ESP32 "device configuration" API spec doc another team sent
 # (GET /devices/config) — see app/routers/device_config.py.

@@ -45,6 +45,12 @@
     letter-spacing: 0.01em;
   }
   header h1 span { color: var(--text-muted); font-weight: 400; }
+  .view-tabs { display: flex; gap: 6px; }
+  .view-tabs .view-tab {
+    padding: 7px 16px;
+    font-size: 13px;
+  }
+  .view-tabs .view-tab.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
   #whoami { color: var(--text-muted); font-size: 13px; display: flex; align-items: center; gap: 12px; }
   button {
     font-family: var(--sans);
@@ -135,6 +141,52 @@
   #list-empty { color: var(--text-muted); font-size: 13px; padding: 12px 10px; }
 
   #detail-pane { padding: 24px 32px; max-width: 560px; }
+
+  /* test results view */
+  #tr-pane { padding: 24px 32px; max-width: 900px; margin: 0 auto; width: 100%; }
+  .tr-controls { display: flex; gap: 10px; margin-bottom: 20px; }
+  .tr-controls input { flex: 1; }
+  .tr-controls button { flex-shrink: 0; }
+  .tr-empty { color: var(--text-muted); font-size: 13px; padding: 12px 0; }
+  .tr-card {
+    display: flex;
+    gap: 16px;
+    padding: 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 10px;
+    align-items: center;
+  }
+  .tr-thumb {
+    width: 84px;
+    height: 84px;
+    border-radius: 6px;
+    background: var(--bg);
+    object-fit: cover;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+  }
+  .tr-thumb.tr-thumb-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  .tr-meta { flex: 1; min-width: 0; }
+  .tr-meta .tr-meter { font-family: var(--mono); font-size: 14px; font-weight: 600; }
+  .tr-meta .tr-when { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .tr-meta .tr-reading { font-family: var(--mono); font-size: 20px; margin-top: 6px; }
+  .tr-badge {
+    display: inline-block;
+    font-size: 11px;
+    padding: 3px 9px;
+    border-radius: 4px;
+    margin-top: 6px;
+  }
+  .tr-badge.ok { background: rgba(79,184,168,0.15); color: var(--accent); }
+  .tr-badge.err { background: rgba(217,113,79,0.15); color: var(--gas); }
+  .tr-badge.warn { background: rgba(232,179,57,0.15); color: var(--electric); }
   #detail-empty { color: var(--text-muted); padding: 24px 0; }
   #detail-empty p { max-width: 360px; }
 
@@ -195,12 +247,16 @@
 <div id="app">
   <header>
     <h1>Meter config <span>— ตารางถ่ายภาพ ESP32</span></h1>
+    <div class="view-tabs" id="view-tabs">
+      <button type="button" class="view-tab selected" data-view="config">ตั้งค่า</button>
+      <button type="button" class="view-tab" data-view="test-results">ผลทดสอบ</button>
+    </div>
     <div id="whoami">
       <span id="whoami-name"></span>
       <button id="logout-btn">ออกจากระบบ</button>
     </div>
   </header>
-  <main>
+  <main id="config-view">
     <div id="list-pane">
       <div class="pane-head">
         <h2>มิเตอร์</h2>
@@ -306,6 +362,17 @@
           <span id="save-msg"></span>
         </div>
       </div>
+    </div>
+  </main>
+
+  <main id="test-results-view" style="display:none">
+    <div id="tr-pane">
+      <div class="tr-controls">
+        <input type="text" id="tr-meter-filter" placeholder="กรอง meter ID (เว้นว่าง = ทุกมิเตอร์)">
+        <button id="tr-load-btn" class="primary">โหลด</button>
+      </div>
+      <div id="tr-empty" class="tr-empty">กด "โหลด" เพื่อดูผลทดสอบ</div>
+      <div id="tr-list"></div>
     </div>
   </main>
 </div>
@@ -642,6 +709,115 @@
     fillSelect("f-photo-delay", 1, 60);
   }
   initSelects();
+
+  // ---------- view switching (config <-> test results) ----------
+  document.querySelectorAll("#view-tabs .view-tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("#view-tabs .view-tab").forEach((b) => b.classList.toggle("selected", b === btn));
+      const view = btn.dataset.view;
+      $("config-view").style.display = view === "config" ? "grid" : "none";
+      $("test-results-view").style.display = view === "test-results" ? "block" : "none";
+    });
+  });
+
+  // ---------- test results (ocr_meter_test) ----------
+  const ERROR_TYPE_LABEL = {
+    0: { text: "อ่านสำเร็จ", cls: "ok" },
+    1: { text: "อ่านเลขไม่ได้", cls: "err" },
+    2: { text: "หาตัวเลข/มิเตอร์ไม่เจอ", cls: "err" },
+    3: { text: "ค่าผิดปกติ", cls: "warn" },
+  };
+
+  // Authenticated <img> loading — a plain <img src="..."> can't send the
+  // Authorization header this endpoint requires, so fetch() the bytes
+  // with the header attached (same as every other call here) and hand
+  // the <img> a local object URL instead. Object URLs are never
+  // revoked here — this is a small admin tool, not a long-running SPA
+  // with a real memory-pressure concern, and revoking one out from
+  // under an <img> that's still on screen would just break the image.
+  async function loadThumb(imgEl, anchorImagePath) {
+    // anchor_image_path can genuinely be null now — the LEFT JOIN behind
+    // GET /admin/meters/ocr-meter-test (app/routers/meters.py) misses
+    // when the anchor image row can't be matched (e.g. it was deleted).
+    // The row itself still comes back rather than disappearing from the
+    // list, just without a picture — same "ไม่มีภาพ" placeholder as an
+    // outright failed fetch below.
+    if (!anchorImagePath) {
+      imgEl.outerHTML = '<div class="tr-thumb tr-thumb-empty">ไม่มีภาพ</div>';
+      return;
+    }
+    const filename = anchorImagePath.split("/").pop();
+    try {
+      const res = await api("images-by-filename/" + encodeURIComponent(filename) + "/file");
+      if (!res.ok) throw new Error("not found");
+      const blob = await res.blob();
+      imgEl.src = URL.createObjectURL(blob);
+    } catch (e) {
+      imgEl.outerHTML = '<div class="tr-thumb tr-thumb-empty">ไม่มีภาพ</div>';
+    }
+  }
+
+  async function loadTestResults() {
+    const meterId = $("tr-meter-filter").value.trim().toUpperCase();
+    const qs = "limit=100" + (meterId ? "&meter_id=" + encodeURIComponent(meterId) : "");
+    $("tr-empty").textContent = "กำลังโหลด...";
+    $("tr-empty").style.display = "block";
+    $("tr-list").innerHTML = "";
+    try {
+      const res = await api("meters/ocr-meter-test?" + qs);
+      const items = await res.json();
+      if (!items.length) {
+        $("tr-empty").textContent = "ไม่พบผลทดสอบ";
+        return;
+      }
+      $("tr-empty").style.display = "none";
+      items.forEach((entry) => renderTestResultCard(entry));
+    } catch (e) {
+      $("tr-empty").textContent = "โหลดไม่สำเร็จ";
+    }
+  }
+
+  function renderTestResultCard(entry) {
+    const card = document.createElement("div");
+    card.className = "tr-card";
+
+    const thumb = document.createElement("img");
+    thumb.className = "tr-thumb";
+    card.appendChild(thumb);
+    loadThumb(thumb, entry.anchor_image_path);
+
+    const meta = document.createElement("div");
+    meta.className = "tr-meta";
+
+    const meter = document.createElement("div");
+    meter.className = "tr-meter";
+    meter.textContent = entry.meter_id;
+    meta.appendChild(meter);
+
+    const when = document.createElement("div");
+    when.className = "tr-when";
+    when.textContent = entry.capture_date + " " + entry.capture_time;
+    meta.appendChild(when);
+
+    const reading = document.createElement("div");
+    reading.className = "tr-reading";
+    reading.textContent = entry.ocr_reading !== null ? entry.ocr_reading : "—";
+    meta.appendChild(reading);
+
+    const label = ERROR_TYPE_LABEL[entry.error_type] || { text: "ไม่ทราบ", cls: "err" };
+    const badge = document.createElement("span");
+    badge.className = "tr-badge " + label.cls;
+    badge.textContent = label.text;
+    meta.appendChild(badge);
+
+    card.appendChild(meta);
+    $("tr-list").appendChild(card);
+  }
+
+  $("tr-load-btn").addEventListener("click", loadTestResults);
+  $("tr-meter-filter").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") loadTestResults();
+  });
 
   // ---------- boot ----------
   if (token()) {

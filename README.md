@@ -61,6 +61,7 @@ GET    /admin/meters/{meter_id}/ocr-readings                     (NEW — not in
 GET    /admin/meters/ocr-meter                                   (NEW — not in original spec, see below)
 GET    /admin/meters/ocr-meter-test                               (NEW — not in original spec, see below)
 GET    /admin/images/{item_id}/file
+GET    /admin/images-by-filename/{filename}/file                 (NEW — dashboard test-results view only, see below)
 PUT    /admin/images/{item_id}/ocr-manual         [admin JWT]
 GET    /devices/config                                           (NEW — separate spec doc, see "device_config" below)
 GET    /admin/device-config                                      (NEW — not in that spec doc either, see below)
@@ -540,6 +541,40 @@ Both list across *every* meter by default (unlike
 two tables together at all — a meter's test results and its real
 results can never mix in a single response from either endpoint.
 
+**`OcrMeterTestEntry.anchor_image_path` — no schema change on
+`ocr_meter_test` for this, confirmed request (an earlier version added
+a stored column there — reverted).** `GET /admin/meters/ocr-meter-test`
+computes it at query time instead: `_list_ocr_meter_test_rows()`
+(`app/routers/meters.py`) `LEFT JOIN`s a `UNION ALL` of every
+`images_*` table's `is_anchor = true` rows onto `ocr_meter_test`,
+matched on `meter_id` + `device_timestamp` — reconstructed from that
+row's own `capture_date`/`capture_time` via Postgres's
+`(date + time) AT TIME ZONE 'Asia/Bangkok'` (the exact reverse of how
+`device_timestamp` became `capture_date`/`capture_time` in the first
+place — see `_capture_date_time_from_device_timestamp()` in
+`app/routers/ocr_jobs.py`). A `LEFT` (not inner) join so a row without
+a matching image still comes back with `anchor_image_path: null`
+instead of vanishing from the list. `OcrMeterTestEntry`
+(`app/schemas.py`) is `OcrMeterEntry` plus this one optional field —
+used only by this one listing endpoint; `POST .../result-test` itself
+still returns a plain `OcrMeterEntry`, same as `POST .../result`, and
+`ocr_meter`/`ocr_meter_test`'s actual table shapes remain identical to
+each other and untouched.
+
+**`GET /admin/images-by-filename/{filename}/file`** — a second
+image-serving endpoint alongside the existing `GET
+/admin/images/{item_id}/file`, added because the dashboard's test-results
+tab only has `anchor_image_path` (a disk path string, computed as above)
+to work with, not an `images_*.id` — the page extracts the filename
+client-side and calls this instead. `filename` is checked for `/`, `\`,
+and `..` before ever touching the filesystem (confirmed necessary —
+this is the one file-serving path that takes a caller-supplied string
+straight from the URL rather than a filename already validated at
+upload time). Requires the browser to actually load the bytes with an
+`Authorization` header attached — a plain `<img src="...">` can't do
+that, so the page `fetch()`s each thumbnail and hands the `<img>` a
+`URL.createObjectURL()` result instead.
+
 **Not yet decided / worth flagging:**
 - Whether `GET /admin/meters/{meter_id}/ocr-readings` (the endpoint the
   OCR client polls for anomaly-detection history) should read from
@@ -761,6 +796,19 @@ curl -X PUT http://localhost:3003/admin/device-config/E101 \
    from the spec doc — flag if a different auth story (e.g. its own
    session cookie instead of reusing the JWT-in-localStorage pattern)
    is wanted instead.
+
+   **"ผลทดสอบ" (test results) tab — confirmed request, added later,
+   same page.** A top-level tab switcher in the header swaps the whole
+   `<main>` between the config UI above and a second view: an optional
+   meter-ID filter plus a card list pulling from
+   `GET /admin/meters/ocr-meter-test` — each card shows the group's
+   anchor image (loaded via `GET /admin/images-by-filename/{filename}/file`,
+   `fetch()`ed with the JWT attached and shown through a
+   `URL.createObjectURL()` blob, since a plain `<img src>` can't send an
+   `Authorization` header), the reading, and a color-coded
+   `error_type` badge. Confirmed scope: anchor image only (not every
+   image in the group) and only for `ocr_meter_test` — `ocr_meter`
+   itself has no equivalent view.
 
 `date1`/`date2` are stored as raw Postgres `INTEGER[]` (5 elements,
 `CHECK`-constrained to exactly 5), matching the wire format exactly —

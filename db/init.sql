@@ -505,6 +505,15 @@ CREATE TABLE IF NOT EXISTS ocr_meter_test (
     error_type          INTEGER     NOT NULL REFERENCES error_type(code),
     image_error         TEXT
 );
+-- anchor_image_path was briefly a column here (confirmed request,
+-- reverted) — the dashboard's test-results image instead comes from a
+-- query-time JOIN against images_*/is_anchor=true, matched on
+-- meter_id + device_timestamp (which capture_date/capture_time were
+-- themselves derived from) — see
+-- app/routers/meters.py::_list_ocr_meter_rows(). No schema change
+-- needed for this at all; if a stray anchor_image_path column exists
+-- from that earlier version, drop it.
+ALTER TABLE ocr_meter_test DROP COLUMN IF EXISTS anchor_image_path;
 CREATE INDEX IF NOT EXISTS idx_ocr_meter_test_meter_id ON ocr_meter_test (meter_id, capture_date DESC, capture_time DESC);
 
 -- --------------------------------------------------------------------------

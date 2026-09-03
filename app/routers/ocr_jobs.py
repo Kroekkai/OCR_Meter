@@ -177,7 +177,7 @@ async def _submit_ocr_result(
 
             # No file write at all — just reference the anchor's filename,
             # already sitting on disk since the original ESP32 upload.
-            # image_error stores the FULL disk path now (e.g.
+            # image_error stores the FULL disk path (e.g.
             # "/data/images/E101_20260829_100000_01.jpg"), not just the
             # bare filename — storage.original_path() is the single place
             # that computes this path (same helper used to actually save/
