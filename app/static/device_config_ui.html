@@ -802,12 +802,10 @@
     const meta = document.createElement("div");
     meta.className = "tr-meta";
 
-    const group = document.createElement("div");
-    group.className = "tr-group";
-    // group_id rides the same LEFT JOIN as anchor_image_path — null
-    // under the same condition (anchor image row not found).
-    group.textContent = (entry.group_id || "—") + " · " + entry.capture_date + " " + entry.capture_time;
-    meta.appendChild(group);
+    const when = document.createElement("div");
+    when.className = "tr-group";
+    when.textContent = entry.capture_date + " " + entry.capture_time;
+    meta.appendChild(when);
 
     const reading = document.createElement("div");
     reading.className = "tr-reading";
