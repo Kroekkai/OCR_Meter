@@ -31,6 +31,15 @@ point.
 # ความหมายเต็มอยู่ที่ตาราง error_type ใน DB (single source of truth)
 OcrErrorType = Literal[0, 1, 2, 3]
 
+# 1 = LOCAL (Worker's own YOLO+CNN model, no cost), 2 = GEMINI (cloud
+# fallback, Gemini 3.7 Flash) — confirmed, Worker team spec, same
+# lookup-table pattern as OcrErrorType/error_type above. Safe as a
+# Literal here (unlike on a Form() field — see
+# app/routers/ocr_jobs.py's error_type Form() description for why) since
+# this only ever appears in a RESPONSE model, populated from a real int
+# the database returns, never from a raw multipart string.
+OcrEngineType = Literal[1, 2]
+
 
 # --------------------------------------------------------------------------
 # Auth
@@ -174,6 +183,15 @@ class OcrMeterEntry(BaseModel):
     ocr_reading: float | None
     error_type: OcrErrorType
     image_error: str | None
+    ocr_engine: OcrEngineType | None
+    """
+    Confirmed, Worker team spec — 1=LOCAL, 2=GEMINI. Optional at the API
+    level (POST .../result and .../result-test both default it to 1
+    when the Worker omits it — see app/routers/ocr_jobs.py) even though
+    the DB column also carries its own DEFAULT 1 as a second safety
+    net. Same 6-field-plus-this shape on both ocr_meter and
+    ocr_meter_test — this model is shared by both tables' rows.
+    """
 
 
 # --------------------------------------------------------------------------

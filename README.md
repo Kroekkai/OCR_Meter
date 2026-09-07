@@ -15,6 +15,7 @@ nothing gets silently re-guessed or re-flipped:
 - `DB_HOST=timescaledb` (container name on `innovation_net`), **not** the host's own IP `192.168.248.199` — connecting via the host's external IP timed out from inside the container (self-referential/hairpin routing back to its own host), confirmed via `docker network inspect innovation_net` while debugging the actual deploy. `timescaledb` and `ocr-meter-store` are both already on that network, so Docker's internal DNS resolves it directly — no IP needed at all.
 - **`is_test_filename()`/`ocr_meter_test`** — every new group is tagged by ESP32's own `wakeup_reason` query param on upload (`"timer"` → real, anything else including absent → test, a later Project Carbon firmware update — replaced an earlier server-side comparison against `device_config`'s schedule, `app/schedule_match.py`, since deleted) and, for a test capture, has `_Test` appended to its *stored* filename (both disk and DB) — there is no separate `is_test` column anywhere (tried, then removed); `is_test_filename(original_filename)` is the sole source of truth end to end. Results for test jobs go to the new `ocr_meter_test` table instead of `ocr_meter`. At most one normal (non-test) group per meter per Bangkok calendar day may be *queued* — a same-day duplicate gets `ocr_status='dropped'` set on its `images_*` rows and creates **no `ocr_jobs` row at all** (confirmed design — dropped status is visible only in `images_*`, never in `ocr_jobs`); test groups are exempt from this limit entirely. See "Real vs. test captures" below.
 - **`esp32_upload_log`** — a new observability-only table (Project Carbon, confirmed), one row per group, logging the `net_mode`/`carrier`/`wakeup_reason` query params ESP32 now sends alongside every upload. No bearing on grouping/OCR/results. See "Real vs. test captures" below.
+- **`ocr_engine`** — a new lookup table (Worker team spec, confirmed), same pattern as `error_type`. `ocr_meter`/`ocr_meter_test` both gained an `ocr_engine INT REFERENCES ocr_engine(code)` column (1=LOCAL, 2=GEMINI) — optional on `POST .../result`/`.../result-test`, defaults to 1 when omitted. Purely observational. See "`ocr_engine`" below.
 - `ocr_jobs` is one shared table across meter types (per `db/init.sql`) — not split into `ocr_jobs_electric/water/gas`.
 - Upload filename convention: `{meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg`, meter_id/device_timestamp parsed from it (Thailand local time, UTC+7), invalid meter_id prefix → HTTP 400.
 - Auth is fixed-secret-per-deployment: `DEVICE_API_KEY`/`DEVICE_API_KEY_USERNAME` and `OCR_CLIENT_KEY`/`OCR_CLIENT_KEY_USERNAME`, each an *optional shortcut* alongside real JWT login (blank pair = login required). See `app/auth.py`.
@@ -51,7 +52,7 @@ POST   /images/upload                              [X-Device-Key]  (+ net_mode/c
 GET    /admin/images
 GET    /admin/images/ocr
 POST   /admin/images/ocr/{job_id}/claim            [X-OCR-Key]
-POST   /admin/images/ocr/{job_id}/result           [X-OCR-Key]   (plain form fields, not multipart — see "ocr_meter" below)
+POST   /admin/images/ocr/{job_id}/result           [X-OCR-Key]   (plain form fields, not multipart — accepts ocr_engine now too, see "ocr_engine" below)
 POST   /admin/images/ocr/{job_id}/result-test      [X-OCR-Key]   (NEW — mirror of /result, writes ocr_meter_test instead, see below)
 POST   /admin/images/ocr/{job_id}/fail             [X-OCR-Key]
 POST   /admin/images/{item_id}/reprocess           [admin JWT]
@@ -260,6 +261,36 @@ curl -s "http://localhost:3003/admin/meters/e101/ocr-readings?limit=3&only_succe
 # client computes: deltas [60, 50] -> avg 55 -> threshold 55*3=165
 # if (new_reading - 1310) > 165 -> submit /result with error_type=3
 ```
+
+### `ocr_engine` — LOCAL vs GEMINI stats (Worker team spec, confirmed)
+
+Not in either original spec doc — a later addition from the Worker
+team, once their local model (YOLO+CNN) + Gemini cloud-fallback
+pipeline passed full E2E testing. Same lookup-table pattern as
+`error_type` — `db/init.sql`'s `ocr_engine` table (`1, 'LOCAL
+(YOLO+CNN)'` / `2, 'GEMINI (Cloud Fallback)'`) is the single source of
+truth for what each code means; `ocr_meter`/`ocr_meter_test` each carry
+one `ocr_engine INT REFERENCES ocr_engine(code)` column, added via
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (with `DROP`+`ADD` on the FK
+itself to stay idempotent, matching the existing `error_type` FK
+pattern) — confirmed on **both** tables, not just `ocr_meter`, since
+they're meant to stay structurally identical to each other.
+
+**Unlike `error_type`, this is optional at the API level, confirmed
+deliberately** — `POST .../result` and `.../result-test` both default
+it to `1` (LOCAL) when the Worker omits it, rather than rejecting the
+request the way a missing `error_type` would. This mirrors the Worker
+team's own proposed schema (`DEFAULT 1` on the column itself) — the API
+layer just extends that same leniency one level up, rather than
+imposing a stricter requirement they didn't ask for. When it *is*
+provided, still validated against `1`/`2` by hand (422 on anything
+else) for the same reason `error_type` is — a clearer error than
+letting a typo trip the DB's FK constraint instead.
+
+**Purely observational — no bearing on grouping, `is_test`, retries, or
+anything else.** Exists so the Worker team can later query "what % of
+captures needed the Gemini fallback" without re-deriving it from
+anything else.
 
 ## `group_id` — human-readable group codes (E1, W3, G12, ...)
 

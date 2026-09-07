@@ -114,6 +114,7 @@ async def _submit_ocr_result(
     job_id: int,
     ocr_reading: float | None,
     error_type: int,
+    ocr_engine: int | None,
     *,
     expected_test: bool,
     wrong_endpoint_hint: str,
@@ -130,10 +131,22 @@ async def _submit_ocr_result(
     for. That's the only thing that makes the split more than
     cosmetic — without this check, calling either endpoint for any job
     would silently do the same thing the old single endpoint did.
+
+    ocr_engine (confirmed, added for the Worker team's local-model-vs-
+    Gemini-fallback stats — see db/init.sql's ocr_engine lookup table,
+    same pattern as error_type) is OPTIONAL here, defaulting to 1
+    (LOCAL) when omitted — deliberately lenient, unlike error_type's
+    hard requirement, matching the Worker team's own proposed schema
+    (DB column DEFAULT 1) rather than adding a stricter API-level
+    requirement they didn't ask for. Still validated against the two
+    real codes when it IS provided, so a typo'd value fails loudly
+    (422) instead of tripping the DB's FK constraint with a less
+    readable error.
     """
     VALID_CODES = (0, 1, 2, 3)
     NO_READING_CODES = (1, 2)
     HAS_READING_CODES = (0, 3)
+    VALID_ENGINE_CODES = (1, 2)
 
     if error_type not in VALID_CODES:
         raise HTTPException(
@@ -149,6 +162,13 @@ async def _submit_ocr_result(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"ocr_reading must be omitted when error_type={error_type} — there is no reading to report",
+        )
+    if ocr_engine is None:
+        ocr_engine = 1
+    elif ocr_engine not in VALID_ENGINE_CODES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"ocr_engine must be 1 (LOCAL) or 2 (GEMINI) — got {ocr_engine!r}",
         )
 
     async with pool().acquire() as conn:
@@ -192,8 +212,8 @@ async def _submit_ocr_result(
             meter_row = await conn.fetchrow(
                 f"""
                 INSERT INTO {target_table}
-                    (meter_id, capture_date, capture_time, ocr_reading, error_type, image_error)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                    (meter_id, capture_date, capture_time, ocr_reading, error_type, image_error, ocr_engine)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING *
                 """,
                 job["meter_id"],
@@ -202,6 +222,7 @@ async def _submit_ocr_result(
                 ocr_reading,
                 error_type,
                 image_error,
+                ocr_engine,
             )
 
             await conn.execute(
@@ -240,6 +261,15 @@ async def admin_submit_ocr_result(
             "against a real request while testing, not just theoretical."
         ),
     ),
+    ocr_engine: int | None = Form(
+        default=None,
+        description=(
+            "Optional, defaults to 1 (LOCAL) when omitted. 1 = read by the Worker's own local "
+            "model (YOLO+CNN, no cost), 2 = fell back to Gemini (cloud). Purely for stats on how "
+            "often the cloud fallback gets used — never affects error_type/ocr_reading or any other "
+            "behavior. See db/init.sql's ocr_engine lookup table (same pattern as error_type)."
+        ),
+    ),
     _: CurrentUser = Depends(get_ocr_client),
 ):
     """
@@ -263,11 +293,15 @@ async def admin_submit_ocr_result(
     client is still the one that checks history and decides, server just
     stores whichever code it reports.
 
+    ocr_engine (confirmed, Worker team spec) is the newest field here —
+    optional, see its Form() description above for the full reasoning
+    on why (unlike error_type) it's lenient rather than required.
+
     capture_date/capture_time are no longer client-supplied — they're
     derived from the job's own device_timestamp (when ESP32 captured the
     photo), not from anything in this request. ocr_meter does NOT carry
     group_id (confirmed) — that's an internal images_*/ocr_jobs concern
-    only; ocr_meter stays just the 6 confirmed fields.
+    only; ocr_meter is the 6 originally-confirmed fields plus ocr_engine.
 
     No file upload here at all anymore — plain form fields, not
     multipart. The OCR client has no image of its own to contribute
@@ -284,6 +318,7 @@ async def admin_submit_ocr_result(
         job_id,
         ocr_reading,
         error_type,
+        ocr_engine,
         expected_test=False,
         wrong_endpoint_hint="POST .../result-test",
     )
@@ -303,6 +338,10 @@ async def admin_submit_ocr_result_test(
             "description. This endpoint is identical in every way except which table it writes to "
             "and which jobs it accepts."
         ),
+    ),
+    ocr_engine: int | None = Form(
+        default=None,
+        description="Optional, same meaning as POST .../result — see that endpoint's description.",
     ),
     _: CurrentUser = Depends(get_ocr_client),
 ):
@@ -325,6 +364,7 @@ async def admin_submit_ocr_result_test(
         job_id,
         ocr_reading,
         error_type,
+        ocr_engine,
         expected_test=True,
         wrong_endpoint_hint="POST .../result",
     )

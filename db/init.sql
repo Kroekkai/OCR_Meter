@@ -296,6 +296,21 @@ INSERT INTO error_type (code, error_detail) VALUES
     (3, 'อ่านได้ค่า แต่ผิดปกติ (ลดลงจากเดือนก่อน หรือใช้เกินอัตราปกติมาก — OCR client เป็นคนเช็คเอง ดู README)')
 ON CONFLICT (code) DO NOTHING;
 
+-- ocr_engine — ตาราง lookup แบบเดียวกับ error_type ด้านบน (ยืนยันตาม
+-- สเปกจากทีม Worker) บอกว่า OCR แต่ละครั้งอ่านผ่านโมเดลไหน — 1=LOCAL
+-- (YOLO+CNN ในเครื่อง Worker เอง ไม่มีค่าใช้จ่าย), 2=GEMINI (fallback
+-- ไปเรียก Gemini 3.7 Flash ตอนโมเดลในเครื่องอ่านไม่ผ่าน) — เก็บไว้ทำสถิติ
+-- ว่าภาพกี่ % ต้องพึ่ง cloud AI เท่านั้น ไม่มีผลต่อ error_type/ocr_reading
+-- หรือ logic อื่นในระบบเลย
+CREATE TABLE IF NOT EXISTS ocr_engine (
+    code INT         PRIMARY KEY,
+    name VARCHAR(50) NOT NULL
+);
+INSERT INTO ocr_engine (code, name) VALUES
+    (1, 'LOCAL (YOLO+CNN)'),
+    (2, 'GEMINI (Cloud Fallback)')
+ON CONFLICT (code) DO NOTHING;
+
 -- ocr_meter — ผลลัพธ์ OCR ที่ "จบแล้ว" ของแต่ละมิเตอร์ (สำเร็จ/error) —
 -- ตารางกลางสำหรับส่งต่อให้ระบบภายนอก (External Store) ใช้ ไม่มี FK
 -- อ้างอิงกลับไปที่ images_*/ocr_jobs เลยตั้งใจ — อ่านตารางนี้เฉยๆ ก็รู้
@@ -351,7 +366,13 @@ CREATE TABLE IF NOT EXISTS ocr_meter (
     capture_time        TIME        NOT NULL,
     ocr_reading         NUMERIC,
     error_type          INTEGER     NOT NULL REFERENCES error_type(code),
-    image_error         TEXT
+    image_error         TEXT,
+    -- ocr_engine — ยืนยันตามสเปกทีม Worker: 1=LOCAL (default, กรณี
+    -- ไม่ได้ระบุมาจากงานเก่าก่อนฟีเจอร์นี้), 2=GEMINI — DEFAULT 1 ที่
+    -- DB ชั้นนี้เป็น safety net ชั้นสุดท้ายเท่านั้น (endpoint
+    -- /result และ /result-test เป็นคนตั้ง default ให้จริงๆ ถ้า
+    -- Worker ไม่ส่งมา — ดู app/routers/ocr_jobs.py)
+    ocr_engine          INT         REFERENCES ocr_engine(code) DEFAULT 1
 );
 
 -- อัปเกรด DB ที่มี ocr_meter อยู่แล้วจาก schema เก่า (error_type เป็น TEXT,
@@ -429,6 +450,10 @@ BEGIN
         ALTER TABLE ocr_meter ALTER COLUMN capture_date SET NOT NULL;
         ALTER TABLE ocr_meter ALTER COLUMN capture_time SET NOT NULL;
     END IF;
+    -- ocr_engine — ยืนยันตามสเปกทีม Worker (ทำแบบเดียวกับ error_type
+    -- ด้านบน: 1=LOCAL, 2=GEMINI) — no-op บน fresh install เพราะ
+    -- CREATE TABLE ด้านบนมีคอลัมน์นี้ครบตั้งแต่ต้นอยู่แล้ว
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS ocr_engine INT REFERENCES ocr_engine(code) DEFAULT 1;
 END $$;
 
 -- จัดลำดับคอลัมน์ให้ตรงกับ CREATE TABLE ด้านบนเป๊ะ (error_type ต้องมา
@@ -438,7 +463,7 @@ END $$;
 -- ถูก" — no-op ถ้าลำดับตรงอยู่แล้ว ปลอดภัยรันซ้ำได้
 DO $$
 DECLARE
-    correct_order TEXT[] := ARRAY['id','meter_id','capture_date','capture_time','ocr_reading','error_type','image_error'];
+    correct_order TEXT[] := ARRAY['id','meter_id','capture_date','capture_time','ocr_reading','error_type','image_error','ocr_engine'];
     actual_order TEXT[];
 BEGIN
     SELECT array_agg(column_name ORDER BY ordinal_position) INTO actual_order
@@ -462,16 +487,21 @@ BEGIN
             capture_time  TIME        NOT NULL,
             ocr_reading   NUMERIC,
             error_type    INTEGER     NOT NULL REFERENCES error_type(code),
-            image_error   TEXT
+            image_error   TEXT,
+            ocr_engine    INT         REFERENCES ocr_engine(code) DEFAULT 1
         );
-        INSERT INTO ocr_meter_reordered (id, meter_id, capture_date, capture_time, ocr_reading, error_type, image_error)
-            SELECT id, meter_id, capture_date, capture_time, ocr_reading, error_type, image_error
+        INSERT INTO ocr_meter_reordered (id, meter_id, capture_date, capture_time, ocr_reading, error_type, image_error, ocr_engine)
+            SELECT id, meter_id, capture_date, capture_time, ocr_reading, error_type, image_error, ocr_engine
             FROM ocr_meter
             ORDER BY id;
         DROP TABLE ocr_meter;
         ALTER TABLE ocr_meter_reordered RENAME TO ocr_meter;
         ALTER TABLE ocr_meter RENAME CONSTRAINT ocr_meter_reordered_pkey TO ocr_meter_pkey;
         ALTER TABLE ocr_meter RENAME CONSTRAINT ocr_meter_reordered_error_type_fkey TO ocr_meter_error_type_fkey;
+        -- ocr_engine ได้ FK constraint ชื่ออัตโนมัติจาก Postgres ตอน
+        -- CREATE TABLE ด้านบนเหมือนกัน (คอลัมน์ที่มี REFERENCES ในนิยาม
+        -- ได้ constraint เสมอ ไม่ขึ้นกับว่า nullable หรือไม่)
+        ALTER TABLE ocr_meter RENAME CONSTRAINT ocr_meter_reordered_ocr_engine_fkey TO ocr_meter_ocr_engine_fkey;
         -- ผูก sequence กลับเข้ากับ column ใหม่ให้เรียบร้อย (ไม่จำเป็นต่อการ
         -- ทำงาน แค่ให้ Postgres จัดการ sequence ให้อัตโนมัติเวลา DROP TABLE
         -- ในอนาคต เหมือนตอนที่เป็น BIGSERIAL แต่แรก)
@@ -483,6 +513,8 @@ END $$;
 ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_error_type_check;
 ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_error_type_fkey;
 ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_error_type_fkey FOREIGN KEY (error_type) REFERENCES error_type(code);
+ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_ocr_engine_fkey;
+ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_ocr_engine_fkey FOREIGN KEY (ocr_engine) REFERENCES ocr_engine(code);
 
 -- capture_date DESC, capture_time DESC รองรับ query แบบที่ OCR client
 -- ต้องใช้บ่อยที่สุด: "ค่าล่าสุดของมิเตอร์นี้คือเท่าไหร่" — DROP ก่อนเผื่อ
@@ -503,8 +535,14 @@ CREATE TABLE IF NOT EXISTS ocr_meter_test (
     capture_time        TIME        NOT NULL,
     ocr_reading         NUMERIC,
     error_type          INTEGER     NOT NULL REFERENCES error_type(code),
-    image_error         TEXT
+    image_error         TEXT,
+    ocr_engine          INT         REFERENCES ocr_engine(code) DEFAULT 1
 );
+-- ยืนยันตามสเปกทีม Worker: "และตารางtest ถ้ามีแยกตารางครับ" — มีจริง
+-- (ocr_meter_test) เพิ่มคอลัมน์เดียวกันให้ครบ ไม่มี reorder-migration
+-- ที่ซับซ้อนแบบ ocr_meter (ตารางนี้ไม่เคยมีปัญหาลำดับคอลัมน์ผิดมาก่อน)
+-- แค่ ADD COLUMN ตรงๆ ก็พอ
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS ocr_engine INT REFERENCES ocr_engine(code) DEFAULT 1;
 -- anchor_image_path was briefly a column here (confirmed request,
 -- reverted) — the dashboard's test-results image instead comes from a
 -- query-time JOIN against images_*/is_anchor=true, matched on
