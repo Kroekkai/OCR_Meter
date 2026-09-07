@@ -79,18 +79,21 @@ def is_test_filename(filename: str | None) -> bool:
     """
     True if this filename carries the "_Test" suffix that
     app/routers/images.py's _stored_filename() appends when a group's
-    device_timestamp fell outside that meter's device_config schedule
-    (app/schedule_match.py). Confirmed: this is now the SOLE source of
-    truth for "is this a test capture" end to end — there is no separate
-    is_test column/field anywhere anymore (there briefly was, on
-    images_*/ocr_jobs/OcrJobOut — removed). Both the server (deciding
-    ocr_meter vs ocr_meter_test at /result, and the "one normal group
-    per meter per day" limit) and the OCR client itself (if it wants to
-    tell test jobs apart) are expected to check the filename the same
-    way, via this exact function — matches "_Test" right before the
-    extension only, case-insensitively, not "test" appearing anywhere
-    else in the filename (a meter_id could theoretically contain those
-    letters otherwise).
+    ESP32-reported wakeup_reason wasn't "timer" (Project Carbon firmware
+    update, confirmed — replaced an earlier version that compared
+    device_timestamp against that meter's device_config schedule via
+    app/schedule_match.py, since removed). Confirmed: this filename
+    check is now the SOLE source of truth for "is this a test capture"
+    end to end — there is no separate is_test column/field anywhere
+    anymore (there briefly was, on images_*/ocr_jobs/OcrJobOut —
+    removed). Both the server (deciding ocr_meter vs ocr_meter_test at
+    /result, and the "one normal group per meter per day" limit) and
+    the OCR client itself (if it wants to tell test jobs apart) are
+    expected to check the filename the same way, via this exact
+    function — matches "_Test" right before the extension only,
+    case-insensitively, not "test" appearing anywhere else in the
+    filename (a meter_id could theoretically contain those letters
+    otherwise).
     """
     if not filename:
         return False

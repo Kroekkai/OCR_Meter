@@ -8,10 +8,9 @@ from fastapi.responses import FileResponse
 from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_uploader
 from app.config import get_settings
 from app.db import GROUP_ID_INFO, pool, table_for_meter_id
-from app.filename import FilenameParseError, is_test_filename, parse_upload_filename
+from app.filename import BANGKOK_TZ, FilenameParseError, is_test_filename, parse_upload_filename
 from app.grouping import finalize_group, has_normal_group_today, mark_group_dropped
 from app.repo import get_image_row, image_out
-from app.schedule_match import is_on_schedule
 from app.schemas import ImageOut, ImageUploadResponse, MeterType, OcrManualEditRequest, OcrStatus
 from app import storage
 
@@ -22,9 +21,12 @@ router = APIRouter(tags=["default"])
 
 def _stored_filename(original: str, is_test: bool) -> str:
     """
-    Appends "_Test" right before the extension when this capture was
-    determined off-schedule (server-side, via schedule_match.is_on_schedule
-    — never based on anything ESP32 sent) — e.g.
+    Appends "_Test" right before the extension when this capture is a
+    test capture — confirmed decided by ESP32's own wakeup_reason query
+    param now (Project Carbon firmware update), NOT by comparing
+    device_timestamp against device_config's schedule (that comparison,
+    app/schedule_match.py, is removed — see the upload handler's
+    docstring below for the full reasoning). E.g.
     "E101_20260901_130000_1.jpg" becomes "E101_20260901_130000_1_Test.jpg".
     Applied identically to the file saved on disk and to
     images_*.original_filename, so the two can never disagree — whatever
@@ -47,6 +49,18 @@ def _stored_filename(original: str, is_test: bool) -> str:
 )
 async def upload_image(
     file: UploadFile = File(...),
+    net_mode: str | None = Query(default=None, description='"4G" or "WiFi" — logged only, no behavior tied to it.'),
+    carrier: str | None = Query(
+        default=None, description='Carrier name on 4G, or "-" on WiFi — logged only, no behavior tied to it.'
+    ),
+    wakeup_reason: str | None = Query(
+        default=None,
+        description=(
+            '"timer" (woke on its own RTC schedule) or "manual" (plugged in / a technician pressed the '
+            "test button). Confirmed: this is now the SOLE source of truth for is_test — see "
+            "_stored_filename() and the docstring below."
+        ),
+    ),
     device: CurrentUser = Depends(get_uploader),
 ):
     """
@@ -55,6 +69,30 @@ async def upload_image(
     {meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg (e.g. E101_20260818_151230_01.jpg).
     A filename that doesn't match this, or whose meter_id doesn't start
     with e/w/g, is rejected with 400.
+
+    net_mode / carrier / wakeup_reason (Project Carbon firmware update,
+    confirmed) arrive as URL query params alongside the multipart file —
+    NOT form fields, NOT part of the filename. All three are optional
+    (older, not-yet-updated firmware sends none of them at all — see
+    below for what happens then).
+
+    **is_test determination — confirmed: wakeup_reason REPLACES the
+    old schedule-vs-device_config comparison entirely** (that logic,
+    app/schedule_match.py, no longer exists — device_config's own
+    schedule_mode/date1/date2 are untouched and still serve their
+    original purpose, telling the ESP32 when to wake up in the first
+    place; only the SERVER re-verifying that timing server-side is
+    gone). `wakeup_reason == "manual"` → test; `"timer"` → real;
+    anything else (including a request from firmware old enough not to
+    send this param at all) → **test**, confirmed default — deliberately
+    the safer side to fail on, since ocr_meter_test is exactly the
+    right home for "not confidently real" data, whereas ocr_meter is
+    meant to be trustworthy. This is a one-way trust of whatever the
+    device claims — the server does not attempt to cross-check
+    wakeup_reason against anything.
+
+    net_mode/carrier are logged only (see esp32_upload_log below) —
+    neither affects grouping, is_test, or anything else here.
 
     Joins the image into whichever burst group for this meter_id is
     still open (within settings.image_group_window_seconds of its first
@@ -152,19 +190,25 @@ async def upload_image(
                 # anchor. group_id pulls from the per-type sequence (E1,
                 # E2, ... / W1, W2, ... / G1, G2, ...) — human-readable,
                 # unlike the raw row id which jumps around since all 3
-                # tables share images_id_seq. The schedule check
-                # (server-side against device_config — confirmed NOT
-                # based on the filename ESP32 sent) happens ONCE here,
-                # per new group — the RESULT is baked directly into the
-                # stored filename via _stored_filename() ("_Test"
-                # appended or not) rather than kept in a separate
-                # column; every later image joining this group re-derives
-                # the same answer from THIS row's filename (see the
-                # open_anchor branch above), never recomputes the
-                # schedule check itself.
+                # tables share images_id_seq. The is_test check (now
+                # wakeup_reason, confirmed — see this function's
+                # docstring) happens ONCE here, per new group — the
+                # RESULT is baked directly into the stored filename via
+                # _stored_filename() ("_Test" appended or not) rather
+                # than kept in a separate column; every later image
+                # joining this group re-derives the same answer from
+                # THIS row's filename (see the open_anchor branch
+                # above), never rechecks wakeup_reason itself (which
+                # wouldn't even be available to check — later images in
+                # the same burst may report a different value, and it's
+                # deliberately ignored for them).
                 new_seq_n = await conn.fetchval(f"SELECT nextval('{group_seq}')")
                 new_group_id = f"{group_prefix}{new_seq_n}"
-                is_test = not await is_on_schedule(conn, meter_id, device_timestamp)
+                # Confirmed: wakeup_reason is now the SOLE determinant —
+                # "manual" -> test, "timer" -> real, anything else
+                # (including absent, from firmware that hasn't been
+                # updated yet) -> test, deliberately the safer default.
+                is_test = wakeup_reason != "timer"
                 stored_filename = _stored_filename(file.filename, is_test)
                 image_row = await conn.fetchrow(
                     f"""
@@ -176,6 +220,34 @@ async def upload_image(
                     stored_filename,
                     device_timestamp,
                     new_group_id,
+                )
+
+                # esp32_upload_log — confirmed: one row per GROUP (this
+                # branch only runs when a NEW group is opened, i.e. once
+                # per burst), not one row per image, since
+                # net_mode/carrier/wakeup_reason are identical across
+                # every image in a burst (all come from the same
+                # wake-up event) — logging per-image would just be 3x
+                # redundant rows for no benefit. log_date uses
+                # device_timestamp's Bangkok-local date, matching how
+                # capture_date is derived everywhere else in this
+                # codebase — not received_at, so a burst uploaded just
+                # after Bangkok midnight still logs under the date it
+                # was actually captured. data1/data2/data3 (confirmed
+                # naming) map to net_mode/carrier/wakeup_reason in that
+                # order — all TEXT, all nullable (old firmware sends
+                # none of them).
+                log_date = device_timestamp.astimezone(BANGKOK_TZ).date()
+                await conn.execute(
+                    """
+                    INSERT INTO esp32_upload_log (log_date, meter_id, data1, data2, data3)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    log_date,
+                    meter_id,
+                    net_mode,
+                    carrier,
+                    wakeup_reason,
                 )
 
             # --- Fast path: group just reached this meter's target count? ---

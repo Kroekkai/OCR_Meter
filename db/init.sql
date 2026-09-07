@@ -553,3 +553,35 @@ ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_photo_count_ch
 ALTER TABLE device_config ADD CONSTRAINT device_config_photo_count_check CHECK (photo_count BETWEEN 1 AND 10);
 ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_photo_delay_check;
 ALTER TABLE device_config ADD CONSTRAINT device_config_photo_delay_check CHECK (photo_delay BETWEEN 1 AND 60);
+
+-- --------------------------------------------------------------------------
+-- esp32_upload_log — NOT part of either original spec. Added for
+-- Project Carbon (a later ESP32 firmware update, confirmed) — the
+-- device now sends 3 metadata values as URL query params alongside
+-- every POST /images/upload: net_mode ("4G"/"WiFi"), carrier (mobile
+-- carrier name on 4G, "-" on WiFi), wakeup_reason ("timer"/"manual").
+-- wakeup_reason is also what decides is_test now (see
+-- app/routers/images.py — replaced the old device_config schedule
+-- comparison, app/schedule_match.py, since deleted) — this table is
+-- purely an observability log of what the device reported, with no
+-- bearing on grouping/OCR/results itself.
+--
+-- Confirmed: ONE ROW PER GROUP (burst), not one row per image — all
+-- images in a burst share the same wake-up event, so the 3 values are
+-- identical across them; logging per-image would just be 3x redundant
+-- rows. Only inserted in the "open new group" branch of the upload
+-- handler, same moment is_test gets decided for that group.
+--
+-- Confirmed naming: data1/data2/data3 (not net_mode/carrier/wakeup_reason
+-- as column names) map to net_mode/carrier/wakeup_reason respectively,
+-- in that order, all TEXT, all nullable (older firmware that hasn't
+-- been updated yet sends none of the 3 query params at all).
+CREATE TABLE IF NOT EXISTS esp32_upload_log (
+    id        BIGSERIAL PRIMARY KEY,
+    log_date  DATE      NOT NULL,  -- device_timestamp's Bangkok-local date (not received_at) — matches capture_date elsewhere
+    meter_id  TEXT      NOT NULL,
+    data1     TEXT,                -- net_mode: "4G" | "WiFi" | null
+    data2     TEXT,                -- carrier: mobile carrier name | "-" (on WiFi) | null
+    data3     TEXT                 -- wakeup_reason: "timer" | "manual" | null (null/anything-but-"timer" -> is_test=true)
+);
+CREATE INDEX IF NOT EXISTS idx_esp32_upload_log_meter ON esp32_upload_log (meter_id, log_date DESC);

@@ -214,9 +214,9 @@ async def admin_list_ocr_meter_test(
     Mirror of GET .../ocr-meter directly above — identical shape (plus
     one extra field, anchor_image_path — see OcrMeterTestEntry),
     identical filters, but reads ocr_meter_test instead: results from
-    groups the server determined were off-schedule (filename carries a
-    "_Test" suffix — see app/filename.py::is_test_filename() and
-    app/schedule_match.py). Completely separate table, no FK between the
+    groups whose ESP32-reported wakeup_reason wasn't "timer" (filename
+    carries a "_Test" suffix — see app/filename.py::is_test_filename()).
+    Completely separate table, no FK between the
     two, no query anywhere joins them together — a meter's test results
     and its real results never mix in either endpoint's response.
     """

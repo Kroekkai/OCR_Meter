@@ -87,23 +87,15 @@ class Settings(BaseSettings):
     image_group_size: int = 3
 
     # --- Scheduled-vs-test capture detection ---------------------------------
-    # A capture counts as "on schedule" if its device_timestamp falls within
-    # this many minutes of any configured slot (date1 or date2) in that
-    # meter's device_config (or DEFAULT_CONFIG if it has none). Outside this
-    # tolerance, the whole group is treated as a test capture (its stored
-    # filename gets "_Test" appended — see
-    # app/routers/images.py::_stored_filename() and
-    # app/filename.py::is_test_filename(), the sole source of truth for this
-    # end to end) — confirmed: this decision is a server-side comparison
-    # against device_config, never based on the uploaded filename itself.
-    # Only the FIRST image of a burst (the group's
-    # anchor) is checked — computed once per group and every
-    # later image in the same burst inherits it — so this only needs to
-    # cover "how close is the wake-up shot to the scheduled time", not the
-    # whole burst's duration; a tight 5 minutes leaves little room for
-    # ESP32 clock drift or network delay before that first image reaches
-    # the server, so tighten further only with real drift data in hand.
-    schedule_match_tolerance_minutes: int = 5
+    # Removed entirely (Project Carbon firmware update, confirmed) — this
+    # used to be a tolerance window for comparing device_timestamp
+    # against device_config's schedule (app/schedule_match.py, deleted).
+    # Replaced by the ESP32's own wakeup_reason query param on
+    # POST /images/upload ("timer" vs "manual") — see
+    # app/routers/images.py::upload_image()'s docstring for the full
+    # reasoning, and app/filename.py::is_test_filename() for how the
+    # decision gets stored (still a "_Test" filename suffix, just
+    # decided differently now).
 
 
 @lru_cache
