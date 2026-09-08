@@ -65,6 +65,18 @@ CREATE SEQUENCE IF NOT EXISTS electric_group_seq;
 CREATE SEQUENCE IF NOT EXISTS water_group_seq;
 CREATE SEQUENCE IF NOT EXISTS gas_group_seq;
 
+-- dataset — NOT part of any original spec. Confirmed request, sketched
+-- by hand: a central table consolidating the file path of every image
+-- across all 3 meter types (electric/water/gas), so "where is this
+-- image on disk" can be answered from one table instead of knowing
+-- which of the 3 images_* tables to check first. Each images_* row
+-- gets its OWN dataset row (1:1, not shared) — see the dataset_id
+-- column added to images_electric right below.
+CREATE TABLE IF NOT EXISTS dataset (
+    id   BIGSERIAL PRIMARY KEY,
+    path TEXT      NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS images_electric (
     id                BIGINT      PRIMARY KEY DEFAULT nextval('images_id_seq'),
     meter_id          TEXT        NOT NULL,
@@ -73,10 +85,40 @@ CREATE TABLE IF NOT EXISTS images_electric (
     ocr_status        TEXT        NOT NULL DEFAULT 'pending',  -- pending | done | failed | dropped
     group_id          TEXT        NOT NULL,
     is_anchor         BOOLEAN     NOT NULL DEFAULT false,
-    received_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    received_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- dataset_id — confirmed request (hand-drawn diagram). Nullable:
+    -- existing rows from before this column existed have no dataset
+    -- row to point to and are left alone (never backfilled) — only
+    -- new uploads going forward get one, via app/routers/images.py.
+    dataset_id        BIGINT      REFERENCES dataset(id)
 );
 CREATE TABLE IF NOT EXISTS images_water (LIKE images_electric INCLUDING ALL);
 CREATE TABLE IF NOT EXISTS images_gas   (LIKE images_electric INCLUDING ALL);
+
+-- เผื่อ images_*/dataset มีอยู่แล้วจากรอบก่อนที่ยังไม่มีคอลัมน์/ตารางนี้
+-- (fresh install ไม่ต้องทำอะไรเพิ่ม เพราะ CREATE TABLE ด้านบนมีครบอยู่แล้ว)
+-- เพิ่ม column ก่อน (no-op บน images_water/images_gas เพราะ LIKE...
+-- INCLUDING ALL ตอน CREATE TABLE ด้านบนก็อป column มาให้แล้ว — แต่ยัง
+-- ต้องรันบรรทัดนี้เผื่อ DB เก่าที่ images_electric เองยังไม่มีคอลัมน์นี้)
+ALTER TABLE images_electric ADD COLUMN IF NOT EXISTS dataset_id BIGINT REFERENCES dataset(id);
+ALTER TABLE images_water    ADD COLUMN IF NOT EXISTS dataset_id BIGINT;
+ALTER TABLE images_gas      ADD COLUMN IF NOT EXISTS dataset_id BIGINT;
+
+-- ⚠️ FK ต้องเพิ่มแยกต่างหากเสมอ ไม่พึ่ง ADD COLUMN ด้านบนอย่างเดียว —
+-- ยืนยันจากเอกสาร Postgres จริงแล้วว่า LIKE...INCLUDING ALL (ที่ใช้สร้าง
+-- images_water/images_gas จาก images_electric ด้านบน) ก็อป PRIMARY
+-- KEY/UNIQUE/INDEX ให้ แต่**ไม่ก็อป FOREIGN KEY constraint ให้เลย** —
+-- ถ้าพึ่งแค่ ADD COLUMN IF NOT EXISTS อย่างเดียว images_water/images_gas
+-- จะได้ column dataset_id มา (จาก LIKE) แต่ไม่มี FK ผูกจริงเลย เพราะ
+-- ADD COLUMN IF NOT EXISTS จะ skip ทั้งบรรทัดเงียบๆ เมื่อ column มีอยู่
+-- แล้ว — ใช้ DROP+ADD CONSTRAINT แบบเดียวกับที่ทำกับ error_type/
+-- ocr_engine ก่อนหน้าแทน (idempotent, รันซ้ำได้ปลอดภัยเสมอ)
+ALTER TABLE images_electric DROP CONSTRAINT IF EXISTS images_electric_dataset_id_fkey;
+ALTER TABLE images_electric ADD CONSTRAINT images_electric_dataset_id_fkey FOREIGN KEY (dataset_id) REFERENCES dataset(id);
+ALTER TABLE images_water DROP CONSTRAINT IF EXISTS images_water_dataset_id_fkey;
+ALTER TABLE images_water ADD CONSTRAINT images_water_dataset_id_fkey FOREIGN KEY (dataset_id) REFERENCES dataset(id);
+ALTER TABLE images_gas DROP CONSTRAINT IF EXISTS images_gas_dataset_id_fkey;
+ALTER TABLE images_gas ADD CONSTRAINT images_gas_dataset_id_fkey FOREIGN KEY (dataset_id) REFERENCES dataset(id);
 
 CREATE INDEX IF NOT EXISTS idx_images_electric_meter ON images_electric (meter_id, device_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_images_water_meter    ON images_water    (meter_id, device_timestamp DESC);
@@ -574,7 +616,22 @@ CREATE TABLE IF NOT EXISTS device_config (
     date1         INTEGER[] NOT NULL DEFAULT ARRAY[26,0,0,8,0] CHECK (array_length(date1, 1) = 5),
     date2         INTEGER[] NOT NULL DEFAULT ARRAY[0,0,0,0,0]  CHECK (array_length(date2, 1) = 5),
     photo_count   INTEGER   NOT NULL DEFAULT 3 CHECK (photo_count BETWEEN 1 AND 10),
-    photo_delay   INTEGER   NOT NULL DEFAULT 5 CHECK (photo_delay BETWEEN 1 AND 60)
+    photo_delay   INTEGER   NOT NULL DEFAULT 5 CHECK (photo_delay BETWEEN 1 AND 60),
+    -- is_default — confirmed request, round 2. This column has now been
+    -- added, removed, and re-added — the CONCEPT (distinguish "nobody's
+    -- ever touched this meter's schedule" from "an admin deliberately
+    -- set it") stayed wanted the whole time; only the REASON for
+    -- needing a real column changed. First time: needed because a row
+    -- got auto-created to satisfy a (since-reverted) FK from other
+    -- tables — see "device_config stands alone" further below for that
+    -- whole story. This time: no FK involved at all — a row now gets
+    -- auto-created (app/routers/device_config.py::get_or_create_device_config())
+    -- purely so device_config has a real record of every meter_id
+    -- that's ever been seen, confirmed request. true = still running
+    -- on auto-provisioned defaults, nobody has explicitly set this
+    -- meter's schedule; false = an admin used
+    -- PUT /admin/device-config/{meter_id} at least once.
+    is_default    BOOLEAN   NOT NULL DEFAULT true
 );
 
 -- เผื่อ device_config มีอยู่แล้วจากรอบก่อนที่ยังไม่มี CHECK constraint —
@@ -591,6 +648,36 @@ ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_photo_count_ch
 ALTER TABLE device_config ADD CONSTRAINT device_config_photo_count_check CHECK (photo_count BETWEEN 1 AND 10);
 ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_photo_delay_check;
 ALTER TABLE device_config ADD CONSTRAINT device_config_photo_delay_check CHECK (photo_delay BETWEEN 1 AND 60);
+-- เผื่อ DB นี้เคยผ่านสถานะ "มี is_default" มาก่อน (ไม่ว่าจะจากรอบ FK
+-- เดิม หรือยังไม่เคยมีเลย) ADD COLUMN IF NOT EXISTS ครอบคลุมทั้ง 2 กรณี
+-- ให้ผลเหมือนกัน — no-op บน fresh install เพราะ CREATE TABLE มีคอลัมน์
+-- นี้อยู่แล้ว
+ALTER TABLE device_config ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT true;
+
+-- ⚠️ FK ไปหา device_config — ยืนยันแล้วรอบที่ 3 (ยอมรับผลที่ตามมา:
+-- DELETE /admin/device-config/{meter_id} จะลบจริงไม่ได้อีกต่อไป
+-- สำหรับมิเตอร์ที่มีประวัติในตารางเหล่านี้ — endpoint เปลี่ยนเป็น
+-- upsert กลับเป็นค่า default แทน ดู app/routers/device_config.py)
+-- ต้องอยู่ "หลัง" CREATE TABLE device_config ด้านบนเสมอ (ไม่ใช่แค่ตอน
+-- CREATE TABLE images_electric/ocr_jobs/ocr_meter/ฯลฯ ตอนต้นไฟล์ เพราะ
+-- ตอนนั้น device_config ยังไม่ถูกสร้างเลย — จะ error "relation
+-- device_config does not exist" ทันที) ใช้ DROP+ADD CONSTRAINT แยกเป็น
+-- statement ของตัวเอง (pattern เดียวกับ error_type/ocr_engine/dataset
+-- ก่อนหน้า) เพื่อเลี่ยงปัญหา ordering นี้โดยสิ้นเชิง
+ALTER TABLE images_electric DROP CONSTRAINT IF EXISTS images_electric_meter_id_fkey;
+ALTER TABLE images_electric ADD CONSTRAINT images_electric_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
+ALTER TABLE images_water DROP CONSTRAINT IF EXISTS images_water_meter_id_fkey;
+ALTER TABLE images_water ADD CONSTRAINT images_water_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
+ALTER TABLE images_gas DROP CONSTRAINT IF EXISTS images_gas_meter_id_fkey;
+ALTER TABLE images_gas ADD CONSTRAINT images_gas_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
+ALTER TABLE ocr_jobs DROP CONSTRAINT IF EXISTS ocr_jobs_meter_id_fkey;
+ALTER TABLE ocr_jobs ADD CONSTRAINT ocr_jobs_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
+ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_meter_id_fkey;
+ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
+ALTER TABLE ocr_meter_test DROP CONSTRAINT IF EXISTS ocr_meter_test_meter_id_fkey;
+ALTER TABLE ocr_meter_test ADD CONSTRAINT ocr_meter_test_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
+ALTER TABLE esp32_upload_log DROP CONSTRAINT IF EXISTS esp32_upload_log_meter_id_fkey;
+ALTER TABLE esp32_upload_log ADD CONSTRAINT esp32_upload_log_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
 
 -- --------------------------------------------------------------------------
 -- esp32_upload_log — NOT part of either original spec. Added for

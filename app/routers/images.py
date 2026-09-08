@@ -11,6 +11,7 @@ from app.db import GROUP_ID_INFO, pool, table_for_meter_id
 from app.filename import BANGKOK_TZ, FilenameParseError, is_test_filename, parse_upload_filename
 from app.grouping import finalize_group, has_normal_group_today, mark_group_dropped
 from app.repo import get_image_row, image_out
+from app.routers.device_config import get_or_create_device_config
 from app.schemas import ImageOut, ImageUploadResponse, MeterType, OcrManualEditRequest, OcrStatus
 from app import storage
 
@@ -39,6 +40,33 @@ def _stored_filename(original: str, is_test: bool) -> str:
         return original
     p = Path(original)
     return f"{p.stem}_Test{p.suffix}"
+
+
+async def _insert_dataset_row(conn, stored_filename: str) -> int:
+    """
+    Confirmed request (hand-drawn diagram) — a new `dataset` table
+    consolidating the file path of every image across all 3 meter types,
+    so "where is this image on disk" can be answered from one table
+    without knowing which of images_electric/water/gas to check first.
+    Called once per image insert, in both branches of the upload handler
+    below — every images_* row gets its own dataset row (1:1, not
+    shared across a group).
+
+    The `0` passed as image_id here is a deliberate throwaway —
+    storage.original_path()/_stem_and_suffix() only ever fall back to
+    using image_id when original_filename is None (a path-construction
+    edge case for rows inserted outside this API entirely), which can't
+    happen here since stored_filename is always a real string by this
+    point — so the path is fully determined by the filename alone,
+    computable before the images_* row (and its real id) even exists.
+    This is what lets dataset_id be included directly in the images_*
+    INSERT below instead of needing a second UPDATE after the fact.
+    """
+    row = await conn.fetchrow(
+        "INSERT INTO dataset (path) VALUES ($1) RETURNING id",
+        str(storage.original_path(0, stored_filename)),
+    )
+    return row["id"]
 
 
 @router.post(
@@ -133,6 +161,16 @@ async def upload_image(
 
     async with pool().acquire() as conn:
         async with conn.transaction():
+            # Confirmed request, round 2: device_config should have a
+            # real row for every meter_id ever seen — not tied to any
+            # FK/referential-integrity concern this time (device_config
+            # still stands completely alone, see
+            # get_or_create_device_config()'s own docstring in
+            # app/routers/device_config.py), purely so the table itself
+            # keeps an accurate record. Same transaction as the INSERT
+            # below, so both commit or roll back together.
+            await get_or_create_device_config(conn, meter_id)
+
             # FOR UPDATE here is what makes this race-safe against the
             # background sweep finalizing this exact group at the same
             # instant — see app/grouping.py's matching FOR UPDATE. Locks
@@ -174,16 +212,18 @@ async def upload_image(
                 # column anywhere — see app/filename.py.
                 anchor_is_test = is_test_filename(open_anchor["original_filename"])
                 stored_filename = _stored_filename(file.filename, anchor_is_test)
+                dataset_id = await _insert_dataset_row(conn, stored_filename)
                 image_row = await conn.fetchrow(
                     f"""
-                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor)
-                    VALUES ($1, $2, $3, 'pending', $4, false)
+                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, dataset_id)
+                    VALUES ($1, $2, $3, 'pending', $4, false, $5)
                     RETURNING *
                     """,
                     meter_id,
                     stored_filename,
                     device_timestamp,
                     open_anchor["group_id"],
+                    dataset_id,
                 )
             else:
                 # No open group — this image starts a new one as its own
@@ -210,16 +250,18 @@ async def upload_image(
                 # updated yet) -> test, deliberately the safer default.
                 is_test = wakeup_reason != "timer"
                 stored_filename = _stored_filename(file.filename, is_test)
+                dataset_id = await _insert_dataset_row(conn, stored_filename)
                 image_row = await conn.fetchrow(
                     f"""
-                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor)
-                    VALUES ($1, $2, $3, 'pending', $4, true)
+                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, dataset_id)
+                    VALUES ($1, $2, $3, 'pending', $4, true, $5)
                     RETURNING *
                     """,
                     meter_id,
                     stored_filename,
                     device_timestamp,
                     new_group_id,
+                    dataset_id,
                 )
 
                 # esp32_upload_log — confirmed: one row per GROUP (this

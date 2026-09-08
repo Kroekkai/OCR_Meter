@@ -50,8 +50,55 @@ def _config_out(row) -> DeviceConfigOut:
         date2=list(row["date2"]),
         photo_count=row["photo_count"],
         photo_delay=row["photo_delay"],
-        is_default=False,
+        is_default=row["is_default"],
     )
+
+
+async def get_or_create_device_config(conn, meter_id: str):
+    """
+    Get-or-create — confirmed request, round 2. The first version of
+    this existed to satisfy a real FK that other tables briefly had
+    pointing at device_config(meter_id) — that FK is gone now (see
+    "device_config stands alone" further down in README.md), but the
+    auto-provisioning behavior itself is still wanted on its own merits:
+    device_config should have a real row for every meter_id that's ever
+    been seen, confirmed, independent of any referential-integrity
+    concern.
+
+    Selects the row if it exists; if not, inserts one with
+    DEFAULT_CONFIG values and is_default=true. Takes a connection
+    rather than acquiring its own, so a caller already inside a
+    transaction (the upload handler) gets this insert folded into that
+    same transaction.
+
+    ON CONFLICT (meter_id) DO NOTHING + a follow-up SELECT (rather than
+    trusting RETURNING on the INSERT itself) is what makes this safe
+    against two requests racing for the same brand-new meter_id at
+    once — e.g. two images from the same first-ever burst, or a
+    GET /devices/config landing at the same instant as the first
+    upload. Whichever INSERT wins, the loser's SELECT still finds a
+    real row instead of erroring on the PK collision.
+
+    New rows get is_default=true — this function never sets it false;
+    only PUT /admin/device-config/{meter_id} does.
+    """
+    row = await conn.fetchrow("SELECT * FROM device_config WHERE meter_id = $1", meter_id)
+    if row is not None:
+        return row
+    await conn.execute(
+        """
+        INSERT INTO device_config (meter_id, schedule_mode, date1, date2, photo_count, photo_delay, is_default)
+        VALUES ($1, $2, $3, $4, $5, $6, true)
+        ON CONFLICT (meter_id) DO NOTHING
+        """,
+        meter_id,
+        DEFAULT_CONFIG["schedule_mode"],
+        DEFAULT_CONFIG["date1"],
+        DEFAULT_CONFIG["date2"],
+        DEFAULT_CONFIG["photo_count"],
+        DEFAULT_CONFIG["photo_delay"],
+    )
+    return await conn.fetchrow("SELECT * FROM device_config WHERE meter_id = $1", meter_id)
 
 
 @router.get("/devices/config", response_model=DeviceConfigOut, summary="Get Device Config")
@@ -77,12 +124,19 @@ async def get_device_config(
 
     Per the spec ("หากเป็น Meter ใหม่ที่ยังไม่มีใน Database...ตอบกลับ
     Default Config...พร้อม HTTP Status 200 OK"): a meter_id with no row
-    yet gets DEFAULT_CONFIG back — this NEVER 404s, by design.
+    yet still gets DEFAULT_CONFIG back and 200 OK — this NEVER 404s, by
+    design, exactly as before.
+
+    **Confirmed, round 2: writes a real row now (get_or_create_device_config()),
+    is_default=true** — the response body a caller sees is identical
+    either way, but a row now exists afterward. NOT tied to any FK
+    concern this time (device_config still stands completely alone, no
+    FK from/to any other table) — purely so device_config keeps a real
+    record of every meter_id ever seen, confirmed request.
     """
     meter_id = meter_id.strip().upper()
-    row = await pool().fetchrow("SELECT * FROM device_config WHERE meter_id = $1", meter_id)
-    if row is None:
-        return DeviceConfigOut(meter_id=meter_id, is_default=True, **DEFAULT_CONFIG)
+    async with pool().acquire() as conn:
+        row = await get_or_create_device_config(conn, meter_id)
     return _config_out(row)
 
 
@@ -162,18 +216,26 @@ async def admin_set_device_config(
     Flag if you'd rather this not exist at all (e.g. config is meant to
     be seeded directly in the DB, not through the API), or if it should
     require a different credential than a full admin JWT.
+
+    Always writes is_default=false (confirmed) — this is the ONLY place
+    that ever does. A deliberate PUT here is exactly what distinguishes
+    a real, admin-set config from a row get_or_create_device_config()
+    auto-provisioned elsewhere (GET /devices/config above, or the
+    upload handler) just from a meter_id showing up — see that
+    function's own docstring and is_default's comment in db/init.sql.
     """
     meter_id = meter_id.strip().upper()
     row = await pool().fetchrow(
         """
-        INSERT INTO device_config (meter_id, schedule_mode, date1, date2, photo_count, photo_delay)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO device_config (meter_id, schedule_mode, date1, date2, photo_count, photo_delay, is_default)
+        VALUES ($1, $2, $3, $4, $5, $6, false)
         ON CONFLICT (meter_id) DO UPDATE SET
             schedule_mode = EXCLUDED.schedule_mode,
             date1 = EXCLUDED.date1,
             date2 = EXCLUDED.date2,
             photo_count = EXCLUDED.photo_count,
-            photo_delay = EXCLUDED.photo_delay
+            photo_delay = EXCLUDED.photo_delay,
+            is_default = false
         RETURNING *
         """,
         meter_id,
@@ -197,12 +259,40 @@ async def admin_delete_device_config(
 ):
     """
     NOT in the spec doc — my own addition, for a dashboard "reset to
-    default" button. Removes the meter's row entirely — after this,
-    GET /devices/config (and the two admin GETs above) go back to
-    returning DEFAULT_CONFIG with is_default=true for this meter_id,
-    same as a meter that was never configured at all. Not an error if
-    the meter had no row to begin with (idempotent — deleting an
-    already-default meter is a no-op, not a 404).
+    default" button.
+
+    **Confirmed, round 3: back to an upsert, not a real DELETE.**
+    device_config now has real FKs pointing IN from images_*/ocr_jobs/
+    ocr_meter/ocr_meter_test/esp32_upload_log again (confirmed,
+    deliberately accepting this tradeoff) — an outright DELETE would
+    fail (FK violation) for any meter that's ever uploaded a single
+    image, which in practice is nearly every meter with a row here to
+    reset in the first place. Rewritten as an UPSERT back to
+    DEFAULT_CONFIG values with is_default=true instead — same
+    externally-visible effect as a real delete would have (every GET
+    above goes back to reporting is_default=true for that meter_id,
+    indistinguishable from a meter that was never configured), but the
+    row itself stays in place so every FK still pointing at it keeps
+    working. Idempotent either way — resetting an already-default
+    meter just re-writes the same values.
     """
     meter_id = meter_id.strip().upper()
-    await pool().execute("DELETE FROM device_config WHERE meter_id = $1", meter_id)
+    await pool().execute(
+        """
+        INSERT INTO device_config (meter_id, schedule_mode, date1, date2, photo_count, photo_delay, is_default)
+        VALUES ($1, $2, $3, $4, $5, $6, true)
+        ON CONFLICT (meter_id) DO UPDATE SET
+            schedule_mode = EXCLUDED.schedule_mode,
+            date1 = EXCLUDED.date1,
+            date2 = EXCLUDED.date2,
+            photo_count = EXCLUDED.photo_count,
+            photo_delay = EXCLUDED.photo_delay,
+            is_default = true
+        """,
+        meter_id,
+        DEFAULT_CONFIG["schedule_mode"],
+        DEFAULT_CONFIG["date1"],
+        DEFAULT_CONFIG["date2"],
+        DEFAULT_CONFIG["photo_count"],
+        DEFAULT_CONFIG["photo_delay"],
+    )

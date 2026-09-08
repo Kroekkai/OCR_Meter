@@ -16,6 +16,7 @@ nothing gets silently re-guessed or re-flipped:
 - **`is_test_filename()`/`ocr_meter_test`** — every new group is tagged by ESP32's own `wakeup_reason` query param on upload (`"timer"` → real, anything else including absent → test, a later Project Carbon firmware update — replaced an earlier server-side comparison against `device_config`'s schedule, `app/schedule_match.py`, since deleted) and, for a test capture, has `_Test` appended to its *stored* filename (both disk and DB) — there is no separate `is_test` column anywhere (tried, then removed); `is_test_filename(original_filename)` is the sole source of truth end to end. Results for test jobs go to the new `ocr_meter_test` table instead of `ocr_meter`. At most one normal (non-test) group per meter per Bangkok calendar day may be *queued* — a same-day duplicate gets `ocr_status='dropped'` set on its `images_*` rows and creates **no `ocr_jobs` row at all** (confirmed design — dropped status is visible only in `images_*`, never in `ocr_jobs`); test groups are exempt from this limit entirely. See "Real vs. test captures" below.
 - **`esp32_upload_log`** — a new observability-only table (Project Carbon, confirmed), one row per group, logging the `net_mode`/`carrier`/`wakeup_reason` query params ESP32 now sends alongside every upload. No bearing on grouping/OCR/results. See "Real vs. test captures" below.
 - **`ocr_engine`** — a new lookup table (Worker team spec, confirmed), same pattern as `error_type`. `ocr_meter`/`ocr_meter_test` both gained an `ocr_engine INT REFERENCES ocr_engine(code)` column (1=LOCAL, 2=GEMINI) — optional on `POST .../result`/`.../result-test`, defaults to 1 when omitted. Purely observational. See "`ocr_engine`" below.
+- **`dataset`** — a new table (confirmed request, from a hand-drawn diagram), consolidating every image's file path into one place regardless of meter type. `images_electric`/`water`/`gas` each gained a `dataset_id BIGINT REFERENCES dataset(id)` column — every new upload gets its own 1:1 `dataset` row now (existing rows from before this column existed are left alone, never backfilled). See "`dataset`" below.
 - `ocr_jobs` is one shared table across meter types (per `db/init.sql`) — not split into `ocr_jobs_electric/water/gas`.
 - Upload filename convention: `{meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg`, meter_id/device_timestamp parsed from it (Thailand local time, UTC+7), invalid meter_id prefix → HTTP 400.
 - Auth is fixed-secret-per-deployment: `DEVICE_API_KEY`/`DEVICE_API_KEY_USERNAME` and `OCR_CLIENT_KEY`/`OCR_CLIENT_KEY_USERNAME`, each an *optional shortcut* alongside real JWT login (blank pair = login required). See `app/auth.py`.
@@ -291,6 +292,72 @@ letting a typo trip the DB's FK constraint instead.
 anything else.** Exists so the Worker team can later query "what % of
 captures needed the Gemini fallback" without re-deriving it from
 anything else.
+
+### `dataset` — one central place to look up any image's file path
+
+Not in either original spec doc — confirmed request, from a hand-drawn
+diagram. Before this, an image's disk location was only ever computable
+by knowing which of `images_electric`/`images_water`/`images_gas` it
+lived in and calling `storage.original_path()` on that row's
+`original_filename`. `dataset` gives it a home independent of meter
+type:
+
+```sql
+CREATE TABLE dataset (
+    id   BIGSERIAL PRIMARY KEY,
+    path TEXT      NOT NULL
+);
+```
+
+Each `images_*` table gained a `dataset_id BIGINT REFERENCES
+dataset(id)` column — confirmed **1:1, not shared**: every single image
+upload creates its own new `dataset` row, not one row per group/burst
+(unlike `esp32_upload_log` above, which *is* one-per-group — these two
+tables intentionally have different granularity, since a `dataset` row
+represents one specific file, while the ESP32 metadata is identical
+across an entire burst).
+
+**Populated in `app/routers/images.py`'s `_insert_dataset_row()`,
+called from both branches of the upload handler** (opening a new group
+and joining an existing one) — right before the `images_*` INSERT, so
+`dataset_id` can be included in that same INSERT rather than needing a
+second `UPDATE` afterward. This works because the path is fully
+determined by the filename alone (`storage.original_path()` only ever
+falls back to using the image's numeric id when `original_filename` is
+`None`, which can't happen this far into the upload handler) — so
+`dataset_id` is knowable *before* the `images_*` row (and its real
+auto-generated id) even exists yet.
+
+**A real bug caught and fixed while building this — worth flagging for
+future migrations:** `images_water`/`images_gas` are created via
+`CREATE TABLE ... (LIKE images_electric INCLUDING ALL)`. Despite the
+name, **`INCLUDING ALL` does NOT copy foreign key constraints** —
+confirmed against Postgres's own documentation (only indexes,
+`PRIMARY KEY`/`UNIQUE`/`EXCLUDE` constraints, `CHECK` constraints, and
+a handful of other properties are listed as copied; `REFERENCES` isn't
+among them, and this is a known, actively-discussed documentation gap
+upstream). So `images_water`/`images_gas` get the `dataset_id` *column*
+from the `LIKE` automatically, but **not** the FK pointing it at
+`dataset(id)` — relying on `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+alone for the FK would have silently skipped adding it on those two
+tables forever (the column already existing makes the whole statement
+a no-op). Fixed by giving all 3 tables their own explicit, named
+`DROP CONSTRAINT IF EXISTS` + `ADD CONSTRAINT ... FOREIGN KEY` pair —
+same idempotent pattern already used for `ocr_meter`'s `error_type`/
+`ocr_engine` FKs — so the FK gets attached correctly and stays correct
+across repeated `init.sql` runs regardless of how the column itself got
+there.
+
+**Not yet decided / worth flagging:**
+- No endpoint reads `dataset` yet — it's populated on every upload but
+  nothing serves it back out. `GET /admin/images-by-filename/{filename}/file`
+  (used by the dashboard's test-results section) still works purely off
+  `original_filename`/computed paths, doesn't touch this table at all.
+  Flag if you want `dataset` actually exposed somewhere.
+- Existing rows (from before this migration) have `dataset_id = NULL` —
+  confirmed not backfilled. If historical images ever need a `dataset`
+  row too, that's a separate one-time migration, not something
+  `init.sql` does automatically on every run.
 
 ## `group_id` — human-readable group codes (E1, W3, G12, ...)
 
@@ -792,11 +859,18 @@ curl "http://localhost:3003/devices/config?meter_id=E101" \
   stays `[0,0,0,0,0]` unless the meter has a second monthly cycle.
 - **A meter with no row yet always gets `DEFAULT_CONFIG` back, still
   `200 OK`** — confirmed from the spec doc directly, never a 404.
-- **`is_default` (my own addition, not in the spec)** — `true` when this
-  response is `DEFAULT_CONFIG` because the meter has no row yet, `false`
-  when it's a genuinely stored config. ESP32 ignores the extra field
-  (harmless); a dashboard can use it to show "using default" vs
-  "customized" state.
+  **This call also auto-provisions a real row** for a brand-new
+  meter_id (`get_or_create_device_config()`) — the response body is
+  identical either way, but a row now exists in the DB afterward. This
+  matters more than it might look: real FKs point at
+  `device_config(meter_id)` from seven other tables now (see
+  "`device_config`" below), so this row existing is what lets this same
+  meter_id's very first `images_*` insert succeed at all.
+- **`is_default` (my own addition, not in the spec)** — `true` = still
+  running on auto-provisioned defaults, nobody has ever explicitly set
+  this meter's schedule; `false` = an admin used `PUT` below at least
+  once. ESP32 ignores the extra field (harmless); a dashboard can use
+  it to show "using default" vs "customized" state.
 
 **Four things NOT in that spec doc, all my own additions — flag if
 any should be different:**
@@ -836,10 +910,15 @@ curl -X PUT http://localhost:3003/admin/device-config/E101 \
     -d '{"schedule_mode":1,"date1":[26,0,0,8,0],"date2":[0,0,0,0,0],"photo_count":3,"photo_delay":5}'
 ```
 5. **`DELETE /admin/device-config/{meter_id}`** — a dashboard "reset to
-   default" button. Removes the row entirely (admin JWT only);
-   idempotent — deleting an already-default meter is a no-op, not a
-   404. After this, every GET above goes back to `DEFAULT_CONFIG` for
-   that `meter_id`.
+   default" button (admin JWT only). **Confirmed final (round 4, see
+   "`device_config`" below for the full back-and-forth): an UPSERT back
+   to `DEFAULT_CONFIG` with `is_default=true`, NOT a real row removal.**
+   Real FKs from seven other tables point at this one now — an actual
+   `DELETE` would fail (FK violation) for any meter with history in
+   those tables, which in practice is nearly every meter with a row
+   here to reset in the first place. Same externally-visible effect as
+   a real delete either way (every `GET` above goes back to reporting
+   `is_default: true`); idempotent.
 6. **`GET /admin/device-config-ui`** — a small standalone dashboard
    (`app/static/device_config_ui.html`, served as plain `HTMLResponse`
    — no template engine, no build step) so a human can browse/edit
@@ -888,6 +967,60 @@ also have `CHECK` constraints matching the spec's valid ranges
 (0-1, 1-10, 1-60) — enforced at the DB level, not just in the Pydantic
 request model, so a bad value can never land in the table regardless of
 how it got inserted.
+
+### `device_config` — real FKs from 7 tables, confirmed final (round 4)
+
+This has gone through four full rounds — worth recording the whole
+arc, since it's flipped back and forth and a future change might
+reasonably want to revisit it again:
+
+1. **Originally**: every `meter_id` column across the schema was a
+   plain `TEXT`, matched by *value* against `device_config.meter_id`
+   purely by application-code convention — no DB-level relationship at
+   all, in either direction. `GET /devices/config` a pure read, nothing
+   ever persisted for a brand-new meter.
+2. **Real FKs added, confirmed request from a hand-drawn diagram**:
+   `FOREIGN KEY (meter_id) REFERENCES device_config(meter_id)` on seven
+   tables (`images_electric`/`water`/`gas`, `ocr_jobs`, `ocr_meter`,
+   `ocr_meter_test`, `esp32_upload_log`), plus an `is_default` column
+   and auto-provisioning (`get_or_create_device_config()`) so a
+   brand-new meter's first upload wouldn't fail outright against a
+   `device_config` row that didn't exist yet.
+3. **FK reverted, confirmed** — a real FK meant `device_config` could
+   no longer ever be cleanly deleted for a meter that still had any
+   history in those other seven tables (a hard Postgres rule: you
+   cannot delete a row another table's FK still points at), and a
+   genuine "remove this meter_id's config row" was confirmed as wanted
+   at the time. `device_config` went back to standing alone, `is_default`/
+   `get_or_create_device_config()` both removed.
+4. **Auto-provisioning re-added minus the FK** — the auto-provisioning
+   *behavior itself* was still wanted independent of the referential-
+   integrity question, so it came back on its own first (`is_default`,
+   `get_or_create_device_config()`), deliberately without any FK.
+5. **FK re-added, confirmed final — this time deliberately accepting
+   the DELETE tradeoff.** Real FKs from all seven tables restored,
+   matching the original hand-drawn diagram exactly. Confirmed
+   explicitly: `DELETE /admin/device-config/{meter_id}` can no longer
+   ever be a real `DELETE` for a meter with any history elsewhere —
+   accepted as the right tradeoff this time, in exchange for
+   `device_config(meter_id)` being a real, DB-enforced foreign key
+   everywhere `meter_id` appears.
+
+**Where this landed:** `is_default` and `get_or_create_device_config()`
+— called from `GET /devices/config` and from
+`app/routers/images.py`'s upload handler, right at the top of that
+transaction so it commits or rolls back atomically with the
+`images_*` insert it's guarding. All seven FKs
+(`images_electric`/`water`/`gas`, `ocr_jobs`, `ocr_meter`,
+`ocr_meter_test`, `esp32_upload_log` → `device_config(meter_id)`) are
+back, `DROP CONSTRAINT IF EXISTS` + `ADD CONSTRAINT` pairs in
+`db/init.sql`, placed *after* `CREATE TABLE device_config` (ordering
+matters here — a table can't be referenced by an FK before it exists).
+`DELETE /admin/device-config/{meter_id}` is an UPSERT back to
+`DEFAULT_CONFIG` values with `is_default=true`, not an actual row
+removal — same externally-visible effect (every `GET` reports
+`is_default: true` afterward, indistinguishable from a never-configured
+meter) without ever violating the FK.
 
 ## Things still worth double-checking
 
