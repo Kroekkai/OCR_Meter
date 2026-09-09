@@ -697,35 +697,93 @@ ALTER TABLE esp32_upload_log ADD CONSTRAINT esp32_upload_log_meter_id_fkey FOREI
 -- rows. Only inserted in the "open new group" branch of the upload
 -- handler, same moment is_test gets decided for that group.
 --
--- Confirmed naming: data1/data2/data3 (not net_mode/carrier/wakeup_reason
--- as column names) map to net_mode/carrier/wakeup_reason respectively,
--- in that order, all TEXT, all nullable (older firmware that hasn't
--- been updated yet sends none of the 3 query params at all).
+-- Column names net_mode/carrier/wakeup_reason — confirmed request
+-- (an earlier version briefly used data1/data2/data3 — renamed, see
+-- the migration block below for DBs that ran that version). All TEXT,
+-- all nullable (older firmware that hasn't been updated yet sends
+-- none of the 3 query params at all).
 CREATE TABLE IF NOT EXISTS esp32_upload_log (
-    id        BIGSERIAL PRIMARY KEY,
-    log_date  DATE      NOT NULL,  -- device_timestamp's Bangkok-local date (not received_at) — matches capture_date elsewhere
+    id            BIGSERIAL PRIMARY KEY,
+    log_date      DATE      NOT NULL,  -- device_timestamp's Bangkok-local date (not received_at) — matches capture_date elsewhere
     -- log_time — confirmed request, added later. Same Bangkok-local
     -- device_timestamp as log_date, just the time-of-day component —
     -- previously only the date was kept, meaning multiple bursts from
     -- the same meter on the same day were indistinguishable by time
-    -- alone in this table.
-    log_time  TIME      NOT NULL,
-    meter_id  TEXT      NOT NULL,
-    data1     TEXT,                -- net_mode: "4G" | "WiFi" | null
-    -- data2 — confirmed request, added later: carrier arrives from
-    -- ESP32 as a raw PLMN code (e.g. "52003"), not a pre-formatted
-    -- carrier name — normalized to a human-readable name (e.g. "AIS
-    -- (AWN)") before being stored here, via
+    -- alone in this table. Confirmed: must sit directly after
+    -- log_date, not at the end of the table.
+    log_time      TIME      NOT NULL,
+    meter_id      TEXT      NOT NULL,
+    net_mode      TEXT,                -- "4G" | "WiFi" | null
+    -- carrier — confirmed request, added later: arrives from ESP32 as
+    -- a raw PLMN code (e.g. "52003"), not a pre-formatted carrier
+    -- name — normalized to a human-readable name (e.g. "AIS (AWN)")
+    -- before being stored here, via
     -- app/routers/images.py::_normalize_carrier(). "-" (on WiFi) and
     -- any PLMN code not in that mapping table pass through unchanged.
-    data2     TEXT,                -- carrier: normalized carrier name | "-" (on WiFi) | null
-    data3     TEXT                 -- wakeup_reason: "timer" | "manual" | null (null/anything-but-"timer" -> is_test=true)
+    carrier       TEXT,                -- normalized carrier name | "-" (on WiFi) | null
+    wakeup_reason TEXT                 -- "timer" | "manual" | null (null/anything-but-"timer" -> is_test=true)
 );
--- เผื่อ esp32_upload_log มีอยู่แล้วจากรอบก่อนที่ยังไม่มี log_time —
--- backfill แถวเก่าด้วย 00:00:00 ชั่วคราว (ไม่มีทางรู้เวลาจริงย้อนหลังได้
--- แม่นยำกว่านี้ ไม่ใช่ error แค่ไม่มีข้อมูลดีกว่านี้ให้ใช้) แล้วค่อยบังคับ
--- NOT NULL ให้แถวใหม่ต้องมีค่าเสมอตามที่ตั้งใจ
-ALTER TABLE esp32_upload_log ADD COLUMN IF NOT EXISTS log_time TIME;
-UPDATE esp32_upload_log SET log_time = '00:00:00' WHERE log_time IS NULL;
-ALTER TABLE esp32_upload_log ALTER COLUMN log_time SET NOT NULL;
+
+-- ⚠️ Migration สำหรับ DB ที่เคยผ่านเวอร์ชันก่อนหน้ามาแล้ว (ไม่ว่าจะยังไม่มี
+-- log_time เลย, มี log_time แต่ต่อท้ายตาราง (จาก ADD COLUMN ซึ่งต่อท้าย
+-- เสมอ ไม่ใช่แทรกตำแหน่งที่ระบุใน CREATE TABLE), หรือยังใช้ชื่อคอลัมน์เดิม
+-- data1/data2/data3 อยู่) — ทำให้ตรงกับ CREATE TABLE ด้านบนทุกกรณี
+-- confirmed: ต้อง reorder จริง (สร้างตารางใหม่+ย้ายข้อมูล) ไม่ใช่แค่
+-- ALTER TABLE ADD COLUMN เพราะ Postgres ไม่มีคำสั่งขยับตำแหน่งคอลัมน์
+-- ตรงๆ — pattern เดียวกับที่ใช้ reorder ocr_meter ก่อนหน้า
+DO $$
+DECLARE
+    correct_order TEXT[] := ARRAY['id','log_date','log_time','meter_id','net_mode','carrier','wakeup_reason'];
+    actual_order  TEXT[];
+BEGIN
+    -- เปลี่ยนชื่อคอลัมน์เก่าก่อน (no-op ถ้าเปลี่ยนไปแล้ว หรือเป็น fresh
+    -- install ที่ไม่เคยมีชื่อเก่าเลย)
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'esp32_upload_log' AND column_name = 'data1') THEN
+        ALTER TABLE esp32_upload_log RENAME COLUMN data1 TO net_mode;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'esp32_upload_log' AND column_name = 'data2') THEN
+        ALTER TABLE esp32_upload_log RENAME COLUMN data2 TO carrier;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'esp32_upload_log' AND column_name = 'data3') THEN
+        ALTER TABLE esp32_upload_log RENAME COLUMN data3 TO wakeup_reason;
+    END IF;
+
+    -- เพิ่ม log_time ถ้ายังไม่มีเลย (DB ที่ไม่เคยรัน migration รอบก่อน
+    -- มาก่อนเลย) — backfill แถวเก่าด้วย 00:00:00 ชั่วคราว (ไม่มีทางรู้
+    -- เวลาจริงย้อนหลังได้แม่นยำกว่านี้)
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'esp32_upload_log' AND column_name = 'log_time') THEN
+        ALTER TABLE esp32_upload_log ADD COLUMN log_time TIME;
+        UPDATE esp32_upload_log SET log_time = '00:00:00' WHERE log_time IS NULL;
+        ALTER TABLE esp32_upload_log ALTER COLUMN log_time SET NOT NULL;
+    END IF;
+
+    -- เช็คว่าลำดับคอลัมน์ตรงกับที่ต้องการหรือยัง (log_time อยู่ติดหลัง
+    -- log_date จริงไหม) ถ้าไม่ตรง (เช่น log_time ไปต่อท้ายตารางเพราะ
+    -- ADD COLUMN ก่อนหน้า) ให้สร้างตารางใหม่ตามลำดับที่ถูกต้องแล้วย้าย
+    -- ข้อมูล
+    SELECT array_agg(column_name::text ORDER BY ordinal_position)
+    INTO actual_order
+    FROM information_schema.columns
+    WHERE table_name = 'esp32_upload_log';
+
+    IF actual_order IS DISTINCT FROM correct_order THEN
+        CREATE TABLE esp32_upload_log_reordered (
+            id            BIGINT    PRIMARY KEY DEFAULT nextval('esp32_upload_log_id_seq'),
+            log_date      DATE      NOT NULL,
+            log_time      TIME      NOT NULL,
+            meter_id      TEXT      NOT NULL,
+            net_mode      TEXT,
+            carrier       TEXT,
+            wakeup_reason TEXT
+        );
+        INSERT INTO esp32_upload_log_reordered (id, log_date, log_time, meter_id, net_mode, carrier, wakeup_reason)
+            SELECT id, log_date, log_time, meter_id, net_mode, carrier, wakeup_reason
+            FROM esp32_upload_log
+            ORDER BY id;
+        DROP TABLE esp32_upload_log;
+        ALTER TABLE esp32_upload_log_reordered RENAME TO esp32_upload_log;
+        ALTER TABLE esp32_upload_log RENAME CONSTRAINT esp32_upload_log_reordered_pkey TO esp32_upload_log_pkey;
+    END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_esp32_upload_log_meter ON esp32_upload_log (meter_id, log_date DESC);

@@ -560,21 +560,22 @@ grouping/OCR/results, confirmed. One row per **group** (not per image —
 every image in a burst shares the same wake-up event, so `net_mode`/
 `carrier`/`wakeup_reason` would be identical across all of them;
 logging per-image would just be 3x redundant rows), inserted in the
-same "open new group" branch that decides `is_test`. Columns:
-`log_date`/`log_time` (the group's `device_timestamp`, split into
+same "open new group" branch that decides `is_test`. Columns, in this
+exact order (confirmed, DB-enforced — see the reorder migration in
+`db/init.sql` if this table was created before either change below):
+`id`, `log_date`/`log_time` (the group's `device_timestamp`, split into
 Bangkok-local date and time-of-day — `log_time` added later, confirmed
-request, for full timestamp resolution when a meter logs more than
-once a day — not `received_at`, matching how `capture_date`/
-`capture_time` are derived everywhere else), `meter_id`, and
-`data1`/`data2`/`data3` (confirmed naming — mapping to
-`net_mode`/`carrier`/`wakeup_reason` respectively, all `TEXT`, all
-nullable for pre-update firmware).
+request, sitting directly after `log_date` — not `received_at`,
+matching how `capture_date`/`capture_time` are derived everywhere
+else), `meter_id`, and `net_mode`/`carrier`/`wakeup_reason` (confirmed
+column names — an earlier version briefly used `data1`/`data2`/`data3`
+instead, renamed — all `TEXT`, all nullable for pre-update firmware).
 
-**`data2`/`carrier` normalization — confirmed request, added later.**
+**`carrier` normalization — confirmed request, added later.**
 ESP32 sends `carrier` as a raw PLMN code (MCC+MNC, e.g. `"52003"`), not
 a ready-to-read carrier name — `app/routers/images.py::_normalize_carrier()`
 maps it against a small lookup table before it's ever written to
-`data2`:
+`carrier`:
 
 | PLMN code(s) | Stored as |
 |---|---|

@@ -45,7 +45,7 @@ def _stored_filename(original: str, is_test: bool) -> str:
 # PLMN (MCC+MNC) -> ผู้ให้บริการเครือข่ายไทย — ยืนยันตามตารางที่ให้มา.
 # ESP32 ส่ง carrier มาเป็นรหัส PLMN ดิบ (เช่น "52003") ไม่ใช่ชื่อ
 # เครือข่ายสำเร็จรูป — ต้องแปลงเป็นชื่ออ่านง่ายก่อนเก็บลง
-# esp32_upload_log.data2 เสมอ ผ่าน _normalize_carrier() ด้านล่าง
+# esp32_upload_log.carrier เสมอ ผ่าน _normalize_carrier() ด้านล่าง
 PLMN_CARRIER_MAP = {
     "52003": "AIS (AWN)",
     "52001": "AIS (AWN)",
@@ -63,7 +63,7 @@ def _normalize_carrier(raw: str | None) -> str | None:
     Confirmed request: map the raw PLMN code ESP32 sends in the
     `carrier` query param to a human-readable carrier name, per
     PLMN_CARRIER_MAP above, before it gets logged to
-    esp32_upload_log.data2. Anything not in that table — "-" (the
+    esp32_upload_log.carrier. Anything not in that table — "-" (the
     documented value when net_mode is WiFi, meaning no cellular
     network at all), None (older firmware that doesn't send this
     param), or a PLMN code not yet in the mapping — passes through
@@ -309,17 +309,18 @@ async def upload_image(
                 # how capture_date/capture_time are derived everywhere
                 # else in this codebase — not received_at, so a burst
                 # uploaded just after Bangkok midnight still logs under
-                # the date/time it was actually captured. data1/data2/
-                # data3 (confirmed naming) map to
-                # net_mode/carrier/wakeup_reason in that order — all
-                # TEXT, all nullable (old firmware sends none of them).
-                # data2 specifically goes through _normalize_carrier()
-                # first — see that function's own docstring for why
-                # (ESP32 sends a raw PLMN code, not a carrier name).
+                # the date/time it was actually captured. Columns are
+                # net_mode/carrier/wakeup_reason (confirmed naming — an
+                # earlier version briefly used data1/data2/data3,
+                # renamed) — all TEXT, all nullable (old firmware sends
+                # none of them). carrier specifically goes through
+                # _normalize_carrier() first — see that function's own
+                # docstring for why (ESP32 sends a raw PLMN code, not a
+                # carrier name).
                 local_dt = device_timestamp.astimezone(BANGKOK_TZ)
                 await conn.execute(
                     """
-                    INSERT INTO esp32_upload_log (log_date, log_time, meter_id, data1, data2, data3)
+                    INSERT INTO esp32_upload_log (log_date, log_time, meter_id, net_mode, carrier, wakeup_reason)
                     VALUES ($1, $2, $3, $4, $5, $6)
                     """,
                     local_dt.date(),
