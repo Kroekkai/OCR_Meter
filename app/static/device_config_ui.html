@@ -141,21 +141,6 @@
      (the whole section is already scoped to one meter) and group_id is
      shown instead */
   #tr-section { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
-  #log-section { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
-  #log-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  #log-table th {
-    text-align: left;
-    font-weight: 500;
-    color: var(--text-muted);
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--border);
-  }
-  #log-table td {
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--border);
-    font-family: var(--mono);
-  }
-  #log-table tbody tr:last-child td { border-bottom: none; }
   .section-divider { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; }
   .tr-empty { color: var(--text-muted); font-size: 13px; padding: 4px 0; }
   .tr-card {
@@ -185,6 +170,21 @@
     font-size: 10px;
     text-align: center;
     cursor: default;
+  }
+  .tr-thumb-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    width: 64px;
+  }
+  .tr-thumb-log {
+    font-size: 10px;
+    color: var(--text-muted);
+    text-align: center;
+    line-height: 1.3;
+    word-break: break-word;
   }
   .tr-meta { flex: 1; min-width: 0; }
   .tr-meta .tr-group { font-family: var(--mono); font-size: 13px; color: var(--text-muted); }
@@ -401,23 +401,6 @@
           <div id="tr-empty" class="tr-empty">ยังไม่มีผลทดสอบสำหรับมิเตอร์นี้</div>
           <div id="tr-list"></div>
         </div>
-
-        <div id="log-section">
-          <div class="section-divider">log ESP32 ล่าสุด</div>
-          <div id="log-empty" class="tr-empty">ยังไม่มี log สำหรับมิเตอร์นี้</div>
-          <table id="log-table" style="display:none">
-            <thead>
-              <tr>
-                <th>วันที่</th>
-                <th>เวลา</th>
-                <th>โหมด</th>
-                <th>เครือข่าย</th>
-                <th>สาเหตุตื่น</th>
-              </tr>
-            </thead>
-            <tbody id="log-tbody"></tbody>
-          </table>
-        </div>
       </div>
     </div>
   </main>
@@ -588,7 +571,6 @@
       const cfg = await res.json();
       renderDetail(cfg);
       loadTestResults(meterId);
-      loadEsp32Log(meterId);
     } catch (e) { /* handled in api() */ }
   }
 
@@ -827,10 +809,28 @@
     const card = document.createElement("div");
     card.className = "tr-card";
 
+    const thumbWrap = document.createElement("div");
+    thumbWrap.className = "tr-thumb-wrap";
+
     const thumb = document.createElement("img");
     thumb.className = "tr-thumb";
-    card.appendChild(thumb);
+    thumbWrap.appendChild(thumb);
     loadThumb(thumb, entry.anchor_image_path);
+
+    // net_mode/carrier/wakeup_reason — confirmed request: shown right
+    // under the anchor image itself, not as a separate table/section.
+    // Skips any field that's null (e.g. older results, or firmware
+    // that doesn't send these query params) rather than showing
+    // "null · null · null".
+    const logParts = [entry.net_mode, entry.carrier, entry.wakeup_reason].filter(Boolean);
+    if (logParts.length) {
+      const logLine = document.createElement("div");
+      logLine.className = "tr-thumb-log";
+      logLine.textContent = logParts.join(" · ");
+      thumbWrap.appendChild(logLine);
+    }
+
+    card.appendChild(thumbWrap);
 
     const meta = document.createElement("div");
     meta.className = "tr-meta";
@@ -853,48 +853,6 @@
 
     card.appendChild(meta);
     $("tr-list").appendChild(card);
-  }
-
-  // ---------- esp32 upload log (net_mode/carrier/wakeup_reason) —
-  // scoped to the currently selected meter, loaded automatically by
-  // selectMeter() above, same pattern as the test-results section.
-  // Confirmed request: this table existed since Project Carbon but had
-  // no read endpoint/UI at all until now.
-  async function loadEsp32Log(meterId) {
-    $("log-tbody").innerHTML = "";
-    $("log-table").style.display = "none";
-    $("log-empty").textContent = "กำลังโหลด...";
-    $("log-empty").style.display = "block";
-    try {
-      const res = await api("meters/esp32-upload-log?limit=10&meter_id=" + encodeURIComponent(meterId));
-      const items = await res.json();
-      if (!items.length) {
-        $("log-empty").textContent = "ยังไม่มี log สำหรับมิเตอร์นี้";
-        return;
-      }
-      $("log-empty").style.display = "none";
-      $("log-table").style.display = "table";
-      items.forEach((entry) => renderLogRow(entry));
-    } catch (e) {
-      $("log-empty").textContent = "โหลดไม่สำเร็จ";
-    }
-  }
-
-  function renderLogRow(entry) {
-    const tr = document.createElement("tr");
-    const cells = [
-      entry.log_date,
-      entry.log_time,
-      entry.net_mode || "—",
-      entry.carrier || "—",
-      entry.wakeup_reason || "—",
-    ];
-    cells.forEach((val) => {
-      const td = document.createElement("td");
-      td.textContent = val;
-      tr.appendChild(td);
-    });
-    $("log-tbody").appendChild(tr);
   }
 
   // ---------- boot ----------

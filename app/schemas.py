@@ -219,6 +219,16 @@ class OcrMeterTestEntry(OcrMeterEntry):
     Confirmed request: lets the dashboard's per-meter test-results
     section show which burst each card came from.
     """
+    net_mode: str | None
+    carrier: str | None
+    wakeup_reason: str | None
+    """
+    Confirmed request: shown directly on each test-result card instead
+    of a separate log table/section. A second LEFT JOIN against
+    esp32_upload_log (see app/routers/meters.py) — null when there's no
+    matching log row (older test results from before this logging
+    existed, or firmware that doesn't send these query params).
+    """
 
 
 # --------------------------------------------------------------------------

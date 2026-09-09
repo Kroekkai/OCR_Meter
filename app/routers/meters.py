@@ -54,6 +54,18 @@ async def _list_ocr_meter_test_rows(meter_id: str | None, limit: int, offset: in
     which burst each card came from) rides along on the exact same JOIN
     — no second query needed, it's just another column on the same
     images_* row anchor_image_path already comes from.
+
+    net_mode/carrier/wakeup_reason — confirmed request: shown inline on
+    each test-result card instead of a separate log table/section.
+    Second LEFT JOIN, this time against esp32_upload_log, matched on
+    meter_id + log_date/log_time = capture_date/capture_time directly
+    (no timezone conversion needed here, unlike the images_* join above
+    — both sides are already plain DATE/TIME columns derived from the
+    same device_timestamp via the exact same Bangkok-local conversion,
+    see app/routers/images.py's upload handler, so they compare equal
+    directly). Also LEFT, not INNER — a test result from before this
+    logging existed (or from firmware that doesn't send these query
+    params) still comes back, just with these three fields null.
     """
     clauses, params = [], []
     if meter_id:
@@ -63,7 +75,8 @@ async def _list_ocr_meter_test_rows(meter_id: str | None, limit: int, offset: in
     params.extend([limit, offset])
     rows = await pool().fetch(
         f"""
-        SELECT o.*, i.original_filename AS anchor_filename, i.group_id AS anchor_group_id
+        SELECT o.*, i.original_filename AS anchor_filename, i.group_id AS anchor_group_id,
+               log.net_mode, log.carrier, log.wakeup_reason
         FROM ocr_meter_test o
         LEFT JOIN (
             SELECT meter_id, device_timestamp, original_filename, group_id FROM images_electric WHERE is_anchor = true
@@ -73,6 +86,9 @@ async def _list_ocr_meter_test_rows(meter_id: str | None, limit: int, offset: in
             SELECT meter_id, device_timestamp, original_filename, group_id FROM images_gas WHERE is_anchor = true
         ) i ON i.meter_id = o.meter_id
            AND i.device_timestamp = (o.capture_date + o.capture_time) AT TIME ZONE 'Asia/Bangkok'
+        LEFT JOIN esp32_upload_log log ON log.meter_id = o.meter_id
+           AND log.log_date = o.capture_date
+           AND log.log_time = o.capture_time
         {where}
         ORDER BY o.capture_date DESC, o.capture_time DESC
         LIMIT ${len(params) - 1} OFFSET ${len(params)}
