@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.auth import CurrentUser, get_admin_or_service
 from app.config import get_settings
 from app.db import pool, table_for_meter_id
-from app.schemas import MeterHistoryEntry, OcrMeterEntry, OcrMeterTestEntry
+from app.schemas import Esp32UploadLogEntry, MeterHistoryEntry, OcrMeterEntry, OcrMeterTestEntry
 
 router = APIRouter(prefix="/admin/meters", tags=["default"])
 
@@ -221,3 +221,42 @@ async def admin_list_ocr_meter_test(
     and its real results never mix in either endpoint's response.
     """
     return await _list_ocr_meter_test_rows(meter_id, limit, offset)
+
+
+@router.get(
+    "/esp32-upload-log",
+    response_model=list[Esp32UploadLogEntry],
+    summary="Admin List Esp32 Upload Log",
+)
+async def admin_list_esp32_upload_log(
+    meter_id: str | None = Query(default=None, description="Optional — omit to list across every meter"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    _: CurrentUser = Depends(get_admin_or_service),
+):
+    """
+    Confirmed request — esp32_upload_log (Project Carbon's net_mode/
+    carrier/wakeup_reason metadata, see db/init.sql) had no read
+    endpoint at all until now; this is what the dashboard's per-meter
+    "log ESP32" section calls. Same shape/filter pattern as
+    GET .../ocr-meter and .../ocr-meter-test above — meter_id narrows
+    to one meter, omit it to list across all of them. One row per
+    group/burst (not per image — see the table's own comment in
+    db/init.sql for why), newest first.
+    """
+    clauses, params = [], []
+    if meter_id:
+        params.append(meter_id.strip().upper())
+        clauses.append(f"meter_id = ${len(params)}")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.extend([limit, offset])
+    rows = await pool().fetch(
+        f"""
+        SELECT * FROM esp32_upload_log
+        {where}
+        ORDER BY log_date DESC, log_time DESC
+        LIMIT ${len(params) - 1} OFFSET ${len(params)}
+        """,
+        *params,
+    )
+    return [Esp32UploadLogEntry(**dict(r)) for r in rows]

@@ -222,6 +222,23 @@ class OcrMeterTestEntry(OcrMeterEntry):
 
 
 # --------------------------------------------------------------------------
+# esp32_upload_log — confirmed request: expose this table via the
+# dashboard (it's existed since Project Carbon, but had no read endpoint
+# at all until now — see app/routers/meters.py::admin_list_esp32_upload_log()).
+# Field names match the table's own columns exactly (see db/init.sql) —
+# net_mode/carrier/wakeup_reason, not the earlier data1/data2/data3.
+# --------------------------------------------------------------------------
+class Esp32UploadLogEntry(BaseModel):
+    id: int
+    log_date: dt.date
+    log_time: dt.time
+    meter_id: str
+    net_mode: str | None
+    carrier: str | None
+    wakeup_reason: str | None
+
+
+# --------------------------------------------------------------------------
 # device_config — NOT part of the original confirmed spec. From a
 # separate ESP32 "device configuration" API spec doc another team sent
 # (GET /devices/config) — see app/routers/device_config.py.
