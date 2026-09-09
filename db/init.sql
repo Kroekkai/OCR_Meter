@@ -676,8 +676,12 @@ ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_meter_id_fkey;
 ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
 ALTER TABLE ocr_meter_test DROP CONSTRAINT IF EXISTS ocr_meter_test_meter_id_fkey;
 ALTER TABLE ocr_meter_test ADD CONSTRAINT ocr_meter_test_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
-ALTER TABLE esp32_upload_log DROP CONSTRAINT IF EXISTS esp32_upload_log_meter_id_fkey;
-ALTER TABLE esp32_upload_log ADD CONSTRAINT esp32_upload_log_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
+-- esp32_upload_log's meter_id FK is added near the end of this file
+-- instead, right after that table's own reorder migration — confirmed
+-- bug found in production: adding it here (before the reorder) meant
+-- the reorder's DROP TABLE esp32_upload_log wiped this FK out again a
+-- few statements later, since the reordered CREATE TABLE never
+-- declared REFERENCES device_config(meter_id) itself.
 
 -- --------------------------------------------------------------------------
 -- esp32_upload_log — NOT part of either original spec. Added for
@@ -805,3 +809,14 @@ BEGIN
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_esp32_upload_log_meter ON esp32_upload_log (meter_id, log_date DESC);
+
+-- ⚠️ esp32_upload_log's meter_id FK — ต้องอยู่ "หลัง" reorder migration
+-- ด้านบนเสมอ (ไม่ใช่ก่อน แบบที่เคยเป็นบั๊กจริงตอน deploy) เพราะ reorder
+-- migration ทำ DROP TABLE esp32_upload_log แล้วสร้างตารางใหม่ที่ไม่มี
+-- REFERENCES device_config(meter_id) ในนิยามคอลัมน์เอง — ถ้าเพิ่ม FK
+-- ก่อนบล็อก reorder ตาราง (และ FK) เดิมจะถูกลบทิ้งไปพร้อมกันตอน DROP
+-- TABLE แล้วไม่มีอะไรมาเพิ่ม FK ให้ใหม่อีกเลย จบ statement สุดท้ายของ
+-- ไฟล์ = รันหลัง reorder เสร็จสมบูรณ์เสมอ ไม่ว่า reorder จะ trigger
+-- จริงหรือเป็น no-op (fresh install ที่ลำดับคอลัมน์ถูกต้องตั้งแต่ต้น)
+ALTER TABLE esp32_upload_log DROP CONSTRAINT IF EXISTS esp32_upload_log_meter_id_fkey;
+ALTER TABLE esp32_upload_log ADD CONSTRAINT esp32_upload_log_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
