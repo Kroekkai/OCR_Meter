@@ -14,7 +14,7 @@ nothing gets silently re-guessed or re-flipped:
 - `error_type` is a plain integer 0/1/2/3 (not free-form text) — meanings live in the `error_type` lookup table (`db/init.sql`), server owns the definitions, OCR client just reports the code. Case 3 ("read a value, but anomalous") replaces the old `reading_decreased`/`usage_anomaly` text values as one combined case — still client-computed, server doesn't run this check. `error_detail` column removed from `ocr_meter`. `capture_date`/`capture_time` derived server-side from the job's `device_timestamp` now, never client-supplied. **No file upload on `/result` at all anymore** — it's plain form fields, not multipart; the old `result_image` field is gone (see "ocr_meter" below for why — it was a real risk, not just unnecessary). `ocr_meter.ocr_image_filename` renamed to `image_error`, and its value is now the FULL disk path (e.g. `/data/images/E101_..._01.jpg`, not just the bare filename) to the job's own `original_filename` (the anchor's already-stored file), not a separately uploaded one. `GET /admin/images/{item_id}/ocr-result-file` (original spec) removed accordingly — use `/file` instead. `meter_id` stored uppercase everywhere (was lowercase). `ocr_jobs.last_error`/`admin_reason` columns removed (not persisted anywhere now — `/fail`'s error message only reaches the server log). `group_id` is now the E1/W3/G12-style text code directly (the old numeric `group_id`/self-reference anchor mechanism and the separate `group_label` column from an earlier revision are both gone — merged into one `group_id` column, with a new `is_anchor` boolean replacing the self-reference trick), on `images_*`/`ocr_jobs`. A group also now finalizes into `ocr_jobs` immediately once it reaches `IMAGE_GROUP_SIZE` (3) images, not just on the 60s window fallback. **`ocr_meter` does NOT carry `group_id`** — briefly did in an intermediate revision, confirmed removed: `ocr_meter` is exactly 6 fields (`meter_id`, `capture_date`, `capture_time`, `ocr_reading`, `error_type`, `image_error`), nothing else, group tracking is an `images_*`/`ocr_jobs`-internal concern only. See "ocr_meter", "group_id", and "Burst upload grouping" sections below.
 - `DB_HOST=timescaledb` (container name on `innovation_net`), **not** the host's own IP `192.168.248.199` — connecting via the host's external IP timed out from inside the container (self-referential/hairpin routing back to its own host), confirmed via `docker network inspect innovation_net` while debugging the actual deploy. `timescaledb` and `ocr-meter-store` are both already on that network, so Docker's internal DNS resolves it directly — no IP needed at all.
 - **`is_test_filename()`/`ocr_meter_test`** — every new group is tagged by ESP32's own `wakeup_reason` query param on upload (`"timer"` → real, anything else including absent → test, a later Project Carbon firmware update — replaced an earlier server-side comparison against `device_config`'s schedule, `app/schedule_match.py`, since deleted) and, for a test capture, has `_Test` appended to its *stored* filename (both disk and DB) — there is no separate `is_test` column anywhere (tried, then removed); `is_test_filename(original_filename)` is the sole source of truth end to end. Results for test jobs go to the new `ocr_meter_test` table instead of `ocr_meter`. At most one normal (non-test) group per meter per Bangkok calendar day may be *queued* — a same-day duplicate gets `ocr_status='dropped'` set on its `images_*` rows and creates **no `ocr_jobs` row at all** (confirmed design — dropped status is visible only in `images_*`, never in `ocr_jobs`); test groups are exempt from this limit entirely. See "Real vs. test captures" below.
-- **`esp32_upload_log`** — a new observability-only table (Project Carbon, confirmed), one row per group, logging the `net_mode`/`carrier`/`wakeup_reason` query params ESP32 now sends alongside every upload. No bearing on grouping/OCR/results. See "Real vs. test captures" below.
+- **`esp32_upload_log`** — a new observability-only table (Project Carbon, confirmed), one row per group, logging the `net_mode`/`carrier`/`wakeup_reason` query params ESP32 now sends alongside every upload — `carrier` gets normalized from a raw PLMN code to a human-readable name first (`_normalize_carrier()`), and `log_time` (added later, confirmed) sits alongside `log_date` for full timestamp resolution. No bearing on grouping/OCR/results. See "Real vs. test captures" below.
 - **`ocr_engine`** — a new lookup table (Worker team spec, confirmed), same pattern as `error_type`. `ocr_meter`/`ocr_meter_test` both gained an `ocr_engine INT REFERENCES ocr_engine(code)` column (1=LOCAL, 2=GEMINI) — optional on `POST .../result`/`.../result-test`, defaults to 1 when omitted. Purely observational. See "`ocr_engine`" below.
 - **`dataset`** — a new table (confirmed request, from a hand-drawn diagram), consolidating every image's file path into one place regardless of meter type. `images_electric`/`water`/`gas` each gained a `dataset_id BIGINT REFERENCES dataset(id)` column — every new upload gets its own 1:1 `dataset` row now (existing rows from before this column existed are left alone, never backfilled). See "`dataset`" below.
 - `ocr_jobs` is one shared table across meter types (per `db/init.sql`) — not split into `ocr_jobs_electric/water/gas`.
@@ -561,11 +561,33 @@ every image in a burst shares the same wake-up event, so `net_mode`/
 `carrier`/`wakeup_reason` would be identical across all of them;
 logging per-image would just be 3x redundant rows), inserted in the
 same "open new group" branch that decides `is_test`. Columns:
-`log_date` (the group's `device_timestamp`, Bangkok-local date — not
-`received_at` — matching how `capture_date` is derived everywhere
-else), `meter_id`, and `data1`/`data2`/`data3` (confirmed naming —
-mapping to `net_mode`/`carrier`/`wakeup_reason` respectively, all
-`TEXT`, all nullable for pre-update firmware).
+`log_date`/`log_time` (the group's `device_timestamp`, split into
+Bangkok-local date and time-of-day — `log_time` added later, confirmed
+request, for full timestamp resolution when a meter logs more than
+once a day — not `received_at`, matching how `capture_date`/
+`capture_time` are derived everywhere else), `meter_id`, and
+`data1`/`data2`/`data3` (confirmed naming — mapping to
+`net_mode`/`carrier`/`wakeup_reason` respectively, all `TEXT`, all
+nullable for pre-update firmware).
+
+**`data2`/`carrier` normalization — confirmed request, added later.**
+ESP32 sends `carrier` as a raw PLMN code (MCC+MNC, e.g. `"52003"`), not
+a ready-to-read carrier name — `app/routers/images.py::_normalize_carrier()`
+maps it against a small lookup table before it's ever written to
+`data2`:
+
+| PLMN code(s) | Stored as |
+|---|---|
+| `52003`, `52001` | `AIS (AWN)` |
+| `52000`, `52004`, `52099` | `TrueMove H / my by NT` |
+| `52005`, `52018` | `dtac (TriNet)` |
+| `52015` | `NT Mobile (TOT)` |
+
+`"-"` (the documented value on WiFi — no cellular network at all),
+`None` (older firmware that doesn't send this param), and any PLMN
+code not yet in this table all pass through **unchanged** — an
+unrecognized code stays visible in the log for someone to notice and
+add, rather than being silently dropped or blanked out.
 
 **One normal group per meter per (Bangkok) calendar day — confirmed
 rule, applies only to non-test groups:**

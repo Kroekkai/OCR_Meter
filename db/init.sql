@@ -704,9 +704,28 @@ ALTER TABLE esp32_upload_log ADD CONSTRAINT esp32_upload_log_meter_id_fkey FOREI
 CREATE TABLE IF NOT EXISTS esp32_upload_log (
     id        BIGSERIAL PRIMARY KEY,
     log_date  DATE      NOT NULL,  -- device_timestamp's Bangkok-local date (not received_at) — matches capture_date elsewhere
+    -- log_time — confirmed request, added later. Same Bangkok-local
+    -- device_timestamp as log_date, just the time-of-day component —
+    -- previously only the date was kept, meaning multiple bursts from
+    -- the same meter on the same day were indistinguishable by time
+    -- alone in this table.
+    log_time  TIME      NOT NULL,
     meter_id  TEXT      NOT NULL,
     data1     TEXT,                -- net_mode: "4G" | "WiFi" | null
-    data2     TEXT,                -- carrier: mobile carrier name | "-" (on WiFi) | null
+    -- data2 — confirmed request, added later: carrier arrives from
+    -- ESP32 as a raw PLMN code (e.g. "52003"), not a pre-formatted
+    -- carrier name — normalized to a human-readable name (e.g. "AIS
+    -- (AWN)") before being stored here, via
+    -- app/routers/images.py::_normalize_carrier(). "-" (on WiFi) and
+    -- any PLMN code not in that mapping table pass through unchanged.
+    data2     TEXT,                -- carrier: normalized carrier name | "-" (on WiFi) | null
     data3     TEXT                 -- wakeup_reason: "timer" | "manual" | null (null/anything-but-"timer" -> is_test=true)
 );
+-- เผื่อ esp32_upload_log มีอยู่แล้วจากรอบก่อนที่ยังไม่มี log_time —
+-- backfill แถวเก่าด้วย 00:00:00 ชั่วคราว (ไม่มีทางรู้เวลาจริงย้อนหลังได้
+-- แม่นยำกว่านี้ ไม่ใช่ error แค่ไม่มีข้อมูลดีกว่านี้ให้ใช้) แล้วค่อยบังคับ
+-- NOT NULL ให้แถวใหม่ต้องมีค่าเสมอตามที่ตั้งใจ
+ALTER TABLE esp32_upload_log ADD COLUMN IF NOT EXISTS log_time TIME;
+UPDATE esp32_upload_log SET log_time = '00:00:00' WHERE log_time IS NULL;
+ALTER TABLE esp32_upload_log ALTER COLUMN log_time SET NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_esp32_upload_log_meter ON esp32_upload_log (meter_id, log_date DESC);

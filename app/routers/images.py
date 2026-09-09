@@ -42,6 +42,40 @@ def _stored_filename(original: str, is_test: bool) -> str:
     return f"{p.stem}_Test{p.suffix}"
 
 
+# PLMN (MCC+MNC) -> ผู้ให้บริการเครือข่ายไทย — ยืนยันตามตารางที่ให้มา.
+# ESP32 ส่ง carrier มาเป็นรหัส PLMN ดิบ (เช่น "52003") ไม่ใช่ชื่อ
+# เครือข่ายสำเร็จรูป — ต้องแปลงเป็นชื่ออ่านง่ายก่อนเก็บลง
+# esp32_upload_log.data2 เสมอ ผ่าน _normalize_carrier() ด้านล่าง
+PLMN_CARRIER_MAP = {
+    "52003": "AIS (AWN)",
+    "52001": "AIS (AWN)",
+    "52000": "TrueMove H / my by NT",
+    "52004": "TrueMove H / my by NT",
+    "52099": "TrueMove H / my by NT",
+    "52005": "dtac (TriNet)",
+    "52018": "dtac (TriNet)",
+    "52015": "NT Mobile (TOT)",
+}
+
+
+def _normalize_carrier(raw: str | None) -> str | None:
+    """
+    Confirmed request: map the raw PLMN code ESP32 sends in the
+    `carrier` query param to a human-readable carrier name, per
+    PLMN_CARRIER_MAP above, before it gets logged to
+    esp32_upload_log.data2. Anything not in that table — "-" (the
+    documented value when net_mode is WiFi, meaning no cellular
+    network at all), None (older firmware that doesn't send this
+    param), or a PLMN code not yet in the mapping — passes through
+    completely unchanged rather than erroring or being blanked out, so
+    a not-yet-mapped code is still visible in the log for someone to
+    notice and add, rather than silently lost.
+    """
+    if raw is None:
+        return None
+    return PLMN_CARRIER_MAP.get(raw, raw)
+
+
 async def _insert_dataset_row(conn, stored_filename: str) -> int:
     """
     Confirmed request (hand-drawn diagram) — a new `dataset` table
@@ -270,25 +304,29 @@ async def upload_image(
                 # net_mode/carrier/wakeup_reason are identical across
                 # every image in a burst (all come from the same
                 # wake-up event) — logging per-image would just be 3x
-                # redundant rows for no benefit. log_date uses
-                # device_timestamp's Bangkok-local date, matching how
-                # capture_date is derived everywhere else in this
-                # codebase — not received_at, so a burst uploaded just
-                # after Bangkok midnight still logs under the date it
-                # was actually captured. data1/data2/data3 (confirmed
-                # naming) map to net_mode/carrier/wakeup_reason in that
-                # order — all TEXT, all nullable (old firmware sends
-                # none of them).
-                log_date = device_timestamp.astimezone(BANGKOK_TZ).date()
+                # redundant rows for no benefit. log_date/log_time use
+                # device_timestamp's Bangkok-local date/time, matching
+                # how capture_date/capture_time are derived everywhere
+                # else in this codebase — not received_at, so a burst
+                # uploaded just after Bangkok midnight still logs under
+                # the date/time it was actually captured. data1/data2/
+                # data3 (confirmed naming) map to
+                # net_mode/carrier/wakeup_reason in that order — all
+                # TEXT, all nullable (old firmware sends none of them).
+                # data2 specifically goes through _normalize_carrier()
+                # first — see that function's own docstring for why
+                # (ESP32 sends a raw PLMN code, not a carrier name).
+                local_dt = device_timestamp.astimezone(BANGKOK_TZ)
                 await conn.execute(
                     """
-                    INSERT INTO esp32_upload_log (log_date, meter_id, data1, data2, data3)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO esp32_upload_log (log_date, log_time, meter_id, data1, data2, data3)
+                    VALUES ($1, $2, $3, $4, $5, $6)
                     """,
-                    log_date,
+                    local_dt.date(),
+                    local_dt.time(),
                     meter_id,
                     net_mode,
-                    carrier,
+                    _normalize_carrier(carrier),
                     wakeup_reason,
                 )
 
