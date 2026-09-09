@@ -767,6 +767,20 @@ BEGIN
     WHERE table_name = 'esp32_upload_log';
 
     IF actual_order IS DISTINCT FROM correct_order THEN
+        -- เจอ error จริงตอน deploy รอบก่อน — esp32_upload_log.id เดิม
+        -- สร้างด้วย BIGSERIAL ตอน fresh install ทำให้ Postgres ผูก
+        -- esp32_upload_log_id_seq ให้เป็นของ (OWNED BY) column นี้
+        -- อัตโนมัติ ถ้าไม่ตัดความเป็นเจ้าของออกก่อน ตอน DROP TABLE
+        -- esp32_upload_log ด้านล่าง Postgres จะพยายามลบ sequence ตามไป
+        -- ด้วย (เพราะเป็นเจ้าของ) แต่ลบไม่ได้เพราะ
+        -- esp32_upload_log_reordered ที่เพิ่งสร้างก็อ้างอิง sequence
+        -- เดียวกันอยู่ — ชนกัน error "cannot drop table ... other
+        -- objects depend on it" (pattern เดียวกับที่เคยเจอกับ ocr_meter
+        -- ด้านบน — คราวนี้ลืมใส่ fix นี้ตอนสร้างใหม่ แก้แล้ว) แก้โดยตัด
+        -- ความเป็นเจ้าของออกก่อน ให้ sequence ลอยอิสระ ไม่ผูกกับตาราง
+        -- ไหนจนกว่าจะผูกใหม่ด้านล่าง
+        ALTER SEQUENCE esp32_upload_log_id_seq OWNED BY NONE;
+
         CREATE TABLE esp32_upload_log_reordered (
             id            BIGINT    PRIMARY KEY DEFAULT nextval('esp32_upload_log_id_seq'),
             log_date      DATE      NOT NULL,
@@ -783,6 +797,10 @@ BEGIN
         DROP TABLE esp32_upload_log;
         ALTER TABLE esp32_upload_log_reordered RENAME TO esp32_upload_log;
         ALTER TABLE esp32_upload_log RENAME CONSTRAINT esp32_upload_log_reordered_pkey TO esp32_upload_log_pkey;
+        -- ผูก sequence กลับเข้ากับ column ใหม่ให้เรียบร้อย (ไม่จำเป็นต่อ
+        -- การทำงาน แค่ให้ Postgres จัดการ sequence ให้อัตโนมัติเวลา
+        -- DROP TABLE ในอนาคต เหมือนตอนที่เป็น BIGSERIAL แต่แรก)
+        ALTER SEQUENCE esp32_upload_log_id_seq OWNED BY esp32_upload_log.id;
     END IF;
 END $$;
 
