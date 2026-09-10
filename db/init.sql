@@ -7,9 +7,9 @@
 -- image-store เก็บ 4 อย่าง:
 --   1. users — ศูนย์กลาง auth เดียว ที่ meter-dashboard (และทุก service
 --      อื่น) เชื่อถือ
---   2. images_electric/water/gas (แยกตามประเภทมิเตอร์) + ocr_jobs
---      (ตารางเดียวรวมทุกประเภท) — ข้อมูล hardware capture + internal
---      job queue ของ OCR ล้วนๆ
+--   2. images (ตารางเดียวรวมทุกประเภทมิเตอร์ — แยกด้วย utility_type
+--      column, confirmed request) + ocr_jobs — ข้อมูล hardware capture +
+--      internal job queue ของ OCR ล้วนๆ
 --   3. ocr_meter — ผลลัพธ์ OCR ที่จบแล้ว (สำเร็จ/error) ตารางกลางสำหรับ
 --      ส่งต่อให้ระบบภายนอกใช้ ไม่อ้างอิงกลับไปที่ 2 ข้อบนเลย
 --   4. error_type — ตาราง lookup อธิบายความหมายของรหัส error_type แต่ละ
@@ -26,13 +26,17 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- --- Per-meter-type hardware/OCR tables ----------------------------------
+-- --- Unified images table (all meter types) --------------------------------
 -- แยกตามตัวอักษรแรกของ meter_id ตอนอัปโหลด (E->electric, W->water,
 -- G->gas) — meter_id เก็บเป็นตัวพิมพ์ใหญ่เสมอ (normalize ตอน parse ชื่อ
 -- ไฟล์ — ดู app/filename.py)
 --
--- images_electric/water/gas ทั้ง 3 ใช้ id จาก sequence เดียวกัน (และ
--- ocr_jobs_* อีกชุดหนึ่ง) เพื่อให้ id ไม่ชนกันข้ามตาราง
+-- ⚠️ confirmed request: รวม images_electric/water/gas เป็นตารางเดียว
+-- (images) ใช้คอลัมน์ utility_type แยกประเภทแทนชื่อตาราง — แก้ปัญหาเดิม
+-- ที่ "เพิ่มมิเตอร์ชนิดใหม่ (เช่น steam) ต้องเพิ่มตารางใหม่ + แก้โค้ดหลาย
+-- จุดพร้อมกัน (sequence, mapping, sweep loop, UNION ALL query, FK, index
+-- ฯลฯ)" — ตอนนี้เพิ่มมิเตอร์ชนิดใหม่แค่เพิ่มค่า utility_type ใหม่เข้า
+-- CHECK constraint พอ ไม่ต้องแตะ schema/โค้ดจุดอื่นเลย
 --
 -- group_id / is_anchor / received_at: ESP32 ส่งภาพเป็นชุด (burst) หลายภาพ
 -- ต่อการอ่าน 1 ครั้ง — server รวมภาพที่มาถึงจาก meter_id เดียวกันภายใน
@@ -41,21 +45,14 @@ CREATE TABLE IF NOT EXISTS users (
 -- ภาพครบ image_group_size แล้ว (ไม่ต้องรอครบเวลา — ดู app/routers/images.py)
 --
 -- group_id (TEXT, เช่น "E1", "W3", "G12") คือรหัสกลุ่มที่มนุษย์อ่านง่าย —
--- นับแยกต่างหากต่อประเภทมิเตอร์ (ไม่ใช่เลข id ดิบที่กระโดดข้ามกันเพราะ 3
--- ตารางแชร์ sequence เดียวกัน) กำหนดครั้งเดียวตอนเปิดกลุ่มใหม่ ภาพอื่นใน
--- กลุ่มเดียวกันได้ค่าเดียวกันหมด — **เดิมมี group_id (BIGINT, ชี้ id ของ
--- หัวกลุ่ม) แยกกับ group_label (TEXT, E1/W3) คนละคอลัมน์ ตอนนี้รวมเป็น
--- คอลัมน์เดียว: group_id (TEXT) คือ E1/W3/G12 ตรงๆ เลย ไม่มีเลข BIGINT
--- คู่ขนานอีกต่อไป**
+-- นับแยกต่างหากต่อประเภทมิเตอร์ (sequence คนละตัวต่อ utility_type ยังคง
+-- แยกกันอยู่ แม้ตอนนี้จะอยู่ในตารางเดียวกันแล้วก็ตาม — ตัวเลขจะได้ไม่
+-- กระโดดข้ามประเภทแบบสับสน)
 --
--- is_anchor (BOOLEAN) แทนที่กลไก "group_id = id" เดิมที่ใช้บอกว่าแถวไหน
--- เป็นหัวกลุ่ม — เพราะ group_id ไม่ใช่ BIGINT ที่ self-reference กับ id
--- ได้อีกแล้ว (เป็น TEXT ที่ทุกแถวในกลุ่มมีค่าเดียวกันหมด) จึงต้องมี flag
--- แยกบอกชัดๆ แทน — true = แถวนี้เป็นแถวแรกที่เปิดกลุ่มนี้ขึ้นมา (เก็บ
+-- is_anchor (BOOLEAN): true = แถวนี้เป็นแถวแรกที่เปิดกลุ่มนี้ขึ้นมา (เก็บ
 -- meter_id/original_filename/device_timestamp ที่จะก็อปเข้า ocr_jobs ตอน
 -- ปิดกลุ่ม), false = แถวอื่นๆ ที่มาสมทบทีหลังในกลุ่มเดียวกัน กลไก
 -- claim/sweep ที่กันการ race กันตอนสร้าง/ปิดกลุ่มล็อกที่แถว is_anchor=true
--- แทนที่จะล็อกที่ group_id=id แบบเดิม
 --
 -- received_at คือเวลาที่ server ได้รับภาพจริง (ใช้วัด timeout ของกลุ่ม)
 -- ต่างจาก device_timestamp ซึ่งเป็นเวลาที่ device อ้างว่าถ่าย
@@ -67,19 +64,21 @@ CREATE SEQUENCE IF NOT EXISTS gas_group_seq;
 
 -- dataset — NOT part of any original spec. Confirmed request, sketched
 -- by hand: a central table consolidating the file path of every image
--- across all 3 meter types (electric/water/gas), so "where is this
--- image on disk" can be answered from one table instead of knowing
--- which of the 3 images_* tables to check first. Each images_* row
--- gets its OWN dataset row (1:1, not shared) — see the dataset_id
--- column added to images_electric right below.
+-- across all meter types, so "where is this image on disk" can be
+-- answered from one table. Each images row gets its OWN dataset row
+-- (1:1, not shared) — see the dataset_id column added to images below.
 CREATE TABLE IF NOT EXISTS dataset (
     id   BIGSERIAL PRIMARY KEY,
     path TEXT      NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS images_electric (
+CREATE TABLE IF NOT EXISTS images (
     id                BIGINT      PRIMARY KEY DEFAULT nextval('images_id_seq'),
     meter_id          TEXT        NOT NULL,
+    -- utility_type — confirmed request: 'electric' | 'water' | 'gas',
+    -- extend the CHECK below (and app/db.py's mapping) to add a new
+    -- meter type — no schema change needed anywhere else.
+    utility_type      TEXT        NOT NULL,
     original_filename TEXT,
     device_timestamp  TIMESTAMPTZ,
     ocr_status        TEXT        NOT NULL DEFAULT 'pending',  -- pending | done | failed | dropped
@@ -90,121 +89,115 @@ CREATE TABLE IF NOT EXISTS images_electric (
     -- existing rows from before this column existed have no dataset
     -- row to point to and are left alone (never backfilled) — only
     -- new uploads going forward get one, via app/routers/images.py.
-    dataset_id        BIGINT      REFERENCES dataset(id)
+    dataset_id        BIGINT      REFERENCES dataset(id),
+    -- job_id — confirmed request: a direct FK back to ocr_jobs, instead
+    -- of only being joinable via group_id (which isn't unique — a group
+    -- has multiple images — and isn't a real FK target). Nullable and
+    -- deliberately has NO "REFERENCES ocr_jobs(id)" right here — ocr_jobs
+    -- isn't created until further down this file, so a forward reference
+    -- here would error immediately ("relation ocr_jobs does not exist").
+    -- The FK itself is added near the end of this file instead (same
+    -- pattern already used for device_config's FKs). Starts NULL on every
+    -- insert (images always arrive before ocr_jobs can exist for them —
+    -- see app/routers/images.py) and gets backfilled once the group's
+    -- ocr_jobs row is actually created, in
+    -- app/grouping.py::finalize_group(). A group that gets dropped
+    -- instead (see the "one normal group per meter per day" rule further
+    -- down) never gets an ocr_jobs row at all — its images' job_id stays
+    -- NULL forever, which is correct, not a bug.
+    job_id            BIGINT,
+    CONSTRAINT images_utility_type_check CHECK (utility_type IN ('electric', 'water', 'gas'))
 );
-CREATE TABLE IF NOT EXISTS images_water (LIKE images_electric INCLUDING ALL);
-CREATE TABLE IF NOT EXISTS images_gas   (LIKE images_electric INCLUDING ALL);
 
--- เผื่อ images_*/dataset มีอยู่แล้วจากรอบก่อนที่ยังไม่มีคอลัมน์/ตารางนี้
--- (fresh install ไม่ต้องทำอะไรเพิ่ม เพราะ CREATE TABLE ด้านบนมีครบอยู่แล้ว)
--- เพิ่ม column ก่อน (no-op บน images_water/images_gas เพราะ LIKE...
--- INCLUDING ALL ตอน CREATE TABLE ด้านบนก็อป column มาให้แล้ว — แต่ยัง
--- ต้องรันบรรทัดนี้เผื่อ DB เก่าที่ images_electric เองยังไม่มีคอลัมน์นี้)
-ALTER TABLE images_electric ADD COLUMN IF NOT EXISTS dataset_id BIGINT REFERENCES dataset(id);
-ALTER TABLE images_water    ADD COLUMN IF NOT EXISTS dataset_id BIGINT;
-ALTER TABLE images_gas      ADD COLUMN IF NOT EXISTS dataset_id BIGINT;
-
--- ⚠️ FK ต้องเพิ่มแยกต่างหากเสมอ ไม่พึ่ง ADD COLUMN ด้านบนอย่างเดียว —
--- ยืนยันจากเอกสาร Postgres จริงแล้วว่า LIKE...INCLUDING ALL (ที่ใช้สร้าง
--- images_water/images_gas จาก images_electric ด้านบน) ก็อป PRIMARY
--- KEY/UNIQUE/INDEX ให้ แต่**ไม่ก็อป FOREIGN KEY constraint ให้เลย** —
--- ถ้าพึ่งแค่ ADD COLUMN IF NOT EXISTS อย่างเดียว images_water/images_gas
--- จะได้ column dataset_id มา (จาก LIKE) แต่ไม่มี FK ผูกจริงเลย เพราะ
--- ADD COLUMN IF NOT EXISTS จะ skip ทั้งบรรทัดเงียบๆ เมื่อ column มีอยู่
--- แล้ว — ใช้ DROP+ADD CONSTRAINT แบบเดียวกับที่ทำกับ error_type/
--- ocr_engine ก่อนหน้าแทน (idempotent, รันซ้ำได้ปลอดภัยเสมอ)
-ALTER TABLE images_electric DROP CONSTRAINT IF EXISTS images_electric_dataset_id_fkey;
-ALTER TABLE images_electric ADD CONSTRAINT images_electric_dataset_id_fkey FOREIGN KEY (dataset_id) REFERENCES dataset(id);
-ALTER TABLE images_water DROP CONSTRAINT IF EXISTS images_water_dataset_id_fkey;
-ALTER TABLE images_water ADD CONSTRAINT images_water_dataset_id_fkey FOREIGN KEY (dataset_id) REFERENCES dataset(id);
-ALTER TABLE images_gas DROP CONSTRAINT IF EXISTS images_gas_dataset_id_fkey;
-ALTER TABLE images_gas ADD CONSTRAINT images_gas_dataset_id_fkey FOREIGN KEY (dataset_id) REFERENCES dataset(id);
-
-CREATE INDEX IF NOT EXISTS idx_images_electric_meter ON images_electric (meter_id, device_timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_images_water_meter    ON images_water    (meter_id, device_timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_images_gas_meter      ON images_gas      (meter_id, device_timestamp DESC);
-
--- อัปเกรดสำหรับ DB ที่ยังมี schema รอบก่อน (group_id เป็น BIGINT คู่กับ
--- group_label เป็น TEXT แยกกัน) ให้กลายเป็น schema ใหม่ (group_id เดียว
--- เป็น TEXT, มี is_anchor แยก) — no-op บน fresh install (ตารางเพิ่งถูก
--- สร้างครบตามด้านบนอยู่แล้ว ไม่มี group_id แบบ BIGINT ให้เจอ) ปลอดภัยรัน
--- ซ้ำได้ไม่จำกัดจำนวนรอบ ต้องมาก่อน index ที่อ้างถึง is_anchor ด้านล่าง
+-- ⚠️ Migration รวมตาราง — confirmed request. ย้ายข้อมูลจาก
+-- images_electric/water/gas (ตารางแยกจากเวอร์ชันก่อนหน้า) เข้า images
+-- ตัวใหม่ด้านบน แล้ว DROP ตารางเดิมทิ้ง — no-op บน fresh install (ไม่มี 3
+-- ตารางเดิมให้เจอเลย ตั้งแต่ต้น)
 DO $$
 DECLARE
     tbl TEXT;
 BEGIN
-    FOREACH tbl IN ARRAY ARRAY['images_electric', 'images_water', 'images_gas']
-    LOOP
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name = tbl AND column_name = 'group_id' AND data_type = 'bigint'
-        ) THEN
-            -- เติม is_anchor ชั่วคราว, backfill จากกลไกเดิม (group_id=id
-            -- คือหัวกลุ่ม) ก่อนจะลบ column BIGINT เก่าทิ้ง
-            EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS is_anchor BOOLEAN', tbl);
-            EXECUTE format('UPDATE %I SET is_anchor = (group_id = id) WHERE is_anchor IS NULL', tbl);
-            EXECUTE format('ALTER TABLE %I DROP COLUMN group_id', tbl);
-            -- group_label เดิม (ถ้ามีจากรอบก่อน) กลายเป็น group_id ใหม่ —
-            -- ถ้าไม่มีเลย (DB เก่ากว่านั้นอีก ไม่เคยผ่านรอบ group_label)
-            -- เติม column เปล่าไว้ก่อน ให้ backfill ด้านล่างเติมค่าให้
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'images_electric') THEN
+        -- Legacy migration เก่ากว่านี้อีก (BIGINT group_id -> TEXT,
+        -- is_test column removal) — ต้องรันให้ 3 ตารางเดิมอยู่ในสภาพ
+        -- ล่าสุดก่อน ถึงจะย้ายข้อมูลออกมาได้ถูกต้อง เก็บไว้ตรงนี้เพื่อ
+        -- ความปลอดภัย เผื่อ DB ไหนยังไม่เคยผ่าน migration เก่าเหล่านี้มา
+        -- ก่อนเลย (เนื้อหาเดียวกับที่เคยอยู่ตรงนี้มาตลอด ย้ายเข้ามาไว้ใน
+        -- IF block นี้แทน ให้รันเฉพาะตอนตารางเดิมยังอยู่จริงเท่านั้น)
+        FOREACH tbl IN ARRAY ARRAY['images_electric', 'images_water', 'images_gas']
+        LOOP
             IF EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_name = tbl AND column_name = 'group_label'
+                WHERE table_name = tbl AND column_name = 'group_id' AND data_type = 'bigint'
             ) THEN
-                EXECUTE format('ALTER TABLE %I RENAME COLUMN group_label TO group_id', tbl);
-            ELSE
-                EXECUTE format('ALTER TABLE %I ADD COLUMN group_id TEXT', tbl);
+                EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS is_anchor BOOLEAN', tbl);
+                EXECUTE format('UPDATE %I SET is_anchor = (group_id = id) WHERE is_anchor IS NULL', tbl);
+                EXECUTE format('ALTER TABLE %I DROP COLUMN group_id', tbl);
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = tbl AND column_name = 'group_label'
+                ) THEN
+                    EXECUTE format('ALTER TABLE %I RENAME COLUMN group_label TO group_id', tbl);
+                ELSE
+                    EXECUTE format('ALTER TABLE %I ADD COLUMN group_id TEXT', tbl);
+                END IF;
             END IF;
-        END IF;
-        EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS is_anchor BOOLEAN', tbl);
-        EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ', tbl);
-        EXECUTE format('UPDATE %I SET received_at = COALESCE(device_timestamp, now()) WHERE received_at IS NULL', tbl);
-        EXECUTE format('UPDATE %I SET is_anchor = false WHERE is_anchor IS NULL', tbl);
-        EXECUTE format('ALTER TABLE %I ALTER COLUMN is_anchor SET NOT NULL', tbl);
-        EXECUTE format('ALTER TABLE %I ALTER COLUMN is_anchor SET DEFAULT false', tbl);
-        EXECUTE format('ALTER TABLE %I ALTER COLUMN received_at SET NOT NULL', tbl);
-        EXECUTE format('ALTER TABLE %I ALTER COLUMN received_at SET DEFAULT now()', tbl);
-        -- meter_id เก็บเป็นตัวพิมพ์ใหญ่เสมอตั้งแต่นี้ไป — บรรทัดนี้แปลง
-        -- แถวเก่าที่อาจยังเป็นตัวพิมพ์เล็กอยู่ ให้ตรงกันหมดครั้งเดียว
-        EXECUTE format('UPDATE %I SET meter_id = UPPER(meter_id) WHERE meter_id != UPPER(meter_id)', tbl);
-        -- is_test เคยเป็นคอลัมน์แยกอยู่ช่วงสั้นๆ (server เทียบ
-        -- device_timestamp กับตาราง schedule ใน device_config ตอนเปิด
-        -- กลุ่มใหม่ แล้วเก็บผลไว้ตรงนี้) — ตัดออกตามที่ยืนยัน เปลี่ยนไปดู
-        -- จากชื่อไฟล์แทน (ชื่อไฟล์มี "_Test" ต่อท้ายอยู่แล้วถ้าไม่ตรง
-        -- ตาราง — ดู app/filename.py::is_test_filename() และ
-        -- app/routers/images.py::_stored_filename()) ไม่มีการเก็บ
-        -- boolean แยกอีกต่อไป ชื่อไฟล์เป็นแหล่งความจริงเดียวตั้งแต่นี้ไป
-        EXECUTE format('ALTER TABLE %I DROP COLUMN IF EXISTS is_test', tbl);
-    END LOOP;
+            EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS is_anchor BOOLEAN', tbl);
+            EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ', tbl);
+            EXECUTE format('UPDATE %I SET received_at = COALESCE(device_timestamp, now()) WHERE received_at IS NULL', tbl);
+            EXECUTE format('UPDATE %I SET is_anchor = false WHERE is_anchor IS NULL', tbl);
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN is_anchor SET NOT NULL', tbl);
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN is_anchor SET DEFAULT false', tbl);
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN received_at SET NOT NULL', tbl);
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN received_at SET DEFAULT now()', tbl);
+            EXECUTE format('UPDATE %I SET meter_id = UPPER(meter_id) WHERE meter_id != UPPER(meter_id)', tbl);
+            EXECUTE format('ALTER TABLE %I DROP COLUMN IF EXISTS is_test', tbl);
+            EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS dataset_id BIGINT', tbl);
+            EXECUTE format(
+                'UPDATE %I SET group_id = %L || nextval(%L), is_anchor = true WHERE group_id IS NULL OR group_id = %L',
+                tbl,
+                CASE tbl WHEN 'images_electric' THEN 'E' WHEN 'images_water' THEN 'W' ELSE 'G' END,
+                CASE tbl WHEN 'images_electric' THEN 'electric_group_seq' WHEN 'images_water' THEN 'water_group_seq' ELSE 'gas_group_seq' END,
+                ''
+            );
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN group_id SET NOT NULL', tbl);
+        END LOOP;
+
+        -- ย้ายข้อมูลจริงเข้า images ตัวใหม่ — ระบุ id ตรงๆ (ไม่ใช้
+        -- nextval ใหม่) เพื่อรักษาค่า id เดิมไว้ทั้งหมด — ปลอดภัยเพราะทั้ง
+        -- 3 ตารางเดิมแชร์ images_id_seq เดียวกันมาตั้งแต่ต้นอยู่แล้ว ไม่มี
+        -- ทาง id ชนกัน ON CONFLICT DO NOTHING กันไว้เผื่อ migration นี้
+        -- เคยรันไปแล้วบางส่วนมาก่อน (ตารางเดิมยังไม่ถูก DROP ด้วยเหตุผล
+        -- บางอย่าง) ให้รันซ้ำได้ปลอดภัย
+        INSERT INTO images (id, meter_id, utility_type, original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id)
+            SELECT id, meter_id, 'electric', original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id FROM images_electric
+            UNION ALL
+            SELECT id, meter_id, 'water', original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id FROM images_water
+            UNION ALL
+            SELECT id, meter_id, 'gas', original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id FROM images_gas
+        ON CONFLICT (id) DO NOTHING;
+
+        DROP TABLE images_electric;
+        DROP TABLE images_water;
+        DROP TABLE images_gas;
+    END IF;
 END $$;
 
--- เผื่อมีแถวที่ไม่มีค่า group_id เลยหลัง migrate ด้านบน (ไม่ควรเกิดขึ้น
--- ถ้ามี group_label เดิมอยู่แล้วก่อนหน้า แต่กันไว้เผื่อ edge case) — ให้
--- แต่ละแถวกลายเป็นกลุ่มของตัวเองไปเลย ปลอดภัยสุด ไม่เสี่ยงรวมกลุ่มผิด
-UPDATE images_electric SET group_id = 'E' || nextval('electric_group_seq'), is_anchor = true WHERE group_id IS NULL OR group_id = '';
-UPDATE images_water    SET group_id = 'W' || nextval('water_group_seq'),    is_anchor = true WHERE group_id IS NULL OR group_id = '';
-UPDATE images_gas      SET group_id = 'G' || nextval('gas_group_seq'),      is_anchor = true WHERE group_id IS NULL OR group_id = '';
-ALTER TABLE images_electric ALTER COLUMN group_id SET NOT NULL;
-ALTER TABLE images_water    ALTER COLUMN group_id SET NOT NULL;
-ALTER TABLE images_gas      ALTER COLUMN group_id SET NOT NULL;
+-- เผื่อ images มีอยู่แล้วจากรอบก่อนของ migration นี้เองที่ยังไม่มี job_id
+-- (fresh install ไม่ต้องทำอะไรเพิ่ม เพราะ CREATE TABLE ด้านบนมีครบอยู่แล้ว)
+ALTER TABLE images ADD COLUMN IF NOT EXISTS job_id BIGINT;
 
--- หา "กลุ่มที่ยังเปิดอยู่" ของมิเตอร์หนึ่งๆ ให้เร็ว (upload ใหม่เช็คว่ามี
--- กลุ่มเปิดอยู่ไหม, background sweep เช็คว่ากลุ่มไหนหมดเวลาแล้ว) — index
--- นี้ครอบคลุมเฉพาะแถวที่เป็น "หัวกลุ่ม" เท่านั้น (is_anchor = true) — ต้อง
--- DROP ก่อนเพราะเปลี่ยน WHERE clause จากเดิม (group_id = id) ไม่ใช่แค่
--- เปลี่ยนชื่อ คนละนิยาม ALTER แก้ partial index ในที่เดิมไม่ได้ ต้อง
--- drop+create ใหม่เท่านั้น — DROP IF EXISTS ปลอดภัยรันซ้ำได้เสมอ
-DROP INDEX IF EXISTS idx_images_electric_group_lookup;
-DROP INDEX IF EXISTS idx_images_water_group_lookup;
-DROP INDEX IF EXISTS idx_images_gas_group_lookup;
-CREATE INDEX IF NOT EXISTS idx_images_electric_group_lookup ON images_electric (meter_id, received_at) WHERE is_anchor = true;
-CREATE INDEX IF NOT EXISTS idx_images_water_group_lookup    ON images_water    (meter_id, received_at) WHERE is_anchor = true;
-CREATE INDEX IF NOT EXISTS idx_images_gas_group_lookup      ON images_gas      (meter_id, received_at) WHERE is_anchor = true;
+-- FK ไปหา dataset — DROP+ADD เสมอ (idempotent, ไม่พึ่ง ADD COLUMN อย่าง
+-- เดียวเพราะรอบก่อนอาจเคยเพิ่ม column โดยไม่มี FK ติดมา — pattern เดียว
+-- กับที่เคยใช้กับ error_type/ocr_engine)
+ALTER TABLE images DROP CONSTRAINT IF EXISTS images_dataset_id_fkey;
+ALTER TABLE images ADD CONSTRAINT images_dataset_id_fkey FOREIGN KEY (dataset_id) REFERENCES dataset(id);
 
--- ค้นภาพทั้งหมดในกลุ่มเดียวกันให้เร็ว (ตอน claim ต้องดึงทุกภาพในกลุ่ม)
-CREATE INDEX IF NOT EXISTS idx_images_electric_group_id ON images_electric (group_id);
-CREATE INDEX IF NOT EXISTS idx_images_water_group_id    ON images_water    (group_id);
-CREATE INDEX IF NOT EXISTS idx_images_gas_group_id      ON images_gas      (group_id);
+CREATE INDEX IF NOT EXISTS idx_images_meter ON images (meter_id, device_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_images_group_lookup ON images (meter_id, received_at) WHERE is_anchor = true;
+CREATE INDEX IF NOT EXISTS idx_images_group_id ON images (group_id);
+CREATE INDEX IF NOT EXISTS idx_images_utility_type ON images (utility_type);
+CREATE INDEX IF NOT EXISTS idx_images_job_id ON images (job_id);
 
 -- meter_id/original_filename/device_timestamp ก็อปมาจากแถว "หัวกลุ่ม"
 -- (denormalized) ให้เปิดตาราง ocr_jobs เฉยๆ แล้วรู้ครบระดับหนึ่ง ไม่ต้อง
@@ -659,17 +652,13 @@ ALTER TABLE device_config ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL D
 -- สำหรับมิเตอร์ที่มีประวัติในตารางเหล่านี้ — endpoint เปลี่ยนเป็น
 -- upsert กลับเป็นค่า default แทน ดู app/routers/device_config.py)
 -- ต้องอยู่ "หลัง" CREATE TABLE device_config ด้านบนเสมอ (ไม่ใช่แค่ตอน
--- CREATE TABLE images_electric/ocr_jobs/ocr_meter/ฯลฯ ตอนต้นไฟล์ เพราะ
+-- CREATE TABLE images/ocr_jobs/ocr_meter/ฯลฯ ตอนต้นไฟล์ เพราะ
 -- ตอนนั้น device_config ยังไม่ถูกสร้างเลย — จะ error "relation
 -- device_config does not exist" ทันที) ใช้ DROP+ADD CONSTRAINT แยกเป็น
 -- statement ของตัวเอง (pattern เดียวกับ error_type/ocr_engine/dataset
 -- ก่อนหน้า) เพื่อเลี่ยงปัญหา ordering นี้โดยสิ้นเชิง
-ALTER TABLE images_electric DROP CONSTRAINT IF EXISTS images_electric_meter_id_fkey;
-ALTER TABLE images_electric ADD CONSTRAINT images_electric_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
-ALTER TABLE images_water DROP CONSTRAINT IF EXISTS images_water_meter_id_fkey;
-ALTER TABLE images_water ADD CONSTRAINT images_water_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
-ALTER TABLE images_gas DROP CONSTRAINT IF EXISTS images_gas_meter_id_fkey;
-ALTER TABLE images_gas ADD CONSTRAINT images_gas_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
+ALTER TABLE images DROP CONSTRAINT IF EXISTS images_meter_id_fkey;
+ALTER TABLE images ADD CONSTRAINT images_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
 ALTER TABLE ocr_jobs DROP CONSTRAINT IF EXISTS ocr_jobs_meter_id_fkey;
 ALTER TABLE ocr_jobs ADD CONSTRAINT ocr_jobs_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
 ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_meter_id_fkey;
@@ -820,3 +809,10 @@ CREATE INDEX IF NOT EXISTS idx_esp32_upload_log_meter ON esp32_upload_log (meter
 -- จริงหรือเป็น no-op (fresh install ที่ลำดับคอลัมน์ถูกต้องตั้งแต่ต้น)
 ALTER TABLE esp32_upload_log DROP CONSTRAINT IF EXISTS esp32_upload_log_meter_id_fkey;
 ALTER TABLE esp32_upload_log ADD CONSTRAINT esp32_upload_log_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
+
+-- images.job_id FK ไปหา ocr_jobs — confirmed request. ต้องอยู่ท้ายไฟล์
+-- (หลัง CREATE TABLE ocr_jobs แน่นอน) เพราะคอลัมน์ job_id ใน CREATE TABLE
+-- images ต้นไฟล์ตั้งใจไม่ใส่ REFERENCES ไว้เลย (ocr_jobs ยังไม่ถูกสร้าง ณ
+-- จุดนั้น) — ดู comment ของคอลัมน์ job_id ในนิยาม CREATE TABLE images เอง
+ALTER TABLE images DROP CONSTRAINT IF EXISTS images_job_id_fkey;
+ALTER TABLE images ADD CONSTRAINT images_job_id_fkey FOREIGN KEY (job_id) REFERENCES ocr_jobs(id);

@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 
 from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_uploader
 from app.config import get_settings
-from app.db import GROUP_ID_INFO, pool, table_for_meter_id
+from app.db import GROUP_ID_INFO, pool, utility_type_for_meter_id
 from app.filename import BANGKOK_TZ, FilenameParseError, is_test_filename, parse_upload_filename
 from app.grouping import finalize_group, has_normal_group_today, mark_group_dropped
 from app.repo import get_image_row, image_out
@@ -79,12 +79,10 @@ def _normalize_carrier(raw: str | None) -> str | None:
 async def _insert_dataset_row(conn, stored_filename: str) -> int:
     """
     Confirmed request (hand-drawn diagram) — a new `dataset` table
-    consolidating the file path of every image across all 3 meter types,
-    so "where is this image on disk" can be answered from one table
-    without knowing which of images_electric/water/gas to check first.
-    Called once per image insert, in both branches of the upload handler
-    below — every images_* row gets its own dataset row (1:1, not
-    shared across a group).
+    consolidating the file path of every image, so "where is this image
+    on disk" can be answered from one table. Called once per image
+    insert, in both branches of the upload handler below — every images
+    row gets its own dataset row (1:1, not shared across a group).
 
     The `0` passed as image_id here is a deliberate throwaway —
     storage.original_path()/_stem_and_suffix() only ever fall back to
@@ -179,7 +177,7 @@ async def upload_image(
     """
     try:
         meter_id, device_timestamp = parse_upload_filename(file.filename)
-        table = table_for_meter_id(meter_id)
+        utility_type = utility_type_for_meter_id(meter_id)
     except (FilenameParseError, ValueError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -191,7 +189,7 @@ async def upload_image(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty file")
 
     settings = get_settings()
-    group_prefix, group_seq = GROUP_ID_INFO[table]
+    group_prefix, group_seq = GROUP_ID_INFO[utility_type]
 
     async with pool().acquire() as conn:
         async with conn.transaction():
@@ -220,19 +218,21 @@ async def upload_image(
             # anything not 'pending' (i.e. already 'done' or 'dropped')
             # closes that gap.
             open_anchor = await conn.fetchrow(
-                f"""
-                SELECT id, group_id, original_filename FROM {table}
+                """
+                SELECT id, group_id, original_filename FROM images
                 WHERE meter_id = $1
+                  AND utility_type = $3
                   AND is_anchor = true
                   AND ocr_status = 'pending'
                   AND received_at > now() - ($2 * interval '1 second')
-                  AND NOT EXISTS (SELECT 1 FROM ocr_jobs WHERE group_id = {table}.group_id)
+                  AND NOT EXISTS (SELECT 1 FROM ocr_jobs WHERE group_id = images.group_id)
                 ORDER BY id DESC
                 LIMIT 1
                 FOR UPDATE
                 """,
                 meter_id,
                 settings.image_group_window_seconds,
+                utility_type,
             )
 
             if open_anchor is not None:
@@ -248,12 +248,13 @@ async def upload_image(
                 stored_filename = _stored_filename(file.filename, anchor_is_test)
                 dataset_id = await _insert_dataset_row(conn, stored_filename)
                 image_row = await conn.fetchrow(
-                    f"""
-                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, dataset_id)
-                    VALUES ($1, $2, $3, 'pending', $4, false, $5)
+                    """
+                    INSERT INTO images (meter_id, utility_type, original_filename, device_timestamp, ocr_status, group_id, is_anchor, dataset_id)
+                    VALUES ($1, $2, $3, $4, 'pending', $5, false, $6)
                     RETURNING *
                     """,
                     meter_id,
+                    utility_type,
                     stored_filename,
                     device_timestamp,
                     open_anchor["group_id"],
@@ -286,12 +287,13 @@ async def upload_image(
                 stored_filename = _stored_filename(file.filename, is_test)
                 dataset_id = await _insert_dataset_row(conn, stored_filename)
                 image_row = await conn.fetchrow(
-                    f"""
-                    INSERT INTO {table} (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, dataset_id)
-                    VALUES ($1, $2, $3, 'pending', $4, true, $5)
+                    """
+                    INSERT INTO images (meter_id, utility_type, original_filename, device_timestamp, ocr_status, group_id, is_anchor, dataset_id)
+                    VALUES ($1, $2, $3, $4, 'pending', $5, true, $6)
                     RETURNING *
                     """,
                     meter_id,
+                    utility_type,
                     stored_filename,
                     device_timestamp,
                     new_group_id,
@@ -349,7 +351,7 @@ async def upload_image(
             if target_count is None:
                 target_count = settings.image_group_size
             group_count = await conn.fetchval(
-                f"SELECT COUNT(*) FROM {table} WHERE group_id = $1",
+                "SELECT COUNT(*) FROM images WHERE group_id = $1",
                 image_row["group_id"],
             )
             if group_count >= target_count:
@@ -361,7 +363,7 @@ async def upload_image(
                 # on the same group twice (mirrors the same race-safety
                 # the sweep already has).
                 anchor_row = await conn.fetchrow(
-                    f"SELECT * FROM {table} WHERE group_id = $1 AND is_anchor = true FOR UPDATE",
+                    "SELECT * FROM images WHERE group_id = $1 AND is_anchor = true FOR UPDATE",
                     image_row["group_id"],
                 )
                 already_has_job = await conn.fetchval(
@@ -375,7 +377,7 @@ async def upload_image(
                 # row to catch it via that check alone.
                 if anchor_row is not None and not already_has_job and anchor_row["ocr_status"] == "pending":
                     anchor_is_test = is_test_filename(anchor_row["original_filename"])
-                    if not anchor_is_test and await has_normal_group_today(conn, table, meter_id):
+                    if not anchor_is_test and await has_normal_group_today(conn, meter_id):
                         # Confirmed rule: at most one normal (non-test)
                         # group per meter per day may be QUEUED for OCR —
                         # this meter already has one today, so this
@@ -388,7 +390,7 @@ async def upload_image(
                         # by anyone, so there's nothing meaningful to
                         # hand back here. Test groups skip this check
                         # entirely — no daily limit for them.
-                        await mark_group_dropped(conn, table, image_row["group_id"])
+                        await mark_group_dropped(conn, image_row["group_id"])
                         logger.info(
                             "dropped duplicate normal group %s for meter %s — already has one today "
                             "(ocr_status='dropped' on images_*, no ocr_jobs row created)",
@@ -405,7 +407,7 @@ async def upload_image(
     await storage.save_upload(image_row["id"], image_row["original_filename"], data)
 
     return ImageUploadResponse(
-        image=image_out(table, image_row),
+        image=image_out(image_row),
         group_id=image_row["group_id"],
         ocr_job_id=ocr_job_id,
     )
@@ -420,33 +422,34 @@ async def admin_list_images(
     offset: int = Query(default=0, ge=0),
     _: CurrentUser = Depends(get_admin_or_service),
 ):
-    tables = [f"images_{meter_type}"] if meter_type else ["images_electric", "images_water", "images_gas"]
+    utility_types = [meter_type] if meter_type else ["electric", "water", "gas"]
     if meter_id:
         meter_id = meter_id.strip().upper()  # meter_id is always stored uppercase — see app/filename.py
 
-    results: list[ImageOut] = []
-    for table in tables:
-        clauses, params = [], []
-        if meter_id:
-            params.append(meter_id)
-            clauses.append(f"meter_id = ${len(params)}")
-        if ocr_status:
-            params.append(ocr_status)
-            clauses.append(f"ocr_status = ${len(params)}")
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = await pool().fetch(f"SELECT * FROM {table} {where} ORDER BY id DESC", *params)
-        results.extend(image_out(table, r) for r in rows)
-
-    results.sort(key=lambda i: i.id, reverse=True)
-    return results[offset : offset + limit]
+    clauses, params = [], []
+    params.append(utility_types)
+    clauses.append(f"utility_type = ANY(${len(params)})")
+    if meter_id:
+        params.append(meter_id)
+        clauses.append(f"meter_id = ${len(params)}")
+    if ocr_status:
+        params.append(ocr_status)
+        clauses.append(f"ocr_status = ${len(params)}")
+    where = f"WHERE {' AND '.join(clauses)}"
+    params.extend([limit, offset])
+    rows = await pool().fetch(
+        f"SELECT * FROM images {where} ORDER BY id DESC LIMIT ${len(params) - 1} OFFSET ${len(params)}",
+        *params,
+    )
+    return [image_out(r) for r in rows]
 
 
 @router.get("/admin/images/{item_id}", response_model=ImageOut, summary="Admin Get Image")
 async def admin_get_image(item_id: int, _: CurrentUser = Depends(get_admin_or_service)):
-    table, row = await get_image_row(item_id)
-    if table is None:
+    row = await get_image_row(item_id)
+    if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
-    return image_out(table, row)
+    return image_out(row)
 
 
 @router.delete("/admin/images/{item_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Admin Delete Image")
@@ -461,15 +464,21 @@ async def admin_delete_image(item_id: int, _: CurrentUser = Depends(get_current_
     re-anchored. Harmless (group_id is a plain value, not an enforced
     FK) but worth knowing before deleting an anchor.
     """
-    table, row = await get_image_row(item_id)
-    if table is None:
+    row = await get_image_row(item_id)
+    if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
 
     async with pool().acquire() as conn:
         async with conn.transaction():
             if row["is_anchor"]:
+                # job_id must be cleared BEFORE the ocr_jobs row is
+                # deleted, not after — images.job_id has a real FK to
+                # ocr_jobs(id) now (confirmed request), so deleting the
+                # ocr_jobs row first would violate that FK for every
+                # OTHER image in the same group still pointing at it.
+                await conn.execute("UPDATE images SET job_id = NULL WHERE group_id = $1", row["group_id"])
                 await conn.execute("DELETE FROM ocr_jobs WHERE group_id = $1", row["group_id"])
-            await conn.execute(f"DELETE FROM {table} WHERE id = $1", item_id)
+            await conn.execute("DELETE FROM images WHERE id = $1", item_id)
 
     storage.delete_files(item_id, row["original_filename"])
 
@@ -488,12 +497,12 @@ async def admin_reprocess_image(item_id: int, _: CurrentUser = Depends(get_curre
     so OCR history for the group is preserved. Every image in the group
     (including item_id itself) gets ocr_status reset to 'pending'.
     """
-    table, row = await get_image_row(item_id)
-    if table is None:
+    row = await get_image_row(item_id)
+    if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
 
     group_id = row["group_id"]
-    anchor = await pool().fetchrow(f"SELECT * FROM {table} WHERE group_id = $1 AND is_anchor = true", group_id)
+    anchor = await pool().fetchrow("SELECT * FROM images WHERE group_id = $1 AND is_anchor = true", group_id)
     if anchor is None:
         # Anchor was deleted separately (see admin_delete_image's note) —
         # fall back to this image's own data so reprocess still works.
@@ -502,15 +511,15 @@ async def admin_reprocess_image(item_id: int, _: CurrentUser = Depends(get_curre
     async with pool().acquire() as conn:
         async with conn.transaction():
             await finalize_group(conn, anchor)
-            await conn.execute(f"UPDATE {table} SET ocr_status = 'pending' WHERE group_id = $1", group_id)
-            updated = await conn.fetchrow(f"SELECT * FROM {table} WHERE id = $1", item_id)
-    return image_out(table, updated)
+            await conn.execute("UPDATE images SET ocr_status = 'pending' WHERE group_id = $1", group_id)
+            updated = await conn.fetchrow("SELECT * FROM images WHERE id = $1", item_id)
+    return image_out(updated)
 
 
 @router.get("/admin/images/{item_id}/file", summary="Admin Get Image File")
 async def admin_get_image_file(item_id: int, _: CurrentUser = Depends(get_admin_or_service)):
-    table, row = await get_image_row(item_id)
-    if table is None:
+    row = await get_image_row(item_id)
+    if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
     path = storage.original_path(item_id, row["original_filename"])
     if not path.exists():
@@ -570,8 +579,8 @@ async def admin_edit_ocr_manually(
     value once an admin overwrites it here, and no column that records
     why (admin_reason was removed).
     """
-    table, image_row = await get_image_row(item_id)
-    if table is None:
+    image_row = await get_image_row(item_id)
+    if image_row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
 
     group_id = image_row["group_id"]
@@ -597,6 +606,6 @@ async def admin_edit_ocr_manually(
                 body.ocr_reading,
                 latest_job["id"],
             )
-            await conn.execute(f"UPDATE {table} SET ocr_status = 'done' WHERE group_id = $1", group_id)
+            await conn.execute("UPDATE images SET ocr_status = 'done' WHERE group_id = $1", group_id)
 
     return dict(updated_job)

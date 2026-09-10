@@ -4,10 +4,10 @@ import logging
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, status
 
 from app.auth import CurrentUser, get_admin_or_service, get_ocr_client
-from app.db import pool, table_for_group_id
+from app.db import pool
 from app.filename import BANGKOK_TZ, is_test_filename
 from app.repo import get_group_images
-from app.schemas import JobStatus, OcrClaimResponse, OcrFailRequest, OcrJobOut, OcrMeterEntry
+from app.schemas import JobStatus, OcrClaimResponse, OcrFailRequest, OcrJobOut, OcrMeterEntry, OcrMeterEntryWithEngine
 from app import storage
 
 logger = logging.getLogger("ocr_meter_store.ocr_jobs")
@@ -21,6 +21,10 @@ def _job_out(row) -> OcrJobOut:
 
 def _meter_out(row) -> OcrMeterEntry:
     return OcrMeterEntry(**dict(row))
+
+
+def _meter_out_with_engine(row) -> OcrMeterEntryWithEngine:
+    return OcrMeterEntryWithEngine(**dict(row))
 
 
 def _capture_date_time_from_device_timestamp(device_timestamp: dt.datetime | None) -> tuple[dt.date, dt.time]:
@@ -103,8 +107,7 @@ async def admin_claim_ocr_job(job_id: int, _: CurrentUser = Depends(get_ocr_clie
                 job_id,
             )
 
-    table = table_for_group_id(updated["group_id"])
-    group_images = await get_group_images(table, updated["group_id"])
+    group_images = await get_group_images(updated["group_id"])
     urls = [f"/admin/images/{img['id']}/file" for img in group_images]
 
     return OcrClaimResponse(job=_job_out(updated), image_file_urls=urls)
@@ -118,7 +121,7 @@ async def _submit_ocr_result(
     *,
     expected_test: bool,
     wrong_endpoint_hint: str,
-) -> OcrMeterEntry:
+) -> OcrMeterEntry | OcrMeterEntryWithEngine:
     """
     Shared logic behind POST .../result and POST .../result-test —
     confirmed request: explicit separate endpoints instead of one
@@ -230,13 +233,12 @@ async def _submit_ocr_result(
                 ocr_reading,
                 job_id,
             )
-            table = table_for_group_id(job["group_id"])
             # job["group_id"] is shared by every image in the burst group
             # — mark all of them 'done', not just the anchor, since OCR
             # considered (and picked from) all of them.
-            await conn.execute(f"UPDATE {table} SET ocr_status = 'done' WHERE group_id = $1", job["group_id"])
+            await conn.execute("UPDATE images SET ocr_status = 'done' WHERE group_id = $1", job["group_id"])
 
-    return _meter_out(meter_row)
+    return _meter_out_with_engine(meter_row) if expected_test else _meter_out(meter_row)
 
 
 @router.post("/{job_id}/result", response_model=OcrMeterEntry, summary="Admin Submit Ocr Result")
@@ -259,15 +261,6 @@ async def admin_submit_ocr_result(
             "doesn't reliably coerce the string \"0\"/\"1\"/etc. that multipart/form-data always sends "
             "into the matching int, and rejects it outright with a confusing 422 instead — confirmed "
             "against a real request while testing, not just theoretical."
-        ),
-    ),
-    ocr_engine: int | None = Form(
-        default=None,
-        description=(
-            "Optional, defaults to 1 (LOCAL) when omitted. 1 = read by the Worker's own local "
-            "model (YOLO+CNN, no cost), 2 = fell back to Gemini (cloud). Purely for stats on how "
-            "often the cloud fallback gets used — never affects error_type/ocr_reading or any other "
-            "behavior. See db/init.sql's ocr_engine lookup table (same pattern as error_type)."
         ),
     ),
     _: CurrentUser = Depends(get_ocr_client),
@@ -293,9 +286,15 @@ async def admin_submit_ocr_result(
     client is still the one that checks history and decides, server just
     stores whichever code it reports.
 
-    ocr_engine (confirmed, Worker team spec) is the newest field here —
-    optional, see its Form() description above for the full reasoning
-    on why (unlike error_type) it's lenient rather than required.
+    **No `ocr_engine` field here, confirmed (round 2) — unlike
+    .../result-test right below, which still has it.** This endpoint's
+    caller doesn't have that information to report, so `ocr_meter.ocr_engine`
+    for every row written through here is always the DB column's own
+    default (1/LOCAL) — `_submit_ocr_result()` is called with
+    `ocr_engine=None`, and that function's existing "default to 1 when
+    omitted" behavior (there for `.../result-test` callers who leave it
+    out) applies exactly the same way here, just unconditionally instead
+    of conditionally.
 
     capture_date/capture_time are no longer client-supplied — they're
     derived from the job's own device_timestamp (when ESP32 captured the
@@ -318,13 +317,13 @@ async def admin_submit_ocr_result(
         job_id,
         ocr_reading,
         error_type,
-        ocr_engine,
+        None,
         expected_test=False,
         wrong_endpoint_hint="POST .../result-test",
     )
 
 
-@router.post("/{job_id}/result-test", response_model=OcrMeterEntry, summary="Admin Submit Ocr Test Result")
+@router.post("/{job_id}/result-test", response_model=OcrMeterEntryWithEngine, summary="Admin Submit Ocr Test Result")
 async def admin_submit_ocr_result_test(
     job_id: int,
     ocr_reading: float | None = Form(
@@ -346,12 +345,15 @@ async def admin_submit_ocr_result_test(
     _: CurrentUser = Depends(get_ocr_client),
 ):
     """
-    Mirror of POST .../result directly above — identical request shape,
-    identical validation, identical response shape (OcrMeterEntry) —
-    the only differences: writes to ocr_meter_test instead of
-    ocr_meter, and **only accepts jobs whose filename carries the
-    "_Test" suffix** (is_test_filename()). Calling this for a normal job
-    rejects with 409 and points you at POST .../result instead.
+    Mirror of POST .../result directly above — identical request shape
+    (still HAS `ocr_engine`, confirmed — that field was only removed
+    from .../result, not here), identical validation, response shape
+    is `OcrMeterEntryWithEngine` (one extra field, `ocr_engine`, vs.
+    plain `OcrMeterEntry` — confirmed request) — the only other
+    differences: writes to ocr_meter_test instead of ocr_meter, and
+    **only accepts jobs whose filename carries the "_Test" suffix**
+    (is_test_filename()). Calling this for a normal job rejects with
+    409 and points you at POST .../result instead.
 
     Confirmed request: an explicitly separate endpoint for test results,
     mirroring GET /admin/meters/ocr-meter-test on the read side, rather
@@ -416,11 +418,10 @@ async def admin_report_ocr_failure(
                 "UPDATE ocr_jobs SET status = 'failed' WHERE id = $1 RETURNING *",
                 job_id,
             )
-            table = table_for_group_id(updated["group_id"])
             # Same group-wide update as /result — see that endpoint's
             # comment. A technical failure applies to the whole attempt
             # (all images in the group), not just the anchor.
             await conn.execute(
-                f"UPDATE {table} SET ocr_status = 'failed' WHERE group_id = $1", updated["group_id"]
+                "UPDATE images SET ocr_status = 'failed' WHERE group_id = $1", updated["group_id"]
             )
     return _job_out(updated)

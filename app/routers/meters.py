@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.auth import CurrentUser, get_admin_or_service
 from app.config import get_settings
-from app.db import pool, table_for_meter_id
+from app.db import pool, utility_type_for_meter_id
 from app.schemas import Esp32UploadLogEntry, MeterHistoryEntry, OcrMeterEntry, OcrMeterTestEntry
 
 router = APIRouter(prefix="/admin/meters", tags=["default"])
@@ -35,32 +35,35 @@ async def _list_ocr_meter_test_rows(meter_id: str | None, limit: int, offset: in
     """
     Backs GET /admin/meters/ocr-meter-test — confirmed request: no schema
     change on ocr_meter_test for this (an earlier version added a stored
-    anchor_image_path column there — reverted). Instead, every image_*
-    table's is_anchor=true rows are UNIONed together and LEFT JOINed onto
-    ocr_meter_test at query time, matched on meter_id +
-    device_timestamp — reconstructed from capture_date/capture_time (the
-    exact fields device_timestamp was itself converted into, at
-    /result-test write time — see
+    anchor_image_path column there — reverted). Instead, images'
+    is_anchor=true rows are LEFT JOINed onto ocr_meter_test at query
+    time, matched on meter_id + device_timestamp — reconstructed from
+    capture_date/capture_time (the exact fields device_timestamp was
+    itself converted into, at /result-test write time — see
     app/routers/ocr_jobs.py::_capture_date_time_from_device_timestamp())
     via Postgres's own `(date + time) AT TIME ZONE 'Asia/Bangkok'`, which
     reinterprets a naive timestamp as Bangkok-local and converts it back
     to the UTC-based timestamptz device_timestamp actually is. A LEFT
     (not INNER) JOIN so a row without a matching image still comes back
     with anchor_image_path=null (and group_id=null) rather than
-    disappearing from the list entirely.
+    disappearing from the list entirely. (Confirmed request:
+    images_electric/water/gas were merged into one images table with a
+    utility_type column — this JOIN used to be a 3-way UNION ALL across
+    those tables; now it's a single join, no utility_type filter needed
+    here since meter_id alone already pins it to the right rows.)
 
     group_id (E1/W3/G12-style, confirmed request — added for the
     dashboard's per-meter test-results section, so an admin can tell
     which burst each card came from) rides along on the exact same JOIN
     — no second query needed, it's just another column on the same
-    images_* row anchor_image_path already comes from.
+    images row anchor_image_path already comes from.
 
     net_mode/carrier/wakeup_reason — confirmed request: shown inline on
     each test-result card instead of a separate log table/section.
     Second LEFT JOIN, this time against esp32_upload_log, matched on
     meter_id + log_date/log_time = capture_date/capture_time directly
-    (no timezone conversion needed here, unlike the images_* join above
-    — both sides are already plain DATE/TIME columns derived from the
+    (no timezone conversion needed here, unlike the images join above —
+    both sides are already plain DATE/TIME columns derived from the
     same device_timestamp via the exact same Bangkok-local conversion,
     see app/routers/images.py's upload handler, so they compare equal
     directly). Also LEFT, not INNER — a test result from before this
@@ -78,13 +81,8 @@ async def _list_ocr_meter_test_rows(meter_id: str | None, limit: int, offset: in
         SELECT o.*, i.original_filename AS anchor_filename, i.group_id AS anchor_group_id,
                log.net_mode, log.carrier, log.wakeup_reason
         FROM ocr_meter_test o
-        LEFT JOIN (
-            SELECT meter_id, device_timestamp, original_filename, group_id FROM images_electric WHERE is_anchor = true
-            UNION ALL
-            SELECT meter_id, device_timestamp, original_filename, group_id FROM images_water WHERE is_anchor = true
-            UNION ALL
-            SELECT meter_id, device_timestamp, original_filename, group_id FROM images_gas WHERE is_anchor = true
-        ) i ON i.meter_id = o.meter_id
+        LEFT JOIN images i ON i.meter_id = o.meter_id
+           AND i.is_anchor = true
            AND i.device_timestamp = (o.capture_date + o.capture_time) AT TIME ZONE 'Asia/Bangkok'
         LEFT JOIN esp32_upload_log log ON log.meter_id = o.meter_id
            AND log.log_date = o.capture_date
@@ -115,12 +113,17 @@ async def admin_get_meter_history(
 ):
     meter_id = meter_id.strip().upper()  # meter_id is always stored uppercase — see app/filename.py
     try:
-        table = table_for_meter_id(meter_id)
+        # Validates meter_id's e/w/g prefix — the return value itself
+        # isn't needed for the query below anymore (images is a single
+        # table now, no per-type routing), but a meter_id that doesn't
+        # start with e/w/g should still 422 here rather than silently
+        # returning an empty list.
+        utility_type_for_meter_id(meter_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
     rows = await pool().fetch(
-        f"""
+        """
         SELECT
             img.id AS image_id,
             img.device_timestamp,
@@ -128,7 +131,7 @@ async def admin_get_meter_history(
             img.group_id,
             latest.ocr_reading AS latest_ocr_reading,
             latest.status AS latest_job_status
-        FROM {table} img
+        FROM images img
         LEFT JOIN LATERAL (
             SELECT ocr_reading, status
             FROM ocr_jobs

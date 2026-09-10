@@ -1,41 +1,26 @@
 """
-images_electric / images_water / images_gas share a single id sequence
-(images_id_seq), so a given image id lives in exactly one of the three
-tables. These helpers look it up without the caller needing to know which
-table that is.
+Confirmed request: images_electric/water/gas were merged into one
+"images" table (utility_type column distinguishes electric/water/gas
+now, instead of which table a row lives in) — these helpers used to need
+to search across all three tables for a given image id; now it's a
+direct lookup, no searching needed at all.
 """
 from __future__ import annotations
 
 import asyncpg
 
-from app.db import METER_TABLES, meter_type_for_table, pool
+from app.db import pool
 from app.schemas import ImageOut
 
-ALL_IMAGE_TABLES = list(METER_TABLES.values())
+
+async def get_image_row(image_id: int) -> asyncpg.Record | None:
+    return await pool().fetchrow("SELECT * FROM images WHERE id = $1", image_id)
 
 
-async def find_image_table(image_id: int) -> str | None:
-    """Return the table name ('images_electric' | 'images_water' | 'images_gas')
-    that contains this image id, or None if it doesn't exist anywhere."""
-    for table in ALL_IMAGE_TABLES:
-        exists = await pool().fetchval(f"SELECT 1 FROM {table} WHERE id = $1", image_id)
-        if exists:
-            return table
-    return None
-
-
-async def get_image_row(image_id: int) -> tuple[str, asyncpg.Record] | tuple[None, None]:
-    table = await find_image_table(image_id)
-    if table is None:
-        return None, None
-    row = await pool().fetchrow(f"SELECT * FROM {table} WHERE id = $1", image_id)
-    return table, row
-
-
-def image_out(table: str, row: asyncpg.Record) -> ImageOut:
+def image_out(row: asyncpg.Record) -> ImageOut:
     return ImageOut(
         id=row["id"],
-        meter_type=meter_type_for_table(table),
+        meter_type=row["utility_type"],
         meter_id=row["meter_id"],
         original_filename=row["original_filename"],
         device_timestamp=row["device_timestamp"],
@@ -45,11 +30,11 @@ def image_out(table: str, row: asyncpg.Record) -> ImageOut:
     )
 
 
-async def get_group_images(table: str, group_id: str) -> list[asyncpg.Record]:
+async def get_group_images(group_id: str) -> list[asyncpg.Record]:
     """All images sharing this group_id (the burst group, e.g. "E1"),
     including the anchor image itself (is_anchor = true) — see
     db/init.sql."""
     return await pool().fetch(
-        f"SELECT * FROM {table} WHERE group_id = $1 ORDER BY id ASC",
+        "SELECT * FROM images WHERE group_id = $1 ORDER BY id ASC",
         group_id,
     )
