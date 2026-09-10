@@ -183,14 +183,35 @@ class OcrMeterEntry(BaseModel):
     ocr_reading: float | None
     error_type: OcrErrorType
     image_error: str | None
+    """
+    Confirmed request (round 2) — back to exactly the 6 originally-
+    confirmed fields, no ocr_engine. Used by GET /admin/meters/ocr-meter
+    and POST .../result's own response — both are the "clean" ocr_meter
+    surface now: POST .../result doesn't accept ocr_engine as input
+    anymore either (see app/routers/ocr_jobs.py), so not echoing it back
+    out here keeps input and output consistent. See
+    OcrMeterEntryWithEngine right below for the one place that still
+    needs it (.../result-test).
+    """
+
+
+# --------------------------------------------------------------------------
+# OcrMeterEntryWithEngine — confirmed request (round 2): ocr_engine
+# stays OUT of the plain OcrMeterEntry above (GET .../ocr-meter and
+# POST .../result), but POST .../result-test still both accepts it as
+# input and echoes it back — its caller (the Worker's test pipeline)
+# still reports which engine ran, unlike .../result's caller. This
+# class exists solely so that one endpoint's response can carry the
+# extra field without reintroducing it to the "clean" ocr_meter shape
+# everything else uses.
+# --------------------------------------------------------------------------
+class OcrMeterEntryWithEngine(OcrMeterEntry):
     ocr_engine: OcrEngineType | None
     """
     Confirmed, Worker team spec — 1=LOCAL, 2=GEMINI. Optional at the API
-    level (POST .../result and .../result-test both default it to 1
-    when the Worker omits it — see app/routers/ocr_jobs.py) even though
-    the DB column also carries its own DEFAULT 1 as a second safety
-    net. Same 6-field-plus-this shape on both ocr_meter and
-    ocr_meter_test — this model is shared by both tables' rows.
+    level (.../result-test defaults it to 1 when the Worker omits it —
+    see app/routers/ocr_jobs.py) even though the DB column also carries
+    its own DEFAULT 1 as a second safety net.
     """
 
 
@@ -206,10 +227,14 @@ class OcrMeterEntry(BaseModel):
 # anchor image was deleted, or in some future edge case) — the row still
 # comes back rather than silently disappearing from the list, just
 # without a picture. Used only by GET /admin/meters/ocr-meter-test;
-# POST .../result-test itself still returns a plain OcrMeterEntry, same
-# as POST .../result — this field only exists for that one listing view.
+# POST .../result-test itself returns OcrMeterEntryWithEngine directly
+# (no anchor_image_path/group_id/net_mode/etc — those three are a
+# listing-view-only concern, see that class) — this class extends
+# OcrMeterEntryWithEngine, not the plain OcrMeterEntry, specifically so
+# ocr_engine keeps showing up in ocr_meter_test's listing (unaffected by
+# the round-2 change that removed it from plain OcrMeterEntry).
 # --------------------------------------------------------------------------
-class OcrMeterTestEntry(OcrMeterEntry):
+class OcrMeterTestEntry(OcrMeterEntryWithEngine):
     anchor_image_path: str | None
     group_id: str | None
     """
