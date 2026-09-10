@@ -157,22 +157,23 @@ class OcrManualEditRequest(BaseModel):
 
 # --------------------------------------------------------------------------
 # ocr_meter — clean, standalone OCR results table (no FK back to
-# images_*/ocr_jobs on purpose). One row per *finished* OCR attempt.
+# images/ocr_jobs on purpose). One row per *finished* OCR attempt.
 # Written by POST /admin/images/ocr/{job_id}/result. Deliberately just
 # these 6 fields (confirmed) — no group_id here (that's an
-# images_*/ocr_jobs-internal concern only, never copied into this
+# images/ocr_jobs-internal concern only, never copied into this
 # output table, even though an earlier revision briefly did). error_type
 # is always present (0/1/2/3 — see db/init.sql's error_type lookup table
 # for what each code means). capture_date/capture_time are the ESP32's
 # capture time (job.device_timestamp), not when OCR ran — column used to
-# be called reading_date/reading_time. image_error is only ever set when
-# error_type != 0 — the FULL disk path to the group's anchor image (e.g.
+# be called reading_date/reading_time. image (confirmed request, renamed
+# from image_error — see that field's own docstring below for the full
+# story) is now the FULL disk path to the group's anchor image on EVERY
+# row, success or error alike (e.g.
 # "/data/images/E101_20260829_100000_01.jpg"), computed by
 # storage.original_path() — same file already stored at upload time, no
 # separate file, no re-upload (the OCR client no longer attaches
-# anything here at all), for a human to review; never set on a clean
-# successful read (error_type=0). (Column used to be called
-# ocr_image_filename, and before that stored just the bare filename
+# anything here at all). (Column used to be called ocr_image_filename,
+# then image_error, and before that stored just the bare filename
 # rather than the full path.)
 # --------------------------------------------------------------------------
 class OcrMeterEntry(BaseModel):
@@ -182,16 +183,26 @@ class OcrMeterEntry(BaseModel):
     capture_time: dt.time
     ocr_reading: float | None
     error_type: OcrErrorType
-    image_error: str | None
+    image: str | None
     """
-    Confirmed request (round 2) — back to exactly the 6 originally-
-    confirmed fields, no ocr_engine. Used by GET /admin/meters/ocr-meter
-    and POST .../result's own response — both are the "clean" ocr_meter
-    surface now: POST .../result doesn't accept ocr_engine as input
-    anymore either (see app/routers/ocr_jobs.py), so not echoing it back
-    out here keeps input and output consistent. See
-    OcrMeterEntryWithEngine right below for the one place that still
-    needs it (.../result-test).
+    Confirmed request — renamed from `image_error`, and now populated on
+    EVERY row (success or error alike), not only when `error_type != 0`.
+    Always the FULL disk path to the group's anchor image (e.g.
+    "/data/images/E101_20260829_100000_01.jpg"), computed by
+    storage.original_path() — same file already stored at upload time,
+    no separate file, no re-upload. The old name/behavior (only set on
+    error, meant for a human to review what went wrong) is gone — this
+    is now just "the image for this reading," full stop, useful for a
+    successful read too.
+
+    Also — separately, confirmed request (round 2) — this class is back
+    to exactly the 6 originally-confirmed fields, no ocr_engine. Used by
+    GET /admin/meters/ocr-meter and POST .../result's own response —
+    both are the "clean" ocr_meter surface now: POST .../result doesn't
+    accept ocr_engine as input anymore either (see
+    app/routers/ocr_jobs.py), so not echoing it back out here keeps
+    input and output consistent. See OcrMeterEntryWithEngine right below
+    for the one place that still needs it (.../result-test).
     """
 
 

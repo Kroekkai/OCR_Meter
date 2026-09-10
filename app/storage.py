@@ -10,7 +10,7 @@ separate either way, only the on-disk image would be lost.
 
 No separate "OCR result" file exists anymore — POST .../result no longer
 accepts an uploaded image at all (see app/routers/ocr_jobs.py's
-docstring for why); ocr_meter.image_error just references one of these
+docstring for why); ocr_meter.image just references one of these
 same original files by filename, nothing gets written twice.
 """
 import os

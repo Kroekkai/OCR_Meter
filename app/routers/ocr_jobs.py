@@ -200,22 +200,26 @@ async def _submit_ocr_result(
 
             # No file write at all — just reference the anchor's filename,
             # already sitting on disk since the original ESP32 upload.
-            # image_error stores the FULL disk path (e.g.
+            # image stores the FULL disk path (e.g.
             # "/data/images/E101_20260829_100000_01.jpg"), not just the
             # bare filename — storage.original_path() is the single place
             # that computes this path (same helper used to actually save/
             # serve the file), so this is guaranteed to match reality.
-            image_error = (
-                str(storage.original_path(job["group_id"], job["original_filename"]))
-                if error_type != 0
-                else None
-            )
+            #
+            # Confirmed request: image is now ALWAYS populated, on every
+            # row — a successful read gets the image too, not just an
+            # error/anomaly one. Column renamed from image_error to image
+            # at the same time, since "always has the image" no longer
+            # matches a name implying "only present when something went
+            # wrong". The error_type != 0 condition that used to gate
+            # this is gone entirely.
+            image = str(storage.original_path(job["group_id"], job["original_filename"]))
 
             target_table = "ocr_meter_test" if expected_test else "ocr_meter"
             meter_row = await conn.fetchrow(
                 f"""
                 INSERT INTO {target_table}
-                    (meter_id, capture_date, capture_time, ocr_reading, error_type, image_error, ocr_engine)
+                    (meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING *
                 """,
@@ -224,7 +228,7 @@ async def _submit_ocr_result(
                 capture_time,
                 ocr_reading,
                 error_type,
-                image_error,
+                image,
                 ocr_engine,
             )
 
