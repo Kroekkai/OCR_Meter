@@ -44,16 +44,31 @@ def pool() -> asyncpg.Pool:
 #   E -> electric, W -> water, G -> gas
 #
 # Confirmed request: images_electric/water/gas were merged into one
-# "images" table with a utility_type column — extending to a new meter
-# type (e.g. a future "steam") now means adding one entry here (plus
-# the matching entry in GROUP_ID_INFO below and db/init.sql's CHECK
-# constraint) instead of a new table + sequence + FK + index set +
-# updating every place that used to loop over METER_TABLES.values().
+# "images" table — extending to a new meter type (e.g. a future "steam")
+# now means adding one entry here (plus the matching entry in
+# GROUP_ID_INFO below) instead of a new table + sequence + FK + index
+# set + updating every place that used to loop over METER_TABLES.values().
+#
+# Confirmed request (round 2): images itself carries NO utility_type
+# column at all — it's derived from meter_id via this dict every time
+# it's needed (app/repo.py::image_out(), the group_id prefix lookup
+# below), rather than stored redundantly. meter_id's first letter
+# determines it permanently and unambiguously, so there's no scenario
+# where a stored copy could ever legitimately disagree with this.
 UTILITY_TYPES = {
     "e": "electric",
     "w": "water",
     "g": "gas",
 }
+
+# Reverse of UTILITY_TYPES — confirmed request (round 2): needed by
+# GET /admin/images' meter_type filter, which used to just match the
+# stored utility_type column directly (WHERE utility_type = ANY(...)) —
+# now that the column is gone, that filter instead matches meter_id's
+# own first letter, and needs this to go from the query param's
+# "electric"/"water"/"gas" back to the "E"/"W"/"G" prefix to match
+# against.
+PREFIX_FOR_UTILITY_TYPE = {v: k.upper() for k, v in UTILITY_TYPES.items()}
 
 
 def utility_type_for_meter_id(meter_id: str) -> str:

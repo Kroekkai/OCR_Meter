@@ -7,9 +7,10 @@
 -- image-store เก็บ 4 อย่าง:
 --   1. users — ศูนย์กลาง auth เดียว ที่ meter-dashboard (และทุก service
 --      อื่น) เชื่อถือ
---   2. images (ตารางเดียวรวมทุกประเภทมิเตอร์ — แยกด้วย utility_type
---      column, confirmed request) + ocr_jobs — ข้อมูล hardware capture +
---      internal job queue ของ OCR ล้วนๆ
+--   2. images (ตารางเดียวรวมทุกประเภทมิเตอร์ — แยกด้วยตัวอักษรแรกของ
+--      meter_id เอง ไม่มี column แยกประเภทเก็บซ้ำ, confirmed request) +
+--      ocr_jobs — ข้อมูล hardware capture + internal job queue ของ OCR
+--      ล้วนๆ
 --   3. ocr_meter — ผลลัพธ์ OCR ที่จบแล้ว (สำเร็จ/error) ตารางกลางสำหรับ
 --      ส่งต่อให้ระบบภายนอกใช้ ไม่อ้างอิงกลับไปที่ 2 ข้อบนเลย
 --   4. error_type — ตาราง lookup อธิบายความหมายของรหัส error_type แต่ละ
@@ -32,11 +33,14 @@ CREATE TABLE IF NOT EXISTS users (
 -- ไฟล์ — ดู app/filename.py)
 --
 -- ⚠️ confirmed request: รวม images_electric/water/gas เป็นตารางเดียว
--- (images) ใช้คอลัมน์ utility_type แยกประเภทแทนชื่อตาราง — แก้ปัญหาเดิม
--- ที่ "เพิ่มมิเตอร์ชนิดใหม่ (เช่น steam) ต้องเพิ่มตารางใหม่ + แก้โค้ดหลาย
--- จุดพร้อมกัน (sequence, mapping, sweep loop, UNION ALL query, FK, index
--- ฯลฯ)" — ตอนนี้เพิ่มมิเตอร์ชนิดใหม่แค่เพิ่มค่า utility_type ใหม่เข้า
--- CHECK constraint พอ ไม่ต้องแตะ schema/โค้ดจุดอื่นเลย
+-- (images) แก้ปัญหาเดิมที่ "เพิ่มมิเตอร์ชนิดใหม่ (เช่น steam) ต้องเพิ่ม
+-- ตารางใหม่ + แก้โค้ดหลายจุดพร้อมกัน (sequence, mapping, sweep loop,
+-- UNION ALL query, FK, index ฯลฯ)" — ตอนแรกใช้คอลัมน์ utility_type แยก
+-- ประเภทแทนชื่อตาราง แต่ตัดออกไปอีกรอบแล้ว (confirmed request รอบถัดมา —
+-- ดู comment ที่ CREATE TABLE images ด้านล่าง) เพราะ derivable ได้จาก
+-- meter_id เองอยู่แล้ว 100% ไม่ต้องเก็บซ้ำ — ตอนนี้เพิ่มมิเตอร์ชนิดใหม่
+-- แค่เพิ่ม entry ใหม่ใน app/db.py::UTILITY_TYPES พอ ไม่ต้องแตะ
+-- schema เลยด้วยซ้ำ
 --
 -- group_id / is_anchor / received_at: ESP32 ส่งภาพเป็นชุด (burst) หลายภาพ
 -- ต่อการอ่าน 1 ครั้ง — server รวมภาพที่มาถึงจาก meter_id เดียวกันภายใน
@@ -75,10 +79,12 @@ CREATE TABLE IF NOT EXISTS dataset (
 CREATE TABLE IF NOT EXISTS images (
     id                BIGINT      PRIMARY KEY DEFAULT nextval('images_id_seq'),
     meter_id          TEXT        NOT NULL,
-    -- utility_type — confirmed request: 'electric' | 'water' | 'gas',
-    -- extend the CHECK below (and app/db.py's mapping) to add a new
-    -- meter type — no schema change needed anywhere else.
-    utility_type      TEXT        NOT NULL,
+    -- utility_type ตัดออกแล้ว — confirmed request. derivable ได้ 100%
+    -- จาก meter_id เอง (ตัวอักษรแรก E/W/G กำหนดประเภทอยู่แล้ว ผ่าน
+    -- app/db.py::utility_type_for_meter_id()) ไม่มีทางไม่ตรงกันได้เลย
+    -- เพราะเราคุม insert path เองทั้งหมด — เก็บ column แยกซ้ำซ้อนไม่มี
+    -- ประโยชน์เพิ่ม ดู migration DROP COLUMN ด้านล่างสำหรับ DB ที่เคยมี
+    -- column นี้จากตอนรวมตาราง images_electric/water/gas ครั้งแรก
     original_filename TEXT,
     device_timestamp  TIMESTAMPTZ,
     ocr_status        TEXT        NOT NULL DEFAULT 'pending',  -- pending | done | failed | dropped
@@ -105,9 +111,17 @@ CREATE TABLE IF NOT EXISTS images (
     -- instead (see the "one normal group per meter per day" rule further
     -- down) never gets an ocr_jobs row at all — its images' job_id stays
     -- NULL forever, which is correct, not a bug.
-    job_id            BIGINT,
-    CONSTRAINT images_utility_type_check CHECK (utility_type IN ('electric', 'water', 'gas'))
+    job_id            BIGINT
 );
+
+-- confirmed request: ตัด utility_type ออกจาก images (derivable ได้จาก
+-- meter_id เสมอ ไม่ต้องเก็บซ้ำ) — no-op บน fresh install (CREATE TABLE
+-- ด้านบนไม่มี column นี้ตั้งแต่ต้นอยู่แล้ว) ใช้ IF EXISTS ครอบคลุม DB ที่
+-- เคยมี column นี้จากตอนรวมตาราง images_electric/water/gas ครั้งแรก —
+-- DROP CONSTRAINT ต้องมาก่อน DROP COLUMN เสมอ (constraint อ้างอิง column
+-- นี้อยู่ ลบ column ตรงๆ โดยไม่ลบ constraint ก่อนจะ error)
+ALTER TABLE images DROP CONSTRAINT IF EXISTS images_utility_type_check;
+ALTER TABLE images DROP COLUMN IF EXISTS utility_type;
 
 -- ⚠️ Migration รวมตาราง — confirmed request. ย้ายข้อมูลจาก
 -- images_electric/water/gas (ตารางแยกจากเวอร์ชันก่อนหน้า) เข้า images
@@ -169,12 +183,12 @@ BEGIN
         -- ทาง id ชนกัน ON CONFLICT DO NOTHING กันไว้เผื่อ migration นี้
         -- เคยรันไปแล้วบางส่วนมาก่อน (ตารางเดิมยังไม่ถูก DROP ด้วยเหตุผล
         -- บางอย่าง) ให้รันซ้ำได้ปลอดภัย
-        INSERT INTO images (id, meter_id, utility_type, original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id)
-            SELECT id, meter_id, 'electric', original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id FROM images_electric
+        INSERT INTO images (id, meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id)
+            SELECT id, meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id FROM images_electric
             UNION ALL
-            SELECT id, meter_id, 'water', original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id FROM images_water
+            SELECT id, meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id FROM images_water
             UNION ALL
-            SELECT id, meter_id, 'gas', original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id FROM images_gas
+            SELECT id, meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, received_at, dataset_id FROM images_gas
         ON CONFLICT (id) DO NOTHING;
 
         DROP TABLE images_electric;
@@ -196,8 +210,11 @@ ALTER TABLE images ADD CONSTRAINT images_dataset_id_fkey FOREIGN KEY (dataset_id
 CREATE INDEX IF NOT EXISTS idx_images_meter ON images (meter_id, device_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_images_group_lookup ON images (meter_id, received_at) WHERE is_anchor = true;
 CREATE INDEX IF NOT EXISTS idx_images_group_id ON images (group_id);
-CREATE INDEX IF NOT EXISTS idx_images_utility_type ON images (utility_type);
 CREATE INDEX IF NOT EXISTS idx_images_job_id ON images (job_id);
+-- confirmed request: utility_type ถูกตัดออกแล้ว (ดูคอลัมน์เดียวกันด้านบน)
+-- — index นี้เลยไม่มีเป้าหมายให้ผูกอีกต่อไป ลบทิ้งด้วย เผื่อ DB เดิมเคย
+-- สร้างไว้ตอนที่ column ยังอยู่
+DROP INDEX IF EXISTS idx_images_utility_type;
 
 -- meter_id/original_filename/device_timestamp ก็อปมาจากแถว "หัวกลุ่ม"
 -- (denormalized) ให้เปิดตาราง ocr_jobs เฉยๆ แล้วรู้ครบระดับหนึ่ง ไม่ต้อง
@@ -376,23 +393,23 @@ ON CONFLICT (code) DO NOTHING;
 -- (ชื่อเดิมคือ reading_date/reading_time — เปลี่ยนชื่อให้สื่อความหมาย
 -- ตรงขึ้นว่าเป็นเวลาที่ "ถ่ายภาพ" ไม่ใช่เวลาที่ "อ่านค่า/ประมวลผล")
 --
--- image_error: ใส่เฉพาะตอน error_type != 0 เท่านั้น (1, 2, หรือ 3
--- — ไม่ใส่ตอนสำเร็จเปล่าๆ error_type=0) เป็น**ชื่อไฟล์เดียวกับที่หัวกลุ่ม
--- ถูกอัปโหลดไว้แล้วตรงๆ** (ไม่ใช่ไฟล์แยกที่ OCR อัปโหลดซ้ำมาใหม่ — เดิม
--- เคยรับ multipart แนบไฟล์ใหม่ แต่ยกเลิกไปแล้ว เพราะ OCR client ไม่มี
+-- image: ตอนนี้ใส่เสมอไม่ว่าจะอ่านสำเร็จหรือไม่ (confirmed request, เปลี่ยน
+-- จากเดิมที่ใส่เฉพาะตอน error_type != 0 เท่านั้น) เป็น**ชื่อไฟล์เดียวกับที่
+-- หัวกลุ่มถูกอัปโหลดไว้แล้วตรงๆ** (ไม่ใช่ไฟล์แยกที่ OCR อัปโหลดซ้ำมาใหม่ —
+-- เดิมเคยรับ multipart แนบไฟล์ใหม่ แต่ยกเลิกไปแล้ว เพราะ OCR client ไม่มี
 -- ภาพอื่นนอกจากภาพที่ ESP32 ส่งมาอยู่แล้วตั้งแต่ต้น การให้อัปโหลดซ้ำมีแต่
 -- เสี่ยงชื่อไฟล์ชนกับภาพอื่นในกลุ่มเอง ไม่มีประโยชน์อะไรเพิ่ม) แค่ชี้กลับ
--- ไปที่ไฟล์ที่มีอยู่แล้วในเครื่อง ให้คนอ่านตรวจสอบตอนเกิด error/ผิดปกติ
--- (ชื่อคอลัมน์เดิมคือ ocr_image_filename — เปลี่ยนเป็น image_error ให้
--- สื่อความหมายตรงขึ้น เพราะมีค่าเฉพาะตอนเกิด error เท่านั้น) — column
--- นี้ตั้งใจให้อยู่**หลัง** error_type เสมอ (ลำดับคอลัมน์ที่เห็นตอน
--- SELECT * — ดู DO block ท้าย section นี้ที่จัดลำดับให้ ถ้า DB เดิมมี
--- image_error อยู่ก่อน error_type จากการ migrate มาหลายรอบ)
+-- ไปที่ไฟล์ที่มีอยู่แล้วในเครื่อง — ตอนนี้ให้คนอ่านดูภาพประกอบได้เสมอ
+-- ไม่ว่าผลจะสำเร็จหรือ error (ชื่อคอลัมน์เดิมคือ ocr_image_filename แล้ว
+-- เปลี่ยนเป็น image_error ตอนที่ยังใช้เฉพาะตอน error — ตอนนี้เปลี่ยนอีกรอบ
+-- เป็น image ให้สื่อความหมายตรงขึ้น เพราะไม่ได้ผูกกับ error เท่านั้นอีกต่อไป)
+-- — column นี้ตั้งใจให้อยู่**หลัง** error_type เสมอ (ลำดับคอลัมน์ที่เห็นตอน
+-- SELECT * — ดู DO block ท้าย section นี้ที่จัดลำดับให้)
 --
 -- ตารางนี้ตั้งใจให้มีแค่ 6 field ตามที่ยืนยัน (meter_id, capture_date,
--- capture_time, ocr_reading, error_type, image_error) — ไม่มี group_id
+-- capture_time, ocr_reading, error_type, image) — ไม่มี group_id
 -- ในตารางนี้แล้ว (เคยมีอยู่ช่วงสั้นๆ ตอนรวม column กับ ocr_jobs แต่ตัด
--- ออกตามที่ขอ — group_id ยังใช้เป็นกลไกภายในต่อใน images_*/ocr_jobs
+-- ออกตามที่ขอ — group_id ยังใช้เป็นกลไกภายในต่อใน images/ocr_jobs
 -- ตามเดิม แค่ไม่ก็อปมาใส่ตารางผลลัพธ์นี้อีกต่อไป)
 CREATE TABLE IF NOT EXISTS ocr_meter (
     id                  BIGSERIAL   PRIMARY KEY,
@@ -401,7 +418,7 @@ CREATE TABLE IF NOT EXISTS ocr_meter (
     capture_time        TIME        NOT NULL,
     ocr_reading         NUMERIC,
     error_type          INTEGER     NOT NULL REFERENCES error_type(code),
-    image_error         TEXT,
+    image                 TEXT,
     -- ocr_engine — ยืนยันตามสเปกทีม Worker: 1=LOCAL (default, กรณี
     -- ไม่ได้ระบุมาจากงานเก่าก่อนฟีเจอร์นี้), 2=GEMINI — DEFAULT 1 ที่
     -- DB ชั้นนี้เป็น safety net ชั้นสุดท้ายเท่านั้น (endpoint
@@ -413,7 +430,7 @@ CREATE TABLE IF NOT EXISTS ocr_meter (
 -- อัปเกรด DB ที่มี ocr_meter อยู่แล้วจาก schema เก่า (error_type เป็น TEXT,
 -- มี error_detail, มี group_id หรือ group_label ที่ตัดออกไปแล้ว, หรือมี
 -- reading_timestamp เดียวจากรอบทดลองสั้นๆ ที่ยกเลิกไปแล้ว, หรือคอลัมน์
--- ชื่อ ocr_image_filename แทน image_error) ให้ตรงกับ schema ใหม่ — no-op
+-- ชื่อ ocr_image_filename/image_error แทน image) ให้ตรงกับ schema ใหม่ — no-op
 -- บน fresh install
 DO $$
 BEGIN
@@ -421,7 +438,16 @@ BEGIN
         SELECT 1 FROM information_schema.columns
         WHERE table_name = 'ocr_meter' AND column_name = 'ocr_image_filename'
     ) THEN
-        ALTER TABLE ocr_meter RENAME COLUMN ocr_image_filename TO image_error;
+        ALTER TABLE ocr_meter RENAME COLUMN ocr_image_filename TO image;
+    END IF;
+    -- confirmed request: image_error -> image (ตอนนี้ใส่เสมอ ไม่ใช่แค่ตอน
+    -- error แล้ว — ชื่อเดิมสื่อความหมายผิดไป) — no-op ถ้าเคย rename ไปแล้ว
+    -- หรือเป็น fresh install ที่ไม่เคยมีชื่อเก่าเลย
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'ocr_meter' AND column_name = 'image_error'
+    ) THEN
+        ALTER TABLE ocr_meter RENAME COLUMN image_error TO image;
     END IF;
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
@@ -492,13 +518,13 @@ BEGIN
 END $$;
 
 -- จัดลำดับคอลัมน์ให้ตรงกับ CREATE TABLE ด้านบนเป๊ะ (error_type ต้องมา
--- ก่อน image_error เสมอ) — ใช้วิธีเดียวกับ ocr_jobs ด้านบน (สร้างตาราง
+-- ก่อน image เสมอ) — ใช้วิธีเดียวกับ ocr_jobs ด้านบน (สร้างตาราง
 -- ใหม่ตามลำดับที่ต้องการ ย้ายข้อมูล แล้วสลับตาราง) เพราะรับประกันลำดับ
 -- ที่ถูกต้องแน่นอน ต่างจากการ drop+recreate ทีละคอลัมน์ที่แค่ "ค่อนข้าง
 -- ถูก" — no-op ถ้าลำดับตรงอยู่แล้ว ปลอดภัยรันซ้ำได้
 DO $$
 DECLARE
-    correct_order TEXT[] := ARRAY['id','meter_id','capture_date','capture_time','ocr_reading','error_type','image_error','ocr_engine'];
+    correct_order TEXT[] := ARRAY['id','meter_id','capture_date','capture_time','ocr_reading','error_type','image','ocr_engine'];
     actual_order TEXT[];
 BEGIN
     SELECT array_agg(column_name ORDER BY ordinal_position) INTO actual_order
@@ -522,11 +548,11 @@ BEGIN
             capture_time  TIME        NOT NULL,
             ocr_reading   NUMERIC,
             error_type    INTEGER     NOT NULL REFERENCES error_type(code),
-            image_error   TEXT,
+            image           TEXT,
             ocr_engine    INT         REFERENCES ocr_engine(code) DEFAULT 1
         );
-        INSERT INTO ocr_meter_reordered (id, meter_id, capture_date, capture_time, ocr_reading, error_type, image_error, ocr_engine)
-            SELECT id, meter_id, capture_date, capture_time, ocr_reading, error_type, image_error, ocr_engine
+        INSERT INTO ocr_meter_reordered (id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine)
+            SELECT id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine
             FROM ocr_meter
             ORDER BY id;
         DROP TABLE ocr_meter;
@@ -570,9 +596,26 @@ CREATE TABLE IF NOT EXISTS ocr_meter_test (
     capture_time        TIME        NOT NULL,
     ocr_reading         NUMERIC,
     error_type          INTEGER     NOT NULL REFERENCES error_type(code),
-    image_error         TEXT,
+    image                 TEXT,
     ocr_engine          INT         REFERENCES ocr_engine(code) DEFAULT 1
 );
+-- confirmed request: image_error -> image (ตอนนี้ใส่เสมอ ไม่ใช่แค่ตอน error
+-- แล้ว เหมือนกับ ocr_meter ด้านบน) — no-op ถ้าเคย rename ไปแล้ว หรือเป็น
+-- fresh install ที่ไม่เคยมีชื่อเก่าเลย ตารางนี้ไม่มี reorder-migration ที่
+-- ซับซ้อนแบบ ocr_meter (ไม่เคยมีปัญหาลำดับคอลัมน์ผิดมาก่อน) แค่ RENAME
+-- ตรงๆ ก็พอ ลำดับคอลัมน์ยังถูกต้องเหมือนเดิม (image มาแทนที่ image_error ณ
+-- ตำแหน่งเดิมเป๊ะ ไม่มีตำแหน่งเปลี่ยน) — ห่อด้วย IF EXISTS check เพราะ
+-- fresh install ไม่เคยมีคอลัมน์ชื่อ image_error เลยตั้งแต่ต้น (CREATE
+-- TABLE ด้านบนใช้ชื่อ image ตั้งแต่แรก) RENAME ตรงๆ แบบไม่เช็คจะ error ทันที
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'ocr_meter_test' AND column_name = 'image_error'
+    ) THEN
+        ALTER TABLE ocr_meter_test RENAME COLUMN image_error TO image;
+    END IF;
+END $$;
 -- ยืนยันตามสเปกทีม Worker: "และตารางtest ถ้ามีแยกตารางครับ" — มีจริง
 -- (ocr_meter_test) เพิ่มคอลัมน์เดียวกันให้ครบ ไม่มี reorder-migration
 -- ที่ซับซ้อนแบบ ocr_meter (ตารางนี้ไม่เคยมีปัญหาลำดับคอลัมน์ผิดมาก่อน)

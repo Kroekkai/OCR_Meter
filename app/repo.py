@@ -1,15 +1,14 @@
 """
 Confirmed request: images_electric/water/gas were merged into one
-"images" table (utility_type column distinguishes electric/water/gas
-now, instead of which table a row lives in) — these helpers used to need
-to search across all three tables for a given image id; now it's a
-direct lookup, no searching needed at all.
+"images" table — these helpers used to need to search across all three
+tables for a given image id; now it's a direct lookup, no searching
+needed at all.
 """
 from __future__ import annotations
 
 import asyncpg
 
-from app.db import pool
+from app.db import pool, utility_type_for_meter_id
 from app.schemas import ImageOut
 
 
@@ -20,7 +19,13 @@ async def get_image_row(image_id: int) -> asyncpg.Record | None:
 def image_out(row: asyncpg.Record) -> ImageOut:
     return ImageOut(
         id=row["id"],
-        meter_type=row["utility_type"],
+        # Confirmed request (round 2): utility_type column removed from
+        # images entirely — derived here instead, from meter_id's own
+        # first letter (the exact same signal that decided it at insert
+        # time to begin with — see app/routers/images.py). 100%
+        # derivable, no possibility of drift, so keeping a redundant
+        # stored copy added nothing.
+        meter_type=utility_type_for_meter_id(row["meter_id"]),
         meter_id=row["meter_id"],
         original_filename=row["original_filename"],
         device_timestamp=row["device_timestamp"],

@@ -9,9 +9,9 @@ See db/init.sql for the group_id/is_anchor/received_at design and
 app.config.image_group_window_seconds for the window length.
 
 Confirmed request: images_electric/water/gas were merged into one
-"images" table (utility_type column) — everything in this module that
-used to loop over METER_TABLES.values() (one pass per meter type) now
-just queries the single images table directly, once.
+"images" table — everything in this module that used to loop over
+METER_TABLES.values() (one pass per meter type) now just queries the
+single images table directly, once.
 
 Runs as an asyncio task started in app/main.py's lifespan — NOT triggered
 by any HTTP request. This is what makes the wait actually happen even if

@@ -47,10 +47,10 @@ async def _list_ocr_meter_test_rows(meter_id: str | None, limit: int, offset: in
     (not INNER) JOIN so a row without a matching image still comes back
     with anchor_image_path=null (and group_id=null) rather than
     disappearing from the list entirely. (Confirmed request:
-    images_electric/water/gas were merged into one images table with a
-    utility_type column — this JOIN used to be a 3-way UNION ALL across
-    those tables; now it's a single join, no utility_type filter needed
-    here since meter_id alone already pins it to the right rows.)
+    images_electric/water/gas were merged into one images table — this
+    JOIN used to be a 3-way UNION ALL across those tables; now it's a
+    single join, no utility_type filter needed here since meter_id
+    alone already pins it to the right rows.)
 
     group_id (E1/W3/G12-style, confirmed request — added for the
     dashboard's per-meter test-results section, so an admin can tell

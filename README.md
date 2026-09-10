@@ -11,13 +11,13 @@ piece by piece against docs/config as they come in. Tracking here so
 nothing gets silently re-guessed or re-flipped:
 
 **Confirmed, implemented:**
-- `error_type` is a plain integer 0/1/2/3 (not free-form text) — meanings live in the `error_type` lookup table (`db/init.sql`), server owns the definitions, OCR client just reports the code. Case 3 ("read a value, but anomalous") replaces the old `reading_decreased`/`usage_anomaly` text values as one combined case — still client-computed, server doesn't run this check. `error_detail` column removed from `ocr_meter`. `capture_date`/`capture_time` derived server-side from the job's `device_timestamp` now, never client-supplied. **No file upload on `/result` at all anymore** — it's plain form fields, not multipart; the old `result_image` field is gone (see "ocr_meter" below for why — it was a real risk, not just unnecessary). `ocr_meter.ocr_image_filename` renamed to `image_error`, and its value is now the FULL disk path (e.g. `/data/images/E101_..._01.jpg`, not just the bare filename) to the job's own `original_filename` (the anchor's already-stored file), not a separately uploaded one. `GET /admin/images/{item_id}/ocr-result-file` (original spec) removed accordingly — use `/file` instead. `meter_id` stored uppercase everywhere (was lowercase). `ocr_jobs.last_error`/`admin_reason` columns removed (not persisted anywhere now — `/fail`'s error message only reaches the server log). `group_id` is now the E1/W3/G12-style text code directly (the old numeric `group_id`/self-reference anchor mechanism and the separate `group_label` column from an earlier revision are both gone — merged into one `group_id` column, with a new `is_anchor` boolean replacing the self-reference trick), on `images_*`/`ocr_jobs`. A group also now finalizes into `ocr_jobs` immediately once it reaches `IMAGE_GROUP_SIZE` (3) images, not just on the 60s window fallback. **`ocr_meter` does NOT carry `group_id`** — briefly did in an intermediate revision, confirmed removed: `ocr_meter` is exactly 6 fields (`meter_id`, `capture_date`, `capture_time`, `ocr_reading`, `error_type`, `image_error`), nothing else, group tracking is an `images_*`/`ocr_jobs`-internal concern only. See "ocr_meter", "group_id", and "Burst upload grouping" sections below.
+- `error_type` is a plain integer 0/1/2/3 (not free-form text) — meanings live in the `error_type` lookup table (`db/init.sql`), server owns the definitions, OCR client just reports the code. Case 3 ("read a value, but anomalous") replaces the old `reading_decreased`/`usage_anomaly` text values as one combined case — still client-computed, server doesn't run this check. `error_detail` column removed from `ocr_meter`. `capture_date`/`capture_time` derived server-side from the job's `device_timestamp` now, never client-supplied. **No file upload on `/result` at all anymore** — it's plain form fields, not multipart; the old `result_image` field is gone (see "ocr_meter" below for why — it was a real risk, not just unnecessary). `ocr_meter.ocr_image_filename` was renamed to `image_error` (populated only on error), then renamed again to `image` (confirmed request — populated on EVERY row now, success or error alike, see "`image`" below), and its value is the FULL disk path (e.g. `/data/images/E101_..._01.jpg`, not just the bare filename) to the job's own `original_filename` (the anchor's already-stored file), not a separately uploaded one. `GET /admin/images/{item_id}/ocr-result-file` (original spec) removed accordingly — use `/file` instead. `meter_id` stored uppercase everywhere (was lowercase). `ocr_jobs.last_error`/`admin_reason` columns removed (not persisted anywhere now — `/fail`'s error message only reaches the server log). `group_id` is now the E1/W3/G12-style text code directly (the old numeric `group_id`/self-reference anchor mechanism and the separate `group_label` column from an earlier revision are both gone — merged into one `group_id` column, with a new `is_anchor` boolean replacing the self-reference trick), on `images`/`ocr_jobs`. A group also now finalizes into `ocr_jobs` immediately once it reaches `IMAGE_GROUP_SIZE` (3) images, not just on the 60s window fallback. **`ocr_meter` does NOT carry `group_id`** — briefly did in an intermediate revision, confirmed removed: `ocr_meter` is exactly 6 fields (`meter_id`, `capture_date`, `capture_time`, `ocr_reading`, `error_type`, `image`), nothing else, group tracking is an `images`/`ocr_jobs`-internal concern only. See "ocr_meter", "group_id", and "Burst upload grouping" sections below.
 - `DB_HOST=timescaledb` (container name on `innovation_net`), **not** the host's own IP `192.168.248.199` — connecting via the host's external IP timed out from inside the container (self-referential/hairpin routing back to its own host), confirmed via `docker network inspect innovation_net` while debugging the actual deploy. `timescaledb` and `ocr-meter-store` are both already on that network, so Docker's internal DNS resolves it directly — no IP needed at all.
 - **`is_test_filename()`/`ocr_meter_test`** — every new group is tagged by ESP32's own `wakeup_reason` query param on upload (`"timer"` → real, anything else including absent → test, a later Project Carbon firmware update — replaced an earlier server-side comparison against `device_config`'s schedule, `app/schedule_match.py`, since deleted) and, for a test capture, has `_Test` appended to its *stored* filename (both disk and DB) — there is no separate `is_test` column anywhere (tried, then removed); `is_test_filename(original_filename)` is the sole source of truth end to end. Results for test jobs go to the new `ocr_meter_test` table instead of `ocr_meter`. At most one normal (non-test) group per meter per Bangkok calendar day may be *queued* — a same-day duplicate gets `ocr_status='dropped'` set on its `images` rows and creates **no `ocr_jobs` row at all** (confirmed design — dropped status is visible only in `images`, never in `ocr_jobs`); test groups are exempt from this limit entirely. See "Real vs. test captures" below.
 - **`esp32_upload_log`** — a new observability-only table (Project Carbon, confirmed), one row per group, logging the `net_mode`/`carrier`/`wakeup_reason` query params ESP32 now sends alongside every upload — `carrier` gets normalized from a raw PLMN code to a human-readable name first (`_normalize_carrier()`), and `log_time` (added later, confirmed) sits alongside `log_date` for full timestamp resolution. No bearing on grouping/OCR/results. Confirmed request, added later: readable via `GET /admin/meters/esp32-upload-log` — and, per a later confirmed request, its 3 fields also ride along on `GET /admin/meters/ocr-meter-test` (via a second LEFT JOIN, see `app/routers/meters.py`) so the dashboard's per-meter test-results cards can show them directly under each anchor image instead of needing a separate table. See "Real vs. test captures" below.
 - **`ocr_engine`** — a new lookup table (Worker team spec, confirmed), same pattern as `error_type`. `ocr_meter`/`ocr_meter_test` both gained an `ocr_engine INT REFERENCES ocr_engine(code)` column (1=LOCAL, 2=GEMINI) — optional on `POST .../result`/`.../result-test`, defaults to 1 when omitted. `GET /admin/meters/ocr-meter` and `POST .../result`'s own response no longer show this field (confirmed, round 2 — see "`ocr_engine`" below); `.../result-test` and `GET .../ocr-meter-test` are unaffected. Purely observational.
 - **`dataset`** — a new table (confirmed request, from a hand-drawn diagram), consolidating every image's file path into one place. `images` gained a `dataset_id BIGINT REFERENCES dataset(id)` column — every new upload gets its own 1:1 `dataset` row now (existing rows from before this column existed are left alone, never backfilled). See "`dataset`" below.
-- **`images_electric`/`water`/`gas` merged into one `images` table, confirmed request** — a `utility_type` column (`'electric'`/`'water'`/`'gas'`) distinguishes meter type now instead of which table a row lives in. Fixes a real extensibility problem the 3-table design had: adding a brand-new meter type used to mean a new table + sequence + FK set + index set + updating every place that looped over all 3 tables; now it's one new `utility_type` value. A `job_id BIGINT REFERENCES ocr_jobs(id)` column was added at the same time (also confirmed request) — nullable, since images always arrive before their `ocr_jobs` row can exist; backfilled once `app/grouping.py::finalize_group()` actually creates that row, stays `NULL` forever for a dropped group. See "`images` — merged table" below.
+- **`images_electric`/`water`/`gas` merged into one `images` table, confirmed request** — distinguished by meter type now via `meter_id`'s own first letter (`E`/`W`/`G`) instead of which table a row lives in. Fixes a real extensibility problem the 3-table design had: adding a brand-new meter type used to mean a new table + sequence + FK set + index set + updating every place that looped over all 3 tables; now it's one new entry in `app/db.py::UTILITY_TYPES`. A stored `utility_type` column existed briefly (confirmed request, round 1) then was removed again (confirmed request, round 2) — 100% derivable from `meter_id` with zero risk of drift, so a redundant stored copy added nothing; see "`images` — merged table" below for the full story. A `job_id BIGINT REFERENCES ocr_jobs(id)` column was added at the same time as the table merge (also confirmed request) — nullable, since images always arrive before their `ocr_jobs` row can exist; backfilled once `app/grouping.py::finalize_group()` actually creates that row, stays `NULL` forever for a dropped group.
 - `ocr_jobs` is one shared table across meter types (per `db/init.sql`) — not split into `ocr_jobs_electric/water/gas`.
 - Upload filename convention: `{meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg`, meter_id/device_timestamp parsed from it (Thailand local time, UTC+7), invalid meter_id prefix → HTTP 400.
 - Auth is fixed-secret-per-deployment: `DEVICE_API_KEY`/`DEVICE_API_KEY_USERNAME` and `OCR_CLIENT_KEY`/`OCR_CLIENT_KEY_USERNAME`, each an *optional shortcut* alongside real JWT login (blank pair = login required). See `app/auth.py`.
@@ -172,7 +172,7 @@ two different jobs:
   (`queued`/`processing`/`done`/`failed`, `attempts`, the 409 guard from
   the section above). Nothing outside this service should read it.
 - **`ocr_meter`** — the real output. One row per *finished* OCR attempt,
-  written by `/result`. No FK to `images_*` or `ocr_jobs` at all — it's
+  written by `/result`. No FK to `images` or `ocr_jobs` at all — it's
   meant to be hand-off-ready for the external Store system without that
   system needing to know anything about our internal job queue.
 
@@ -214,12 +214,14 @@ readable descriptions live once, in the `error_type` lookup table, not
 repeated per-row.
 
 **No `result_image` upload either** — the OCR client never attaches an
-image to this endpoint. `ocr_meter.image_error` (only set when
-`error_type != 0`) is the full disk path (via `storage.original_path()`)
-to the job's own `original_filename` — e.g. `/data/images/E101_..._01.jpg`
-— the same file the group's anchor image was already stored under at
-upload time, nothing written twice. An earlier version of this
-endpoint accepted a re-uploaded copy via a `result_image` field —
+image to this endpoint. `ocr_meter.image` (confirmed request, renamed
+from `image_error` — see "`image`" below for the full story) is now the
+full disk path (via `storage.original_path()`) to the job's own
+`original_filename` on EVERY row, success or error alike — e.g.
+`/data/images/E101_..._01.jpg` — the same file the group's anchor image
+was already stored under at upload time, nothing written twice. An
+earlier version of this endpoint accepted a re-uploaded copy via a
+`result_image` field —
 removed: it added nothing (the OCR client can only legitimately attach
 one of the group's own already-stored photos anyway), and it was
 actively risky — the save path was always computed from the *anchor's*
@@ -390,9 +392,10 @@ if this pattern gets reused anywhere else.
 
 Originally three separate, identically-shaped tables — one per meter
 type, distinguished by which table a row lived in. Confirmed request:
-merged into one `images` table with a `utility_type` TEXT column
-(`'electric'`/`'water'`/`'gas'`, `CHECK`-constrained) doing that job
-instead.
+merged into one `images` table. A stored `utility_type` TEXT column
+(`'electric'`/`'water'`/`'gas'`, `CHECK`-constrained) did that job at
+first — removed again shortly after (confirmed request, round 2 — see
+"Round 2: `utility_type` removed" below).
 
 **The problem this solves, confirmed as the actual motivation:** adding
 a genuinely new meter type (e.g. a future "steam") used to mean a new
@@ -401,9 +404,8 @@ to `device_config`) + a new index set + finding and updating every
 place in the codebase that looped over all three tables by name
 (`app/db.py::METER_TABLES`, the background sweep, the `ocr-meter-test`
 JOIN, etc.) — a genuine multi-file change for something conceptually
-tiny. Now it's one new value in a `CHECK` constraint (`db/init.sql`)
-plus one new entry in `app/db.py::UTILITY_TYPES` — nothing else in the
-codebase needs to change at all.
+tiny. Now it's one new entry in `app/db.py::UTILITY_TYPES` — nothing
+else in the codebase needs to change at all.
 
 **`job_id` — a second confirmed request, added in the same migration.**
 `images.job_id BIGINT REFERENCES ocr_jobs(id)`, nullable. Before this,
@@ -439,16 +441,53 @@ the file once every table it could possibly need already exists.
 **Migration (for any DB from before this merge):** every row from the
 three old tables is copied into `images` with `id` preserved exactly
 (safe — all three old tables already shared one `images_id_seq`, so
-their `id` values never overlapped to begin with) and `utility_type`
-set from which old table it came from, then the three old tables are
-dropped. `app/db.py`'s old `table_for_meter_id()`/`table_for_group_id()`
-(returned a table name) became `utility_type_for_meter_id()`/
-`utility_type_for_group_id()` (returns `'electric'`/`'water'`/`'gas'`
-instead) — every caller across `app/routers/images.py`,
-`app/routers/ocr_jobs.py`, `app/routers/meters.py`, `app/grouping.py`,
-and `app/repo.py` updated to match; `app/repo.py`'s helpers in
-particular got simpler, not just renamed — they used to search across
-three tables for a given image id, now it's a direct lookup in one.
+their `id` values never overlapped to begin with), then the three old
+tables are dropped. `app/db.py`'s old `table_for_meter_id()`/
+`table_for_group_id()` (returned a table name) became
+`utility_type_for_meter_id()`/`utility_type_for_group_id()` (returns
+`'electric'`/`'water'`/`'gas'` instead) — every caller across
+`app/routers/images.py`, `app/routers/ocr_jobs.py`,
+`app/routers/meters.py`, `app/grouping.py`, and `app/repo.py` updated
+to match; `app/repo.py`'s helpers in particular got simpler, not just
+renamed — they used to search across three tables for a given image
+id, now it's a direct lookup in one.
+
+### Round 2: `utility_type` removed — confirmed request
+
+The stored `utility_type` column above lasted only until the next
+round. Confirmed observation that triggered this: `utility_type` is
+**100% derivable from `meter_id`** — its own first letter (`E`/`W`/`G`)
+determines it permanently, via the exact same `UTILITY_TYPES` mapping
+that decided it at insert time in the first place. There's no scenario
+where a stored copy could ever legitimately disagree with what
+`meter_id` itself says — the redundant column added nothing beyond
+what deriving it on demand couldn't already give.
+
+**Where each former use of the column landed instead:**
+- **The `open_anchor` query's `WHERE utility_type = $3`
+  (`app/routers/images.py`)** — deleted outright, not replaced with a
+  derivation. It was always redundant *even with the column present*:
+  `meter_id = $1` alone already pins a query to exactly one utility
+  type (a given `meter_id` can only ever belong to one), so filtering
+  by both never actually narrowed anything further than `meter_id`
+  did by itself.
+- **`app/repo.py::image_out()`'s `ImageOut.meter_type` field** — now
+  computed via `utility_type_for_meter_id(row["meter_id"])` at
+  response-build time instead of read off a stored column.
+- **`GET /admin/images`'s `meter_type` query-param filter** — the one
+  place that genuinely needed a translation, not just a lookup: turning
+  `?meter_type=electric` into a WHERE clause now goes through
+  `app/db.py::PREFIX_FOR_UTILITY_TYPE` (`UTILITY_TYPES`'s reverse — 
+  `"electric"` → `"E"`) and filters on `LEFT(meter_id, 1) = $N` instead
+  of `utility_type = ANY(...)`.
+
+**Schema-wise:** `db/init.sql`'s `CREATE TABLE images` no longer
+declares the column at all; a migration block (`ALTER TABLE images
+DROP CONSTRAINT IF EXISTS images_utility_type_check` +
+`DROP COLUMN IF EXISTS utility_type`, plus `DROP INDEX IF EXISTS
+idx_images_utility_type`) removes it from any DB that still has it from
+round 1 — no-op on a fresh install, which never declares the column to
+begin with now.
 
 ## `group_id` — human-readable group codes (E1, W3, G12, ...)
 
@@ -456,7 +495,7 @@ three tables for a given image id, now it's a direct lookup in one.
 directly, not a separate `group_label` alongside a numeric anchor.**
 Earlier revision had two columns: `group_id` (`BIGINT`, self-referencing
 the anchor image's own `id` — jumps around unpredictably since every
-utility_type shares one `images_id_seq`) plus `group_label` (`TEXT`,
+utility type shares one `images_id_seq`) plus `group_label` (`TEXT`,
 the human-readable code) as a separate addition. Confirmed
 simplification: drop the numeric one, rename `group_label` to just
 `group_id` — one column, one name, in `images` and `ocr_jobs`.

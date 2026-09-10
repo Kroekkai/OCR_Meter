@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 
 from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_uploader
 from app.config import get_settings
-from app.db import GROUP_ID_INFO, pool, utility_type_for_meter_id
+from app.db import GROUP_ID_INFO, PREFIX_FOR_UTILITY_TYPE, pool, utility_type_for_meter_id
 from app.filename import BANGKOK_TZ, FilenameParseError, is_test_filename, parse_upload_filename
 from app.grouping import finalize_group, has_normal_group_today, mark_group_dropped
 from app.repo import get_image_row, image_out
@@ -217,11 +217,17 @@ async def upload_image(
             # think it's still "open" and try to join it. Excluding
             # anything not 'pending' (i.e. already 'done' or 'dropped')
             # closes that gap.
+            #
+            # No utility_type filter here (confirmed request, round 2 —
+            # that column is gone from images entirely) — meter_id alone
+            # already pins this to exactly one utility type, since a
+            # given meter_id can only ever belong to one (its own first
+            # letter decides it, permanently) — filtering by both was
+            # always redundant, never actually narrowed anything further.
             open_anchor = await conn.fetchrow(
                 """
                 SELECT id, group_id, original_filename FROM images
                 WHERE meter_id = $1
-                  AND utility_type = $3
                   AND is_anchor = true
                   AND ocr_status = 'pending'
                   AND received_at > now() - ($2 * interval '1 second')
@@ -232,7 +238,6 @@ async def upload_image(
                 """,
                 meter_id,
                 settings.image_group_window_seconds,
-                utility_type,
             )
 
             if open_anchor is not None:
@@ -249,12 +254,11 @@ async def upload_image(
                 dataset_id = await _insert_dataset_row(conn, stored_filename)
                 image_row = await conn.fetchrow(
                     """
-                    INSERT INTO images (meter_id, utility_type, original_filename, device_timestamp, ocr_status, group_id, is_anchor, dataset_id)
-                    VALUES ($1, $2, $3, $4, 'pending', $5, false, $6)
+                    INSERT INTO images (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, dataset_id)
+                    VALUES ($1, $2, $3, 'pending', $4, false, $5)
                     RETURNING *
                     """,
                     meter_id,
-                    utility_type,
                     stored_filename,
                     device_timestamp,
                     open_anchor["group_id"],
@@ -288,12 +292,11 @@ async def upload_image(
                 dataset_id = await _insert_dataset_row(conn, stored_filename)
                 image_row = await conn.fetchrow(
                     """
-                    INSERT INTO images (meter_id, utility_type, original_filename, device_timestamp, ocr_status, group_id, is_anchor, dataset_id)
-                    VALUES ($1, $2, $3, $4, 'pending', $5, true, $6)
+                    INSERT INTO images (meter_id, original_filename, device_timestamp, ocr_status, group_id, is_anchor, dataset_id)
+                    VALUES ($1, $2, $3, 'pending', $4, true, $5)
                     RETURNING *
                     """,
                     meter_id,
-                    utility_type,
                     stored_filename,
                     device_timestamp,
                     new_group_id,
@@ -422,20 +425,24 @@ async def admin_list_images(
     offset: int = Query(default=0, ge=0),
     _: CurrentUser = Depends(get_admin_or_service),
 ):
-    utility_types = [meter_type] if meter_type else ["electric", "water", "gas"]
     if meter_id:
         meter_id = meter_id.strip().upper()  # meter_id is always stored uppercase — see app/filename.py
 
     clauses, params = [], []
-    params.append(utility_types)
-    clauses.append(f"utility_type = ANY(${len(params)})")
+    # Confirmed request (round 2): images carries no utility_type column
+    # anymore — this filter now matches meter_id's own first letter
+    # directly instead (LEFT(meter_id, 1)), via PREFIX_FOR_UTILITY_TYPE
+    # (app/db.py) to go from "electric"/"water"/"gas" back to "E"/"W"/"G".
+    if meter_type:
+        params.append(PREFIX_FOR_UTILITY_TYPE[meter_type])
+        clauses.append(f"LEFT(meter_id, 1) = ${len(params)}")
     if meter_id:
         params.append(meter_id)
         clauses.append(f"meter_id = ${len(params)}")
     if ocr_status:
         params.append(ocr_status)
         clauses.append(f"ocr_status = ${len(params)}")
-    where = f"WHERE {' AND '.join(clauses)}"
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params.extend([limit, offset])
     rows = await pool().fetch(
         f"SELECT * FROM images {where} ORDER BY id DESC LIMIT ${len(params) - 1} OFFSET ${len(params)}",
@@ -558,9 +565,9 @@ async def admin_get_image_file_by_filename(filename: str, _: CurrentUser = Depen
 
 # GET .../ocr-result-file removed — there's no separate "OCR result"
 # file anymore (see app/routers/ocr_jobs.py's /result docstring). For
-# the same image on an error/anomaly row, use this same endpoint
-# (/admin/images/{item_id}/file) — ocr_meter.image_error names exactly
-# this file, nothing new was ever written.
+# the image on any row (success or error alike, confirmed request), use
+# this same endpoint (/admin/images/{item_id}/file) — ocr_meter.image
+# names exactly this file, nothing new was ever written.
 
 
 @router.put("/admin/images/{item_id}/ocr-manual", summary="Admin Edit Ocr Manually")
