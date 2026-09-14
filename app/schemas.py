@@ -31,14 +31,17 @@ point.
 # ความหมายเต็มอยู่ที่ตาราง error_type ใน DB (single source of truth)
 OcrErrorType = Literal[0, 1, 2, 3]
 
-# 1 = LOCAL (Worker's own YOLO+CNN model, no cost), 2 = GEMINI (cloud
-# fallback, Gemini 3.7 Flash) — confirmed, Worker team spec, same
-# lookup-table pattern as OcrErrorType/error_type above. Safe as a
-# Literal here (unlike on a Form() field — see
-# app/routers/ocr_jobs.py's error_type Form() description for why) since
-# this only ever appears in a RESPONSE model, populated from a real int
-# the database returns, never from a raw multipart string.
-OcrEngineType = Literal[1, 2]
+# ระบบคะแนนสะสม (Summation Score System) — ยืนยันรอบ 2 จากทีม Worker,
+# แทนที่ lookup เดิม (1=LOCAL, 2=GEMINI) ทั้งหมด คำนวณจาก YOLO หากล่อง
+# ตัวเลขไม่ครบ +1000, Local OCR/CNN อ่านไม่ออก +100, Gemini (fallback)
+# กู้สำเร็จ +20 / กู้ไม่ผ่าน +10 — ตัวอย่างค่าที่ทีม Worker ยืนยัน: 0, 120,
+# 1120 (auto-approve), 110, 1110 (ส่งคนตรวจ) — ค่าอื่นที่ไม่ได้ยกตัวอย่าง
+# ไว้ (10, 20, 100, 1000, 1010, 1020, 1100) ก็เป็นไปได้ตามสูตรเดียวกัน จึง
+# เป็น int ทั่วไป ไม่ใช่ Literal ของค่าที่ enumerate ไว้ตายตัวอีกต่อไป
+# (ต่างจาก OcrErrorType ด้านบน ซึ่งยังเป็น Literal ได้เพราะค่าคงที่แค่ 4
+# ค่าจริงๆ) — ไม่มี FK ไป lookup table ใดๆ ใน DB แล้วเช่นกัน (ตารางเดิม
+# ocr_engine ถูก DROP ไปแล้ว — ดู db/init.sql)
+OcrEngineType = int
 
 
 # --------------------------------------------------------------------------
@@ -194,35 +197,23 @@ class OcrMeterEntry(BaseModel):
     error, meant for a human to review what went wrong) is gone — this
     is now just "the image for this reading," full stop, useful for a
     successful read too.
-
-    Also — separately, confirmed request (round 2) — this class is back
-    to exactly the 6 originally-confirmed fields, no ocr_engine. Used by
-    GET /admin/meters/ocr-meter and POST .../result's own response —
-    both are the "clean" ocr_meter surface now: POST .../result doesn't
-    accept ocr_engine as input anymore either (see
-    app/routers/ocr_jobs.py), so not echoing it back out here keeps
-    input and output consistent. See OcrMeterEntryWithEngine right below
-    for the one place that still needs it (.../result-test).
     """
-
-
-# --------------------------------------------------------------------------
-# OcrMeterEntryWithEngine — confirmed request (round 2): ocr_engine
-# stays OUT of the plain OcrMeterEntry above (GET .../ocr-meter and
-# POST .../result), but POST .../result-test still both accepts it as
-# input and echoes it back — its caller (the Worker's test pipeline)
-# still reports which engine ran, unlike .../result's caller. This
-# class exists solely so that one endpoint's response can carry the
-# extra field without reintroducing it to the "clean" ocr_meter shape
-# everything else uses.
-# --------------------------------------------------------------------------
-class OcrMeterEntryWithEngine(OcrMeterEntry):
-    ocr_engine: OcrEngineType | None
+    ocr_engine: OcrEngineType
     """
-    Confirmed, Worker team spec — 1=LOCAL, 2=GEMINI. Optional at the API
-    level (.../result-test defaults it to 1 when the Worker omits it —
-    see app/routers/ocr_jobs.py) even though the DB column also carries
-    its own DEFAULT 1 as a second safety net.
+    Confirmed request (round 3, Worker team) — back IN to the plain
+    OcrMeterEntry shape again, and now REQUIRED (not optional) — a brief
+    round 2 had removed it from here and split it into a separate
+    OcrMeterEntryWithEngine class, only used by .../result-test's own
+    response, specifically because .../result didn't accept it as input
+    at the time. That's reversed now: the Worker's new scoring system
+    (see OcrEngineType's own comment above) is required on BOTH
+    POST .../result and .../result-test, and is core routing information
+    for their dashboard workflow (0/120/1120 auto-approve, 110 -> manual
+    entry queue, 1110 -> flag for possible meter damage) — not just
+    incidental stats anymore, so it belongs in the "clean" ocr_meter
+    surface (this class, used by GET /admin/meters/ocr-meter too) same
+    as every other field here. OcrMeterEntryWithEngine is gone — this
+    class alone now covers every place ocr_engine needs to show up.
     """
 
 
@@ -238,14 +229,14 @@ class OcrMeterEntryWithEngine(OcrMeterEntry):
 # anchor image was deleted, or in some future edge case) — the row still
 # comes back rather than silently disappearing from the list, just
 # without a picture. Used only by GET /admin/meters/ocr-meter-test;
-# POST .../result-test itself returns OcrMeterEntryWithEngine directly
-# (no anchor_image_path/group_id/net_mode/etc — those three are a
-# listing-view-only concern, see that class) — this class extends
-# OcrMeterEntryWithEngine, not the plain OcrMeterEntry, specifically so
-# ocr_engine keeps showing up in ocr_meter_test's listing (unaffected by
-# the round-2 change that removed it from plain OcrMeterEntry).
+# POST .../result-test itself returns OcrMeterEntry directly (no
+# anchor_image_path/group_id/net_mode/etc — those three are a
+# listing-view-only concern, see this class) — extends OcrMeterEntry
+# directly now (round 3 removed the OcrMeterEntryWithEngine
+# intermediate class entirely, since ocr_engine lives in OcrMeterEntry
+# itself again).
 # --------------------------------------------------------------------------
-class OcrMeterTestEntry(OcrMeterEntryWithEngine):
+class OcrMeterTestEntry(OcrMeterEntry):
     anchor_image_path: str | None
     group_id: str | None
     """

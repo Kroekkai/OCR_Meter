@@ -7,7 +7,7 @@ from app.auth import CurrentUser, get_admin_or_service, get_ocr_client
 from app.db import pool
 from app.filename import BANGKOK_TZ, is_test_filename
 from app.repo import get_group_images
-from app.schemas import JobStatus, OcrClaimResponse, OcrFailRequest, OcrJobOut, OcrMeterEntry, OcrMeterEntryWithEngine
+from app.schemas import JobStatus, OcrClaimResponse, OcrFailRequest, OcrJobOut, OcrMeterEntry
 from app import storage
 
 logger = logging.getLogger("ocr_meter_store.ocr_jobs")
@@ -21,10 +21,6 @@ def _job_out(row) -> OcrJobOut:
 
 def _meter_out(row) -> OcrMeterEntry:
     return OcrMeterEntry(**dict(row))
-
-
-def _meter_out_with_engine(row) -> OcrMeterEntryWithEngine:
-    return OcrMeterEntryWithEngine(**dict(row))
 
 
 def _capture_date_time_from_device_timestamp(device_timestamp: dt.datetime | None) -> tuple[dt.date, dt.time]:
@@ -117,11 +113,11 @@ async def _submit_ocr_result(
     job_id: int,
     ocr_reading: float | None,
     error_type: int,
-    ocr_engine: int | None,
+    ocr_engine: int,
     *,
     expected_test: bool,
     wrong_endpoint_hint: str,
-) -> OcrMeterEntry | OcrMeterEntryWithEngine:
+) -> OcrMeterEntry:
     """
     Shared logic behind POST .../result and POST .../result-test —
     confirmed request: explicit separate endpoints instead of one
@@ -135,21 +131,21 @@ async def _submit_ocr_result(
     cosmetic — without this check, calling either endpoint for any job
     would silently do the same thing the old single endpoint did.
 
-    ocr_engine (confirmed, added for the Worker team's local-model-vs-
-    Gemini-fallback stats — see db/init.sql's ocr_engine lookup table,
-    same pattern as error_type) is OPTIONAL here, defaulting to 1
-    (LOCAL) when omitted — deliberately lenient, unlike error_type's
-    hard requirement, matching the Worker team's own proposed schema
-    (DB column DEFAULT 1) rather than adding a stricter API-level
-    requirement they didn't ask for. Still validated against the two
-    real codes when it IS provided, so a typo'd value fails loudly
-    (422) instead of tripping the DB's FK constraint with a less
-    readable error.
+    ocr_engine (confirmed, Worker team spec, round 3) is now REQUIRED
+    on both endpoints, no default, no validation against a small fixed
+    set — see OcrEngineType's own comment in app/schemas.py for the
+    full story of the Worker's scoring system this now carries. An
+    earlier round had this optional (defaulting to 1/LOCAL when
+    omitted) and validated against just {1, 2} — both are gone now:
+    the Worker always reports a real score, and the score can
+    legitimately be many different values (the additive combinations
+    of YOLO/CNN/Gemini outcomes), so there's nothing meaningful left to
+    validate against beyond "it's an integer" (which FastAPI's own
+    Form(...) type coercion already guarantees).
     """
     VALID_CODES = (0, 1, 2, 3)
     NO_READING_CODES = (1, 2)
     HAS_READING_CODES = (0, 3)
-    VALID_ENGINE_CODES = (1, 2)
 
     if error_type not in VALID_CODES:
         raise HTTPException(
@@ -165,13 +161,6 @@ async def _submit_ocr_result(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"ocr_reading must be omitted when error_type={error_type} — there is no reading to report",
-        )
-    if ocr_engine is None:
-        ocr_engine = 1
-    elif ocr_engine not in VALID_ENGINE_CODES:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"ocr_engine must be 1 (LOCAL) or 2 (GEMINI) — got {ocr_engine!r}",
         )
 
     async with pool().acquire() as conn:
@@ -242,7 +231,7 @@ async def _submit_ocr_result(
             # considered (and picked from) all of them.
             await conn.execute("UPDATE images SET ocr_status = 'done' WHERE group_id = $1", job["group_id"])
 
-    return _meter_out_with_engine(meter_row) if expected_test else _meter_out(meter_row)
+    return _meter_out(meter_row)
 
 
 @router.post("/{job_id}/result", response_model=OcrMeterEntry, summary="Admin Submit Ocr Result")
@@ -265,6 +254,17 @@ async def admin_submit_ocr_result(
             "doesn't reliably coerce the string \"0\"/\"1\"/etc. that multipart/form-data always sends "
             "into the matching int, and rejects it outright with a confusing 422 instead — confirmed "
             "against a real request while testing, not just theoretical."
+        ),
+    ),
+    ocr_engine: int = Form(
+        ...,
+        description=(
+            "Always required (confirmed, Worker team spec, round 3). The Worker's scoring system — "
+            "a summed score built from YOLO box detection (+1000 if incomplete), local CNN reading "
+            "(+100 if it failed), and Gemini cloud fallback (+20 if it recovered, +10 if it didn't). "
+            "0 = clean read, no fallback needed. Not validated against a fixed set here (unlike "
+            "error_type) — the additive scoring means many values are legitimately possible, not just "
+            "the handful the Worker team has documented so far."
         ),
     ),
     _: CurrentUser = Depends(get_ocr_client),
@@ -290,15 +290,13 @@ async def admin_submit_ocr_result(
     client is still the one that checks history and decides, server just
     stores whichever code it reports.
 
-    **No `ocr_engine` field here, confirmed (round 2) — unlike
-    .../result-test right below, which still has it.** This endpoint's
-    caller doesn't have that information to report, so `ocr_meter.ocr_engine`
-    for every row written through here is always the DB column's own
-    default (1/LOCAL) — `_submit_ocr_result()` is called with
-    `ocr_engine=None`, and that function's existing "default to 1 when
-    omitted" behavior (there for `.../result-test` callers who leave it
-    out) applies exactly the same way here, just unconditionally instead
-    of conditionally.
+    **`ocr_engine` is required here too now, confirmed (round 3) —
+    reversing an earlier round 2 that had removed it from this endpoint
+    specifically.** The Worker team's new scoring system is core routing
+    information for their own workflow (0/120/1120 → auto-approve, 110 →
+    manual entry queue, 1110 → flag for possible meter damage/reshoot),
+    not just incidental stats anymore — see OcrEngineType's own comment
+    in app/schemas.py for the full story.
 
     capture_date/capture_time are no longer client-supplied — they're
     derived from the job's own device_timestamp (when ESP32 captured the
@@ -321,13 +319,13 @@ async def admin_submit_ocr_result(
         job_id,
         ocr_reading,
         error_type,
-        None,
+        ocr_engine,
         expected_test=False,
         wrong_endpoint_hint="POST .../result-test",
     )
 
 
-@router.post("/{job_id}/result-test", response_model=OcrMeterEntryWithEngine, summary="Admin Submit Ocr Test Result")
+@router.post("/{job_id}/result-test", response_model=OcrMeterEntry, summary="Admin Submit Ocr Test Result")
 async def admin_submit_ocr_result_test(
     job_id: int,
     ocr_reading: float | None = Form(
@@ -342,20 +340,19 @@ async def admin_submit_ocr_result_test(
             "and which jobs it accepts."
         ),
     ),
-    ocr_engine: int | None = Form(
-        default=None,
-        description="Optional, same meaning as POST .../result — see that endpoint's description.",
+    ocr_engine: int = Form(
+        ...,
+        description="Always required, same meaning as POST .../result — see that endpoint's description.",
     ),
     _: CurrentUser = Depends(get_ocr_client),
 ):
     """
-    Mirror of POST .../result directly above — identical request shape
-    (still HAS `ocr_engine`, confirmed — that field was only removed
-    from .../result, not here), identical validation, response shape
-    is `OcrMeterEntryWithEngine` (one extra field, `ocr_engine`, vs.
-    plain `OcrMeterEntry` — confirmed request) — the only other
-    differences: writes to ocr_meter_test instead of ocr_meter, and
-    **only accepts jobs whose filename carries the "_Test" suffix**
+    Mirror of POST .../result directly above — identical request shape,
+    identical validation, identical response shape (both are plain
+    `OcrMeterEntry` now, confirmed round 3 — the brief
+    `OcrMeterEntryWithEngine` split from round 2 is gone) — the only
+    other differences: writes to ocr_meter_test instead of ocr_meter,
+    and **only accepts jobs whose filename carries the "_Test" suffix**
     (is_test_filename()). Calling this for a normal job rejects with
     409 and points you at POST .../result instead.
 

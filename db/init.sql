@@ -348,20 +348,16 @@ INSERT INTO error_type (code, error_detail) VALUES
     (3, 'อ่านได้ค่า แต่ผิดปกติ (ลดลงจากเดือนก่อน หรือใช้เกินอัตราปกติมาก — OCR client เป็นคนเช็คเอง ดู README)')
 ON CONFLICT (code) DO NOTHING;
 
--- ocr_engine — ตาราง lookup แบบเดียวกับ error_type ด้านบน (ยืนยันตาม
--- สเปกจากทีม Worker) บอกว่า OCR แต่ละครั้งอ่านผ่านโมเดลไหน — 1=LOCAL
--- (YOLO+CNN ในเครื่อง Worker เอง ไม่มีค่าใช้จ่าย), 2=GEMINI (fallback
--- ไปเรียก Gemini 3.7 Flash ตอนโมเดลในเครื่องอ่านไม่ผ่าน) — เก็บไว้ทำสถิติ
--- ว่าภาพกี่ % ต้องพึ่ง cloud AI เท่านั้น ไม่มีผลต่อ error_type/ocr_reading
--- หรือ logic อื่นในระบบเลย
-CREATE TABLE IF NOT EXISTS ocr_engine (
-    code INT         PRIMARY KEY,
-    name VARCHAR(50) NOT NULL
-);
-INSERT INTO ocr_engine (code, name) VALUES
-    (1, 'LOCAL (YOLO+CNN)'),
-    (2, 'GEMINI (Cloud Fallback)')
-ON CONFLICT (code) DO NOTHING;
+-- ocr_engine (ตาราง lookup) — ยืนยันแล้วว่าตัดออก (round 2, confirmed
+-- จากทีม Worker) เดิมเป็น lookup แบบเดียวกับ error_type (1=LOCAL,
+-- 2=GEMINI) แต่ทีม Worker เปลี่ยนไปใช้ระบบ "คะแนนสะสม" แทน (ดู comment
+-- ที่ ocr_meter.ocr_engine ด้านล่าง) ซึ่งมีค่าที่เป็นไปได้เยอะเกินกว่าจะ
+-- ทำเป็น lookup table เล็กๆ ได้อีกต่อไป (0, 10, 20, 100, 110, 120, 1000,
+-- 1010, 1020, 1100, 1110, 1120, ...) — column กลายเป็น INT ธรรมดา
+-- ไม่มี FK อ้างอิงตารางนี้แล้ว ตารางนี้เลย DROP ทิ้งไปด้วย (ไม่มีใครใช้
+-- อีกต่อไป) — DROP IF EXISTS ปลอดภัยรันซ้ำได้เสมอ ไม่ error แม้ตาราง
+-- ไม่เคยมีอยู่เลย (fresh install)
+DROP TABLE IF EXISTS ocr_engine;
 
 -- ocr_meter — ผลลัพธ์ OCR ที่ "จบแล้ว" ของแต่ละมิเตอร์ (สำเร็จ/error) —
 -- ตารางกลางสำหรับส่งต่อให้ระบบภายนอก (External Store) ใช้ ไม่มี FK
@@ -419,12 +415,21 @@ CREATE TABLE IF NOT EXISTS ocr_meter (
     ocr_reading         NUMERIC,
     error_type          INTEGER     NOT NULL REFERENCES error_type(code),
     image                 TEXT,
-    -- ocr_engine — ยืนยันตามสเปกทีม Worker: 1=LOCAL (default, กรณี
-    -- ไม่ได้ระบุมาจากงานเก่าก่อนฟีเจอร์นี้), 2=GEMINI — DEFAULT 1 ที่
-    -- DB ชั้นนี้เป็น safety net ชั้นสุดท้ายเท่านั้น (endpoint
-    -- /result และ /result-test เป็นคนตั้ง default ให้จริงๆ ถ้า
-    -- Worker ไม่ส่งมา — ดู app/routers/ocr_jobs.py)
-    ocr_engine          INT         REFERENCES ocr_engine(code) DEFAULT 1
+    -- ocr_engine — ยืนยันรอบ 2 จากทีม Worker: เปลี่ยนจาก lookup แบบเดิม
+    -- (1=LOCAL, 2=GEMINI) เป็น "ระบบคะแนนสะสม" (Summation Score System)
+    -- แทน คำนวณจาก YOLO หากล่องตัวเลขไม่ครบ +1000, Local OCR/CNN อ่านไม่
+    -- ออก +100, Gemini (fallback) กู้สำเร็จ +20 / กู้ไม่ผ่าน +10 — ตัวอย่าง
+    -- ค่าที่ทีม Worker ยืนยัน: 0=หากล่องครบ+อ่านออกเลย (auto-approve),
+    -- 120=หากล่องครบ+CNN อ่านไม่ออก+Gemini กู้ผ่าน (auto-approve),
+    -- 1120=หากล่องไม่ครบ+CNN อ่านไม่ออก+Gemini กู้ผ่าน (auto-approve),
+    -- 110=หากล่องครบ+CNN อ่านไม่ออก+Gemini กู้ไม่ผ่าน (ส่งคนตรวจ),
+    -- 1110=หากล่องไม่ครบ+CNN อ่านไม่ออก+Gemini กู้ไม่ผ่าน (ส่งคนตรวจ,
+    -- ติดแท็กเผื่อมิเตอร์ชำรุด) — ค่าอื่นที่ไม่ได้ยกตัวอย่างไว้ (เช่น 10,
+    -- 20, 100, 1000, 1010, 1020, 1100) ก็เป็นไปได้ตามสูตรบวกคะแนนเดียวกัน
+    -- เลยเก็บเป็น INT ทั่วไป ไม่ผูก FK กับ lookup table เล็กๆ อีกต่อไป
+    -- (ตารางเดิม ocr_engine ถูก DROP ไปแล้ว ดู comment ด้านบน) NOT NULL
+    -- เพราะยืนยันแล้วว่าบังคับส่งมาเสมอทั้ง /result และ /result-test
+    ocr_engine          INT         NOT NULL
 );
 
 -- อัปเกรด DB ที่มี ocr_meter อยู่แล้วจาก schema เก่า (error_type เป็น TEXT,
@@ -511,10 +516,24 @@ BEGIN
         ALTER TABLE ocr_meter ALTER COLUMN capture_date SET NOT NULL;
         ALTER TABLE ocr_meter ALTER COLUMN capture_time SET NOT NULL;
     END IF;
-    -- ocr_engine — ยืนยันตามสเปกทีม Worker (ทำแบบเดียวกับ error_type
-    -- ด้านบน: 1=LOCAL, 2=GEMINI) — no-op บน fresh install เพราะ
-    -- CREATE TABLE ด้านบนมีคอลัมน์นี้ครบตั้งแต่ต้นอยู่แล้ว
-    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS ocr_engine INT REFERENCES ocr_engine(code) DEFAULT 1;
+    -- ocr_engine — ยืนยันรอบ 2 จากทีม Worker: เปลี่ยนจาก lookup (1/2) เป็น
+    -- ระบบคะแนนสะสม, ไม่มี FK อีกต่อไป — ดู comment เต็มที่ CREATE TABLE
+    -- ด้านบน. ครอบคลุมทั้ง DB ที่ไม่เคยมีคอลัมน์นี้เลย (ADD COLUMN) และ DB
+    -- ที่เคยมีจาก round 1 (มี FK ผูกกับ ocr_engine lookup table เดิม, มี
+    -- DEFAULT 1) — no-op บน fresh install เพราะ CREATE TABLE ด้านบนมี
+    -- คอลัมน์นี้ครบตั้งแต่ต้นอยู่แล้ว
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS ocr_engine INT;
+    ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_ocr_engine_fkey;
+    ALTER TABLE ocr_meter ALTER COLUMN ocr_engine DROP DEFAULT;
+    -- แถวเก่าที่ไม่เคยมีค่า ocr_engine เลย (ก่อนฟีเจอร์นี้จะมีขึ้นด้วยซ้ำ)
+    -- backfill เป็น 0 ชั่วคราว (เทียบเท่า "หากล่องครบ+อ่านออกเลย" ตาม
+    -- ระบบคะแนนใหม่ — ค่ากลางที่สมเหตุสมผลที่สุดสำหรับข้อมูลเก่าที่ไม่รู้
+    -- ที่มาจริง) ก่อนจะบังคับ NOT NULL — แถวที่มีค่า 1/2 จาก round 1 เดิม
+    -- (LOCAL/GEMINI) ปล่อยไว้เฉยๆ ไม่ต้องแปลง ยังเป็นเลข INT ที่ใช้ได้ปกติ
+    -- ในระบบใหม่ (แค่ไม่ตรงกับสูตรคะแนนใหม่ ซึ่งไม่ใช่ปัญหา — ไม่มี CHECK
+    -- constraint บังคับความหมายของตัวเลขอยู่แล้ว)
+    UPDATE ocr_meter SET ocr_engine = 0 WHERE ocr_engine IS NULL;
+    ALTER TABLE ocr_meter ALTER COLUMN ocr_engine SET NOT NULL;
 END $$;
 
 -- จัดลำดับคอลัมน์ให้ตรงกับ CREATE TABLE ด้านบนเป๊ะ (error_type ต้องมา
@@ -549,7 +568,7 @@ BEGIN
             ocr_reading   NUMERIC,
             error_type    INTEGER     NOT NULL REFERENCES error_type(code),
             image           TEXT,
-            ocr_engine    INT         REFERENCES ocr_engine(code) DEFAULT 1
+            ocr_engine    INT         NOT NULL
         );
         INSERT INTO ocr_meter_reordered (id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine)
             SELECT id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine
@@ -559,10 +578,8 @@ BEGIN
         ALTER TABLE ocr_meter_reordered RENAME TO ocr_meter;
         ALTER TABLE ocr_meter RENAME CONSTRAINT ocr_meter_reordered_pkey TO ocr_meter_pkey;
         ALTER TABLE ocr_meter RENAME CONSTRAINT ocr_meter_reordered_error_type_fkey TO ocr_meter_error_type_fkey;
-        -- ocr_engine ได้ FK constraint ชื่ออัตโนมัติจาก Postgres ตอน
-        -- CREATE TABLE ด้านบนเหมือนกัน (คอลัมน์ที่มี REFERENCES ในนิยาม
-        -- ได้ constraint เสมอ ไม่ขึ้นกับว่า nullable หรือไม่)
-        ALTER TABLE ocr_meter RENAME CONSTRAINT ocr_meter_reordered_ocr_engine_fkey TO ocr_meter_ocr_engine_fkey;
+        -- ocr_engine ไม่มี FK อีกต่อไป (round 2, confirmed) — ไม่มี
+        -- constraint ให้ rename ตรงนี้แล้ว
         -- ผูก sequence กลับเข้ากับ column ใหม่ให้เรียบร้อย (ไม่จำเป็นต่อการ
         -- ทำงาน แค่ให้ Postgres จัดการ sequence ให้อัตโนมัติเวลา DROP TABLE
         -- ในอนาคต เหมือนตอนที่เป็น BIGSERIAL แต่แรก)
@@ -574,8 +591,9 @@ END $$;
 ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_error_type_check;
 ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_error_type_fkey;
 ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_error_type_fkey FOREIGN KEY (error_type) REFERENCES error_type(code);
+-- ocr_engine's FK — ยืนยันแล้วว่าตัดออก (round 2) เปลี่ยนเป็น INT ทั่วไป
+-- ไม่ผูก lookup table อีกต่อไป (ดู comment เต็มที่ CREATE TABLE ocr_meter)
 ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_ocr_engine_fkey;
-ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_ocr_engine_fkey FOREIGN KEY (ocr_engine) REFERENCES ocr_engine(code);
 
 -- capture_date DESC, capture_time DESC รองรับ query แบบที่ OCR client
 -- ต้องใช้บ่อยที่สุด: "ค่าล่าสุดของมิเตอร์นี้คือเท่าไหร่" — DROP ก่อนเผื่อ
@@ -597,7 +615,9 @@ CREATE TABLE IF NOT EXISTS ocr_meter_test (
     ocr_reading         NUMERIC,
     error_type          INTEGER     NOT NULL REFERENCES error_type(code),
     image                 TEXT,
-    ocr_engine          INT         REFERENCES ocr_engine(code) DEFAULT 1
+    -- ocr_engine — ยืนยันรอบ 2 จากทีม Worker: ระบบคะแนนสะสม, ไม่มี FK
+    -- อีกต่อไป — ดู comment เต็มที่ ocr_meter ด้านบน (โครงสร้างเดียวกัน)
+    ocr_engine          INT         NOT NULL
 );
 -- confirmed request: image_error -> image (ตอนนี้ใส่เสมอ ไม่ใช่แค่ตอน error
 -- แล้ว เหมือนกับ ocr_meter ด้านบน) — no-op ถ้าเคย rename ไปแล้ว หรือเป็น
@@ -617,10 +637,16 @@ BEGIN
     END IF;
 END $$;
 -- ยืนยันตามสเปกทีม Worker: "และตารางtest ถ้ามีแยกตารางครับ" — มีจริง
--- (ocr_meter_test) เพิ่มคอลัมน์เดียวกันให้ครบ ไม่มี reorder-migration
--- ที่ซับซ้อนแบบ ocr_meter (ตารางนี้ไม่เคยมีปัญหาลำดับคอลัมน์ผิดมาก่อน)
--- แค่ ADD COLUMN ตรงๆ ก็พอ
-ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS ocr_engine INT REFERENCES ocr_engine(code) DEFAULT 1;
+-- (ocr_meter_test) — ครอบคลุมทั้ง DB ที่ไม่เคยมีคอลัมน์นี้เลย และ DB ที่
+-- เคยมีจาก round 1 (มี FK + DEFAULT 1) เปลี่ยนเป็น round 2 (ระบบคะแนน
+-- สะสม, INT ทั่วไป, NOT NULL) — ดู comment เต็มที่ ocr_meter ด้านบน
+-- ไม่มี reorder-migration ที่ซับซ้อนแบบ ocr_meter (ตารางนี้ไม่เคยมีปัญหา
+-- ลำดับคอลัมน์ผิดมาก่อน)
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS ocr_engine INT;
+ALTER TABLE ocr_meter_test DROP CONSTRAINT IF EXISTS ocr_meter_test_ocr_engine_fkey;
+ALTER TABLE ocr_meter_test ALTER COLUMN ocr_engine DROP DEFAULT;
+UPDATE ocr_meter_test SET ocr_engine = 0 WHERE ocr_engine IS NULL;
+ALTER TABLE ocr_meter_test ALTER COLUMN ocr_engine SET NOT NULL;
 -- anchor_image_path was briefly a column here (confirmed request,
 -- reverted) — the dashboard's test-results image instead comes from a
 -- query-time JOIN against images_*/is_anchor=true, matched on

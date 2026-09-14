@@ -15,7 +15,7 @@ nothing gets silently re-guessed or re-flipped:
 - `DB_HOST=timescaledb` (container name on `innovation_net`), **not** the host's own IP `192.168.248.199` — connecting via the host's external IP timed out from inside the container (self-referential/hairpin routing back to its own host), confirmed via `docker network inspect innovation_net` while debugging the actual deploy. `timescaledb` and `ocr-meter-store` are both already on that network, so Docker's internal DNS resolves it directly — no IP needed at all.
 - **`is_test_filename()`/`ocr_meter_test`** — every new group is tagged by ESP32's own `wakeup_reason` query param on upload (`"timer"` → real, anything else including absent → test, a later Project Carbon firmware update — replaced an earlier server-side comparison against `device_config`'s schedule, `app/schedule_match.py`, since deleted) and, for a test capture, has `_Test` appended to its *stored* filename (both disk and DB) — there is no separate `is_test` column anywhere (tried, then removed); `is_test_filename(original_filename)` is the sole source of truth end to end. Results for test jobs go to the new `ocr_meter_test` table instead of `ocr_meter`. At most one normal (non-test) group per meter per Bangkok calendar day may be *queued* — a same-day duplicate gets `ocr_status='dropped'` set on its `images` rows and creates **no `ocr_jobs` row at all** (confirmed design — dropped status is visible only in `images`, never in `ocr_jobs`); test groups are exempt from this limit entirely. See "Real vs. test captures" below.
 - **`esp32_upload_log`** — a new observability-only table (Project Carbon, confirmed), one row per group, logging the `net_mode`/`carrier`/`wakeup_reason` query params ESP32 now sends alongside every upload — `carrier` gets normalized from a raw PLMN code to a human-readable name first (`_normalize_carrier()`), and `log_time` (added later, confirmed) sits alongside `log_date` for full timestamp resolution. No bearing on grouping/OCR/results. Confirmed request, added later: readable via `GET /admin/meters/esp32-upload-log` — and, per a later confirmed request, its 3 fields also ride along on `GET /admin/meters/ocr-meter-test` (via a second LEFT JOIN, see `app/routers/meters.py`) so the dashboard's per-meter test-results cards can show them directly under each anchor image instead of needing a separate table. See "Real vs. test captures" below.
-- **`ocr_engine`** — a new lookup table (Worker team spec, confirmed), same pattern as `error_type`. `ocr_meter`/`ocr_meter_test` both gained an `ocr_engine INT REFERENCES ocr_engine(code)` column (1=LOCAL, 2=GEMINI) — optional on `POST .../result`/`.../result-test`, defaults to 1 when omitted. `GET /admin/meters/ocr-meter` and `POST .../result`'s own response no longer show this field (confirmed, round 2 — see "`ocr_engine`" below); `.../result-test` and `GET .../ocr-meter-test` are unaffected. Purely observational.
+- **`ocr_engine`** — Worker team spec, gone through 3 rounds. Round 1: a lookup table (like `error_type`), `ocr_meter`/`ocr_meter_test` gained an `ocr_engine INT REFERENCES ocr_engine(code)` column (1=LOCAL, 2=GEMINI), optional, default 1. Round 2: removed from `.../result`'s input and from the plain `GET /admin/meters/ocr-meter`/`.../result` response shape entirely (kept only on `.../result-test`/`ocr-meter-test`). **Round 3 (confirmed, current): the Worker switched to a summation score system** (YOLO box-detection miss +1000, local CNN read failure +100, Gemini fallback +20 success/+10 failure — e.g. `0`=clean read, `120`/`1120`=auto-approved via Gemini recovery, `110`/`1110`=needs human review) — the lookup table is gone (`DROP TABLE`), the column is a plain `INT NOT NULL` with no FK, and it's **required again on both `.../result` and `.../result-test`**, shown on both `GET /admin/meters/ocr-meter` and `.../ocr-meter-test` — no longer just incidental stats, it's core routing information for the Worker's own dashboard workflow now. See "`ocr_engine`" below for the full history.
 - **`dataset`** — a new table (confirmed request, from a hand-drawn diagram), consolidating every image's file path into one place. `images` gained a `dataset_id BIGINT REFERENCES dataset(id)` column — every new upload gets its own 1:1 `dataset` row now (existing rows from before this column existed are left alone, never backfilled). See "`dataset`" below.
 - **`images_electric`/`water`/`gas` merged into one `images` table, confirmed request** — distinguished by meter type now via `meter_id`'s own first letter (`E`/`W`/`G`) instead of which table a row lives in. Fixes a real extensibility problem the 3-table design had: adding a brand-new meter type used to mean a new table + sequence + FK set + index set + updating every place that looped over all 3 tables; now it's one new entry in `app/db.py::UTILITY_TYPES`. A stored `utility_type` column existed briefly (confirmed request, round 1) then was removed again (confirmed request, round 2) — 100% derivable from `meter_id` with zero risk of drift, so a redundant stored copy added nothing; see "`images` — merged table" below for the full story. A `job_id BIGINT REFERENCES ocr_jobs(id)` column was added at the same time as the table merge (also confirmed request) — nullable, since images always arrive before their `ocr_jobs` row can exist; backfilled once `app/grouping.py::finalize_group()` actually creates that row, stays `NULL` forever for a dropped group.
 - `ocr_jobs` is one shared table across meter types (per `db/init.sql`) — not split into `ocr_jobs_electric/water/gas`.
@@ -54,7 +54,7 @@ POST   /images/upload                              [X-Device-Key]  (+ net_mode/c
 GET    /admin/images
 GET    /admin/images/ocr
 POST   /admin/images/ocr/{job_id}/claim            [X-OCR-Key]
-POST   /admin/images/ocr/{job_id}/result           [X-OCR-Key]   (plain form fields, not multipart — no ocr_engine field, see "ocr_engine" below)
+POST   /admin/images/ocr/{job_id}/result           [X-OCR-Key]   (plain form fields, not multipart — ocr_engine required again, see "ocr_engine" below)
 POST   /admin/images/ocr/{job_id}/result-test      [X-OCR-Key]   (NEW — mirror of /result, writes ocr_meter_test instead, see below)
 POST   /admin/images/ocr/{job_id}/fail             [X-OCR-Key]
 POST   /admin/images/{item_id}/reprocess           [admin JWT]
@@ -267,60 +267,71 @@ curl -s "http://localhost:3003/admin/meters/e101/ocr-readings?limit=3&only_succe
 # if (new_reading - 1310) > 165 -> submit /result with error_type=3
 ```
 
-### `ocr_engine` — LOCAL vs GEMINI stats (Worker team spec, confirmed)
+### `ocr_engine` — Worker's scoring system (round 3, confirmed current)
 
 Not in either original spec doc — a later addition from the Worker
-team, once their local model (YOLO+CNN) + Gemini cloud-fallback
-pipeline passed full E2E testing. Same lookup-table pattern as
-`error_type` — `db/init.sql`'s `ocr_engine` table (`1, 'LOCAL
-(YOLO+CNN)'` / `2, 'GEMINI (Cloud Fallback)'`) is the single source of
-truth for what each code means; `ocr_meter`/`ocr_meter_test` each carry
-one `ocr_engine INT REFERENCES ocr_engine(code)` column, added via
-`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (with `DROP`+`ADD` on the FK
-itself to stay idempotent, matching the existing `error_type` FK
-pattern) — confirmed on **both** tables, not just `ocr_meter`, since
-they're meant to stay structurally identical to each other.
+team, gone through three full rounds. Worth recording the arc, since a
+future change might reasonably revisit it again:
 
-**Unlike `error_type`, this is optional at the API level, confirmed
-deliberately** — `.../result-test` defaults it to `1` (LOCAL) when the
-Worker omits it, rather than rejecting the request the way a missing
-`error_type` would. This mirrors the Worker team's own proposed schema
-(`DEFAULT 1` on the column itself) — the API layer just extends that
-same leniency one level up, rather than imposing a stricter requirement
-they didn't ask for. When it *is* provided, still validated against
-`1`/`2` by hand (422 on anything else) for the same reason `error_type`
-is — a clearer error than letting a typo trip the DB's FK constraint
-instead.
+1. **Round 1**: a lookup table, same pattern as `error_type` —
+   `db/init.sql`'s `ocr_engine` table (`1, 'LOCAL (YOLO+CNN)'` /
+   `2, 'GEMINI (Cloud Fallback)'`), with `ocr_meter`/`ocr_meter_test`
+   each carrying an `ocr_engine INT REFERENCES ocr_engine(code)`
+   column, optional at the API level (defaulted to `1` when the Worker
+   omitted it), matching the DB column's own `DEFAULT 1`.
+2. **Round 2**: removed from `POST .../result`'s input entirely (that
+   endpoint's caller didn't have the information to report at the
+   time), and correspondingly dropped from the plain `OcrMeterEntry`
+   response shape (`GET /admin/meters/ocr-meter` and `.../result`'s own
+   response) — kept only on `.../result-test`/`GET .../ocr-meter-test`,
+   via a separate `OcrMeterEntryWithEngine` class.
+3. **Round 3 (confirmed, current) — the Worker switched to a
+   genuinely different concept: a summation score, not a small
+   enumerable lookup.** Built additively from three independent
+   checks: YOLO box detection (`+1000` if the digit box is incomplete/
+   missing), the local CNN reading it (`+100` if that failed), and a
+   Gemini cloud fallback (`+20` if it recovered a reading, `+10` if it
+   didn't). Confirmed example values: `0` = clean read start to finish;
+   `120`/`1120` = CNN failed but Gemini recovered it (auto-approved
+   either way, box-complete or not); `110`/`1110` = both CNN and
+   Gemini failed (sent for human review — `1110` specifically flagged
+   as "box incomplete too", worth a second look for a damaged meter or
+   a reshoot). Other combinations the formula allows (`10`, `20`,
+   `100`, `1000`, `1010`, `1020`, `1100`, ...) weren't individually
+   named by the Worker team but are equally valid — this is why the
+   column and the API are both a plain, unconstrained `int` now rather
+   than a small fixed set.
 
-**`POST .../result` no longer accepts this field at all, confirmed
-(round 2).** Its caller doesn't have this information to report — every
-row written through that endpoint gets `ocr_engine=1` (the DB column's
-own default), via `_submit_ocr_result()` being called with
-`ocr_engine=None` unconditionally rather than from a Form field.
-`.../result-test` is completely unaffected — this field is exactly as
-described above there, unchanged.
+**Where round 3 landed, concretely:**
+- **The `ocr_engine` lookup table is gone** (`DROP TABLE`, `db/init.sql`)
+  — nothing references it anymore.
+- **`ocr_meter`/`ocr_meter_test`'s `ocr_engine` column is `INT NOT NULL`,
+  no `REFERENCES`, no `DEFAULT`.** Migrated from round 1's shape via
+  `DROP CONSTRAINT` (the FK) → `DROP DEFAULT` → backfill any existing
+  `NULL` rows to `0` (a reasonable stand-in for "no score ever
+  reported" — chosen because `0` is round 3's own "cleanest possible
+  outcome" value, not because it claims to know what actually
+  happened) → `ALTER COLUMN ... SET NOT NULL`.
+- **Required again on `POST .../result`, confirmed — reversing round
+  2.** Both endpoints now require it identically; no validation beyond
+  "it's an integer" (FastAPI's own `Form(...)` coercion already
+  guarantees that much) — there's no small fixed set left to check
+  against.
+- **`OcrMeterEntryWithEngine` is gone.** `ocr_engine` lives directly in
+  `OcrMeterEntry` again (`app/schemas.py`), so it shows up everywhere
+  that model is used — `GET /admin/meters/ocr-meter`, `.../result`'s
+  own response, and (via `OcrMeterTestEntry`, which now extends
+  `OcrMeterEntry` directly) `.../ocr-meter-test` and `.../result-test`
+  too. One shape, no split.
 
-**`ocr_engine` doesn't show up in `.../result`'s own response either,
-nor in `GET /admin/meters/ocr-meter`, confirmed (round 3) — the two
-plain "clean ocr_meter" surfaces.** `OcrMeterEntry`
-(`app/schemas.py`) is back to exactly the 6 originally-confirmed
-fields, no `ocr_engine`, matching what `.../result` accepts as input
-(consistent: doesn't take it in, doesn't hand it back out either). A
-separate model, `OcrMeterEntryWithEngine(OcrMeterEntry)`, adds just
-that one field back — used only by `.../result-test`'s own response,
-and as the base `OcrMeterTestEntry` (`GET .../ocr-meter-test`) extends
-instead of plain `OcrMeterEntry`, so that listing keeps showing
-`ocr_engine` unaffected by this change. The underlying `ocr_meter`
-table still has the column, unchanged, still `DEFAULT 1` — every row
-just has it regardless of which endpoint wrote it; these two response
-models simply stop echoing a value back that's always the same
-constant `1` from `.../result`'s side, so it carries no real
-information there anyway.
-
-**Purely observational — no bearing on grouping, `is_test`, retries, or
-anything else.** Exists so the Worker team can later query "what % of
-captures needed the Gemini fallback" without re-deriving it from
-anything else.
+**No longer "purely observational"** — per the Worker team's own
+message confirming this round, the score is meant to drive their
+dashboard/workflow directly: `0`/`120`/`1120` auto-approve into their
+system immediately, `110` queues for a human to key in the reading,
+`1110` gets flagged for a possible damaged meter or reshoot. Still has
+zero bearing on this server's own logic, though — grouping, `is_test`,
+retries, `error_type`'s own validation are all untouched by whatever
+value `ocr_engine` carries.
 
 ### `dataset` — one central place to look up any image's file path
 
@@ -372,7 +383,9 @@ FK would have silently skipped adding it forever (the column already
 existing makes the whole statement a no-op). Fixed at the time by
 giving all 3 tables their own explicit, named `DROP CONSTRAINT IF
 EXISTS` + `ADD CONSTRAINT ... FOREIGN KEY` pair — same idempotent
-pattern used for `ocr_meter`'s `error_type`/`ocr_engine` FKs. Moot now
+pattern used for `ocr_meter`'s `error_type` FK (and, at the time this
+was written, `ocr_engine`'s too — that one's gone now, see "`ocr_engine`"
+above). Moot now
 that there's only one `images` table, but the underlying gotcha
 (`LIKE ... INCLUDING ALL` silently dropping FKs) is worth remembering
 if this pattern gets reused anywhere else.
