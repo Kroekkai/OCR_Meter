@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.auth import CurrentUser, get_admin_or_service
 from app.config import get_settings
 from app.db import pool, utility_type_for_meter_id
-from app.schemas import Esp32UploadLogEntry, MeterHistoryEntry, OcrMeterEntry, OcrMeterTestEntry
+from app.schemas import Esp32UploadLogEntry, MeterHistoryEntry, OcrEngineMeaningEntry, OcrMeterEntry, OcrMeterTestEntry
 
 router = APIRouter(prefix="/admin/meters", tags=["default"])
 
@@ -279,3 +279,28 @@ async def admin_list_esp32_upload_log(
         *params,
     )
     return [Esp32UploadLogEntry(**dict(r)) for r in rows]
+
+
+@router.get(
+    "/ocr-engine-meaning",
+    response_model=list[OcrEngineMeaningEntry],
+    summary="Admin List Ocr Engine Meaning",
+)
+async def admin_list_ocr_engine_meaning(
+    _: CurrentUser = Depends(get_admin_or_service),
+):
+    """
+    Confirmed request — ocr_engine_meaning (db/init.sql) is a reference
+    table mapping the Worker team's scoring-system codes to a
+    human-readable meaning/result_status/next_action, for the dashboard
+    (or anyone else) to look up when displaying an ocr_engine value from
+    GET .../ocr-meter or .../ocr-meter-test. Deliberately NOT joined
+    into either of those responses automatically — ocr_meter.ocr_engine
+    itself has no FK to this table (confirmed: it must keep accepting
+    any integer the Worker's formula can produce, not just the 5 this
+    table documents so far), so a code with no matching row here is
+    entirely expected, not an error. Small, static table (currently 5
+    rows) — returns everything, no pagination.
+    """
+    rows = await pool().fetch("SELECT * FROM ocr_engine_meaning ORDER BY code")
+    return [OcrEngineMeaningEntry(**dict(r)) for r in rows]
