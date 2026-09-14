@@ -292,15 +292,17 @@ async def admin_list_ocr_engine_meaning(
     """
     Confirmed request — ocr_engine_meaning (db/init.sql) is a reference
     table mapping the Worker team's scoring-system codes to a
-    human-readable meaning/result_status/next_action, for the dashboard
-    (or anyone else) to look up when displaying an ocr_engine value from
-    GET .../ocr-meter or .../ocr-meter-test. Deliberately NOT joined
-    into either of those responses automatically — ocr_meter.ocr_engine
-    itself has no FK to this table (confirmed: it must keep accepting
-    any integer the Worker's formula can produce, not just the 5 this
-    table documents so far), so a code with no matching row here is
-    entirely expected, not an error. Small, static table (currently 5
-    rows) — returns everything, no pagination.
+    human-readable meaning, for the dashboard (or anyone else) to look
+    up when displaying an ocr_engine value from GET .../ocr-meter or
+    .../ocr-meter-test. Not joined into either of those responses
+    automatically — ocr_meter.ocr_engine does have a real FK to this
+    table now (round 4, confirmed — the Worker team confirmed a second
+    time that exactly these 5 codes are the only ones ever sent), but
+    that just guarantees every value written there has a matching row
+    here; it doesn't mean the two are joined together automatically —
+    displaying a result and looking up what its score means stay two
+    separate calls, this endpoint being the second one. Small, static
+    table (currently 5 rows) — returns everything, no pagination.
     """
     rows = await pool().fetch("SELECT * FROM ocr_engine_meaning ORDER BY code")
     return [OcrEngineMeaningEntry(**dict(r)) for r in rows]

@@ -299,8 +299,12 @@ class Esp32UploadLogEntry(BaseModel):
 class OcrEngineMeaningEntry(BaseModel):
     code: int
     meaning: str
-    result_status: str
-    next_action: str
+    """
+    Confirmed request — result_status/next_action columns removed
+    (unused). This single field now carries the score's origin,
+    approval status, and next action together as one description, per
+    db/init.sql's ocr_engine_meaning table.
+    """
 
 
 # --------------------------------------------------------------------------

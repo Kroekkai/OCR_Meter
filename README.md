@@ -339,12 +339,16 @@ value `ocr_engine` carries.
 
 **`ocr_engine_meaning` — confirmed request, added the same round as the
 score system's round 3 (before the FK came back in round 4).** A
-reference table mirroring `error_type`'s shape (`code` + description
-columns) so the 5 confirmed score meanings above have a queryable home
-— `code`, `meaning`, `result_status`, `next_action`. **Now IS the FK
-target for `ocr_meter`/`ocr_meter_test`.ocr_engine** (round 4, confirmed
-— round 3 had it deliberately NOT be one, back when the value set
-wasn't confirmed fixed yet). Exposed read-only via
+reference table mirroring `error_type`'s shape (`code` + a single
+description column) so the 5 confirmed score meanings above have a
+queryable home — just `code`, `meaning`. Originally had
+`result_status`/`next_action` as separate columns too — confirmed
+request, removed again shortly after (unused) and folded into `meaning`
+as one combined description instead (`DROP COLUMN IF EXISTS` for both,
+`db/init.sql` — no-op on a fresh install that never had them). **Now IS
+the FK target for `ocr_meter`/`ocr_meter_test`.ocr_engine** (round 4,
+confirmed — round 3 had it deliberately NOT be one, back when the value
+set wasn't confirmed fixed yet). Exposed read-only via
 `GET /admin/meters/ocr-engine-meaning` (`app/routers/meters.py`) —
 small static list, no pagination, not auto-joined into `.../ocr-meter`'s
 or `.../ocr-meter-test`'s own response (whoever displays a result is
