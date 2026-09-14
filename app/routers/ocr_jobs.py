@@ -7,7 +7,7 @@ from app.auth import CurrentUser, get_admin_or_service, get_ocr_client
 from app.db import pool
 from app.filename import BANGKOK_TZ, is_test_filename
 from app.repo import get_group_images
-from app.schemas import JobStatus, OcrClaimResponse, OcrFailRequest, OcrJobOut, OcrMeterEntry
+from app.schemas import JobStatus, OcrClaimResponse, OcrFailRequest, OcrJobOut, OcrMeterEntry, VALID_OCR_ENGINE_CODES
 from app import storage
 
 logger = logging.getLogger("ocr_meter_store.ocr_jobs")
@@ -131,17 +131,18 @@ async def _submit_ocr_result(
     cosmetic — without this check, calling either endpoint for any job
     would silently do the same thing the old single endpoint did.
 
-    ocr_engine (confirmed, Worker team spec, round 3) is now REQUIRED
-    on both endpoints, no default, no validation against a small fixed
-    set — see OcrEngineType's own comment in app/schemas.py for the
-    full story of the Worker's scoring system this now carries. An
-    earlier round had this optional (defaulting to 1/LOCAL when
-    omitted) and validated against just {1, 2} — both are gone now:
-    the Worker always reports a real score, and the score can
-    legitimately be many different values (the additive combinations
-    of YOLO/CNN/Gemini outcomes), so there's nothing meaningful left to
-    validate against beyond "it's an integer" (which FastAPI's own
-    Form(...) type coercion already guarantees).
+    ocr_engine (confirmed, Worker team spec, round 4 — confirmed a
+    second time) is required on both endpoints, validated against
+    exactly 5 known codes — see VALID_OCR_ENGINE_CODES /
+    OcrEngineType's own comment in app/schemas.py for the full story.
+    An earlier round (3) had this as an unconstrained int, reasoning
+    that the additive scoring formula could legitimately produce many
+    more values than the 5 documented — the Worker team has since
+    confirmed explicitly, a second time, that only these 5 are ever
+    actually sent, so validating against them directly gives a much
+    clearer 422 error for a Worker-side bug than letting a typo trip
+    the DB's FK constraint (ocr_engine -> ocr_engine_meaning(code),
+    also reinstated this round) instead.
     """
     VALID_CODES = (0, 1, 2, 3)
     NO_READING_CODES = (1, 2)
@@ -161,6 +162,11 @@ async def _submit_ocr_result(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"ocr_reading must be omitted when error_type={error_type} — there is no reading to report",
+        )
+    if ocr_engine not in VALID_OCR_ENGINE_CODES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"ocr_engine must be one of {VALID_OCR_ENGINE_CODES} — got {ocr_engine!r}",
         )
 
     async with pool().acquire() as conn:
@@ -259,12 +265,13 @@ async def admin_submit_ocr_result(
     ocr_engine: int = Form(
         ...,
         description=(
-            "Always required (confirmed, Worker team spec, round 3). The Worker's scoring system — "
+            "Always required (confirmed, Worker team spec, round 4). The Worker's scoring system — "
             "a summed score built from YOLO box detection (+1000 if incomplete), local CNN reading "
             "(+100 if it failed), and Gemini cloud fallback (+20 if it recovered, +10 if it didn't). "
-            "0 = clean read, no fallback needed. Not validated against a fixed set here (unlike "
-            "error_type) — the additive scoring means many values are legitimately possible, not just "
-            "the handful the Worker team has documented so far."
+            "Must be one of exactly 5 values: 0, 110, 120, 1110, or 1120 — validated by hand in the "
+            "function body (same reason as error_type above: a Literal type on a Form() field doesn't "
+            "reliably coerce the string multipart/form-data sends). See "
+            "GET /admin/meters/ocr-engine-meaning for what each one means."
         ),
     ),
     _: CurrentUser = Depends(get_ocr_client),
@@ -296,7 +303,10 @@ async def admin_submit_ocr_result(
     information for their own workflow (0/120/1120 → auto-approve, 110 →
     manual entry queue, 1110 → flag for possible meter damage/reshoot),
     not just incidental stats anymore — see OcrEngineType's own comment
-    in app/schemas.py for the full story.
+    in app/schemas.py for the full story. (Round 4, confirmed a second
+    time: validated against exactly those 5 codes now, and a matching
+    FK exists in the DB too — see ocr_engine's own Form() description
+    above.)
 
     capture_date/capture_time are no longer client-supplied — they're
     derived from the job's own device_timestamp (when ESP32 captured the

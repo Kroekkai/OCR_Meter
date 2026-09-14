@@ -31,17 +31,30 @@ point.
 # ความหมายเต็มอยู่ที่ตาราง error_type ใน DB (single source of truth)
 OcrErrorType = Literal[0, 1, 2, 3]
 
-# ระบบคะแนนสะสม (Summation Score System) — ยืนยันรอบ 2 จากทีม Worker,
-# แทนที่ lookup เดิม (1=LOCAL, 2=GEMINI) ทั้งหมด คำนวณจาก YOLO หากล่อง
-# ตัวเลขไม่ครบ +1000, Local OCR/CNN อ่านไม่ออก +100, Gemini (fallback)
-# กู้สำเร็จ +20 / กู้ไม่ผ่าน +10 — ตัวอย่างค่าที่ทีม Worker ยืนยัน: 0, 120,
-# 1120 (auto-approve), 110, 1110 (ส่งคนตรวจ) — ค่าอื่นที่ไม่ได้ยกตัวอย่าง
-# ไว้ (10, 20, 100, 1000, 1010, 1020, 1100) ก็เป็นไปได้ตามสูตรเดียวกัน จึง
-# เป็น int ทั่วไป ไม่ใช่ Literal ของค่าที่ enumerate ไว้ตายตัวอีกต่อไป
-# (ต่างจาก OcrErrorType ด้านบน ซึ่งยังเป็น Literal ได้เพราะค่าคงที่แค่ 4
-# ค่าจริงๆ) — ไม่มี FK ไป lookup table ใดๆ ใน DB แล้วเช่นกัน (ตารางเดิม
-# ocr_engine ถูก DROP ไปแล้ว — ดู db/init.sql)
-OcrEngineType = int
+# ระบบคะแนนสะสม (Summation Score System) — ยืนยันรอบ 4 จากทีม Worker
+# (ยืนยันครั้งที่ 2), แทนที่ lookup เดิม (1=LOCAL, 2=GEMINI) ทั้งหมด
+# คำนวณจาก YOLO หากล่องตัวเลขไม่ครบ +1000, Local OCR/CNN อ่านไม่ออก +100,
+# Gemini (fallback) กู้สำเร็จ +20 / กู้ไม่ผ่าน +10 — **ยืนยันชัดเจนแล้วว่า
+# มีแค่ 5 ค่านี้เท่านั้นจริงๆ ไม่มีค่าอื่นอีกเลย**: 0, 120, 1120
+# (auto-approve), 110, 1110 (ส่งคนตรวจ) — round 3 เคยเข้าใจผิดว่าค่าอื่น
+# ตามสูตร (10, 20, 100, 1000, 1010, 1020, 1100) อาจถูกส่งมาด้วย เลยเปลี่ยน
+# เป็น int ทั่วไปไปก่อน ตอนนี้กลับมาเป็น Literal ของ 5 ค่าจริงได้แล้ว —
+# ปลอดภัยบน RESPONSE model แบบเดียวกับ OcrErrorType ด้านบน (มาจาก int จริง
+# ที่ DB คืนมา ไม่ใช่ raw multipart string ที่มีปัญหาเรื่อง type coercion)
+# มี FK ไป ocr_engine_meaning(code) ใน DB แล้วด้วย (db/init.sql) — Literal
+# ตรงนี้เป็นการบังคับซ้ำอีกชั้นในระดับ API/response, ไม่ใช่ตัวเดียวที่คุม
+OcrEngineType = Literal[0, 110, 120, 1110, 1120]
+
+VALID_OCR_ENGINE_CODES = (0, 110, 120, 1110, 1120)
+"""
+Confirmed request (round 4) — the same 5 values as OcrEngineType above,
+kept as a plain tuple too for app/routers/ocr_jobs.py to validate a raw
+Form(...) int against (mirrors error_type's own VALID_CODES pattern
+there — a Literal type annotation directly on a Form() field doesn't
+reliably coerce the string "0"/"110"/etc. that multipart/form-data
+always sends, and rejects it with a confusing 422 instead of the
+clearer hand-written error message this enables).
+"""
 
 
 # --------------------------------------------------------------------------
@@ -273,6 +286,21 @@ class Esp32UploadLogEntry(BaseModel):
     net_mode: str | None
     carrier: str | None
     wakeup_reason: str | None
+
+
+# --------------------------------------------------------------------------
+# ocr_engine_meaning — confirmed request: a reference table mirroring
+# error_type's role (code + human-readable description), but NOT a FK
+# target for ocr_meter/ocr_meter_test.ocr_engine — that column must stay
+# able to accept any integer (see OcrEngineType's own comment), not just
+# the 5 the Worker team has documented so far. Purely for lookup/display
+# — see app/routers/meters.py::admin_list_ocr_engine_meaning().
+# --------------------------------------------------------------------------
+class OcrEngineMeaningEntry(BaseModel):
+    code: int
+    meaning: str
+    result_status: str
+    next_action: str
 
 
 # --------------------------------------------------------------------------

@@ -267,11 +267,11 @@ curl -s "http://localhost:3003/admin/meters/e101/ocr-readings?limit=3&only_succe
 # if (new_reading - 1310) > 165 -> submit /result with error_type=3
 ```
 
-### `ocr_engine` — Worker's scoring system (round 3, confirmed current)
+### `ocr_engine` — Worker's scoring system (round 4, confirmed current)
 
 Not in either original spec doc — a later addition from the Worker
-team, gone through three full rounds. Worth recording the arc, since a
-future change might reasonably revisit it again:
+team, gone through four full rounds now. Worth recording the arc, since
+a future change might reasonably revisit it again:
 
 1. **Round 1**: a lookup table, same pattern as `error_type` —
    `db/init.sql`'s `ocr_engine` table (`1, 'LOCAL (YOLO+CNN)'` /
@@ -285,44 +285,48 @@ future change might reasonably revisit it again:
    response shape (`GET /admin/meters/ocr-meter` and `.../result`'s own
    response) — kept only on `.../result-test`/`GET .../ocr-meter-test`,
    via a separate `OcrMeterEntryWithEngine` class.
-3. **Round 3 (confirmed, current) — the Worker switched to a
-   genuinely different concept: a summation score, not a small
-   enumerable lookup.** Built additively from three independent
-   checks: YOLO box detection (`+1000` if the digit box is incomplete/
-   missing), the local CNN reading it (`+100` if that failed), and a
-   Gemini cloud fallback (`+20` if it recovered a reading, `+10` if it
-   didn't). Confirmed example values: `0` = clean read start to finish;
-   `120`/`1120` = CNN failed but Gemini recovered it (auto-approved
-   either way, box-complete or not); `110`/`1110` = both CNN and
-   Gemini failed (sent for human review — `1110` specifically flagged
-   as "box incomplete too", worth a second look for a damaged meter or
-   a reshoot). Other combinations the formula allows (`10`, `20`,
-   `100`, `1000`, `1010`, `1020`, `1100`, ...) weren't individually
-   named by the Worker team but are equally valid — this is why the
-   column and the API are both a plain, unconstrained `int` now rather
-   than a small fixed set.
+3. **Round 3**: the Worker switched to a genuinely different concept —
+   a summation score, not a small enumerable lookup. Built additively
+   from three independent checks: YOLO box detection (`+1000` if the
+   digit box is incomplete/missing), the local CNN reading it (`+100`
+   if that failed), and a Gemini cloud fallback (`+20` if it recovered
+   a reading, `+10` if it didn't). At the time, other combinations the
+   formula allows (`10`, `20`, `100`, `1000`, `1010`, `1020`, `1100`,
+   ...) were assumed to be equally valid alongside the 5 the Worker
+   team had named — so the column and the API were both made a plain,
+   unconstrained `int`, the `ocr_engine` lookup table was dropped
+   entirely, and `ocr_engine`/`ocr_engine_test` both required it again
+   with no validation beyond "it's an integer".
+4. **Round 4 (confirmed, current) — the Worker team confirmed a second
+   time, explicitly, that only 5 values are EVER actually sent: `0`,
+   `120`, `1120` (auto-approve), `110`, `1110` (send for human review —
+   `1110` specifically flagged as "box incomplete too", worth a second
+   look for a damaged meter or a reshoot). Round 3's assumption that
+   other additive combinations might show up in practice was wrong —
+   validation and the FK are both back, now that the fixed set is
+   confirmed genuinely fixed.**
 
-**Where round 3 landed, concretely:**
-- **The `ocr_engine` lookup table is gone** (`DROP TABLE`, `db/init.sql`)
-  — nothing references it anymore.
-- **`ocr_meter`/`ocr_meter_test`'s `ocr_engine` column is `INT NOT NULL`,
-  no `REFERENCES`, no `DEFAULT`.** Migrated from round 1's shape via
-  `DROP CONSTRAINT` (the FK) → `DROP DEFAULT` → backfill any existing
-  `NULL` rows to `0` (a reasonable stand-in for "no score ever
-  reported" — chosen because `0` is round 3's own "cleanest possible
-  outcome" value, not because it claims to know what actually
-  happened) → `ALTER COLUMN ... SET NOT NULL`.
-- **Required again on `POST .../result`, confirmed — reversing round
-  2.** Both endpoints now require it identically; no validation beyond
-  "it's an integer" (FastAPI's own `Form(...)` coercion already
-  guarantees that much) — there's no small fixed set left to check
-  against.
-- **`OcrMeterEntryWithEngine` is gone.** `ocr_engine` lives directly in
-  `OcrMeterEntry` again (`app/schemas.py`), so it shows up everywhere
-  that model is used — `GET /admin/meters/ocr-meter`, `.../result`'s
-  own response, and (via `OcrMeterTestEntry`, which now extends
-  `OcrMeterEntry` directly) `.../ocr-meter-test` and `.../result-test`
-  too. One shape, no split.
+**Where round 4 landed, concretely:**
+- **`ocr_meter`/`ocr_meter_test`'s `ocr_engine` column is `INT NOT NULL
+  REFERENCES ocr_engine_meaning(code)`** — a real FK again, this time
+  pointing at `ocr_engine_meaning` (see below) instead of round 1's old
+  `ocr_engine` table. Migrated via `DROP CONSTRAINT` → `DROP DEFAULT` →
+  backfill any row whose value isn't one of the 5 confirmed codes
+  (`NULL`, or a leftover `1`/`2` from round 1) to `0` → `SET NOT NULL`
+  → `ADD CONSTRAINT` the new FK — in that order, so the constraint
+  never gets added before the data actually satisfies it.
+- **Validated by hand again** in `app/routers/ocr_jobs.py`'s
+  `_submit_ocr_result()`, against `VALID_OCR_ENGINE_CODES` /
+  `OcrEngineType` (`app/schemas.py`, now `Literal[0, 110, 120, 1110, 1120]`)
+  — same reasoning as `error_type`'s own hand-written check: a `Literal`
+  type directly on a `Form(...)` field doesn't reliably coerce the
+  string multipart/form-data always sends, so validating in the
+  function body gives a clearer 422 than letting a typo trip the DB's
+  FK constraint instead.
+- **Still required on both `POST .../result` and `.../result-test`**
+  (unchanged since round 3), still shown on both `GET /admin/meters/ocr-meter`
+  and `.../ocr-meter-test` (unchanged since round 3 merged
+  `OcrMeterEntryWithEngine` back into plain `OcrMeterEntry`).
 
 **No longer "purely observational"** — per the Worker team's own
 message confirming this round, the score is meant to drive their
@@ -332,6 +336,20 @@ system immediately, `110` queues for a human to key in the reading,
 zero bearing on this server's own logic, though — grouping, `is_test`,
 retries, `error_type`'s own validation are all untouched by whatever
 value `ocr_engine` carries.
+
+**`ocr_engine_meaning` — confirmed request, added the same round as the
+score system's round 3 (before the FK came back in round 4).** A
+reference table mirroring `error_type`'s shape (`code` + description
+columns) so the 5 confirmed score meanings above have a queryable home
+— `code`, `meaning`, `result_status`, `next_action`. **Now IS the FK
+target for `ocr_meter`/`ocr_meter_test`.ocr_engine** (round 4, confirmed
+— round 3 had it deliberately NOT be one, back when the value set
+wasn't confirmed fixed yet). Exposed read-only via
+`GET /admin/meters/ocr-engine-meaning` (`app/routers/meters.py`) —
+small static list, no pagination, not auto-joined into `.../ocr-meter`'s
+or `.../ocr-meter-test`'s own response (whoever displays a result is
+expected to look the meaning up separately, e.g. the dashboard, rather
+than this being baked into the result payload itself).
 
 ### `dataset` — one central place to look up any image's file path
 
