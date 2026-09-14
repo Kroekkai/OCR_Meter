@@ -97,6 +97,17 @@ class Settings(BaseSettings):
     # decision gets stored (still a "_Test" filename suffix, just
     # decided differently now).
 
+    # --- External push (Store system) --------------------------------------
+    # NOT wired up to anything yet — placeholder config for
+    # app/external_push.py, which is a standalone function only, not yet
+    # called from anywhere. Waiting on the real URL + auth scheme from
+    # the receiving team before this gets any real values or gets
+    # triggered automatically. Defaults are empty on purpose — a blank
+    # URL is a clear signal (not a silent wrong-endpoint call) that this
+    # hasn't been configured yet.
+    external_push_url: str = ""
+    external_push_api_key: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:
