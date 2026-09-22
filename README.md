@@ -46,7 +46,7 @@ and plus one addition, both marked below):
 
 ```
 GET    /health
-POST   /register
+POST   /register                                    [admin JWT]     (confirmed security fix — was open to anyone, see "POST /register" below)
 POST   /login
 GET    /admin/users                              [admin JWT]
 POST   /admin/users                               [admin JWT]
@@ -125,6 +125,55 @@ python -m scripts.create_user --username ocr-service --password '<throwaway>' --
 Also use `scripts/create_user.py` to create the very first human admin
 account (chicken-and-egg: `POST /admin/users` itself requires an
 existing admin).
+
+## `POST /register` — confirmed security incident, now admin-only
+
+**This endpoint had NO auth at all until this fix — anyone who found
+the URL could self-register a working account.** Confirmed exploited
+in practice: a batch of bot-registered accounts with random-looking
+usernames (`artexops1`, `artexops9`, `artex7667`, `artx7`, `ocruser01`,
+`artxuser1`) turned up in the `users` table, spread across several
+days — discovered by the admin directly in the DB, not created by
+them. The pattern (meaningless usernames, no relation to any real
+person, spaced-out timestamps) points at automated scanning + registration
+abuse, not a targeted attack on this system specifically — the kind of
+thing that finds any open, unauthenticated POST endpoint on the public
+internet sooner or later.
+
+**Made worse by a second bug found at the same time, now also fixed:**
+`get_uploader()` and `get_admin_or_service()` — the dependencies behind
+`POST /images/upload`, `GET /devices/config`, and every read-mostly
+`/admin/images*`/`/admin/meters/*` route — accepted **any** valid JWT
+on the fallback path, regardless of the account's `is_admin`/`is_device`
+flags, despite both functions' own docstrings always describing the
+intent as "a real device/admin account", never "any registered user
+whatsoever". Combined with the open `/register`, this meant a
+self-registered account (`is_admin=false`, `is_device=false`) could
+have uploaded fake images or read admin-only listings — not just held
+a dormant, harmless login. Both dependencies now explicitly check the
+account's role and reject with `403` if it doesn't qualify.
+
+**`POST /register` itself is now admin-only** (`Depends(get_current_admin)`,
+same as every other `/admin/*` write) — confirmed request: kept the
+endpoint (rather than removing it in favor of only
+`scripts/create_user.py`) since an admin may want to create accounts
+from the dashboard without shell access to the server; just no longer
+reachable by an anonymous caller.
+
+**Cleanup this requires that isn't a code change:** the bot-registered
+rows above are still sitting in the `users` table on whatever
+environment this was found in — this fix stops new ones, it doesn't
+retroactively remove the existing ones. Delete them directly:
+```sql
+DELETE FROM users WHERE username IN
+  ('artexops1', 'artexops9', 'artex7667', 'artx7', 'ocruser01', 'artxuser1');
+```
+Check first whether any of those accounts' JWTs were actually used
+against `/images/upload` or the admin-read routes while the second bug
+above was still live (worth a quick look at server logs for those
+usernames, or for `images`/`ocr_jobs` rows with a suspicious source)
+before assuming no actual damage was done beyond the registration
+itself.
 
 ## The stuck-retry bug (`OCR_API_URL is not configured`, attempts > 2500)
 

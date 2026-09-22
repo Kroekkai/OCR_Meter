@@ -202,7 +202,20 @@ async def get_uploader(
         if via_raw_auth_header is not None:
             return via_raw_auth_header
     if authorization:
-        return await _user_from_header_token(authorization)
+        user = await _user_from_header_token(authorization)
+        if not (user.is_device or user.is_admin):
+            # Confirmed security fix — this used to accept ANY valid
+            # JWT here regardless of role, meaning a plain self-
+            # registered account (is_admin=false, is_device=false) could
+            # call POST /images/upload / GET /devices/config same as a
+            # real device or an admin. Exploited in practice by a batch
+            # of bot-registered accounts (see POST /register's own
+            # docstring) — now requires the account to actually be
+            # is_device or is_admin, matching what this dependency's own
+            # docstring always claimed ("a real JWT login" was never
+            # meant to mean "any user account whatsoever").
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Device or admin privileges required")
+        return user
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Provide either an Authorization: Bearer token or X-Device-Key",
@@ -254,7 +267,16 @@ async def get_admin_or_service(
         if via_key is not None:
             return via_key
     if authorization:
-        return await _user_from_header_token(authorization)
+        user = await _user_from_header_token(authorization)
+        if not user.is_admin:
+            # Confirmed security fix — same bug as get_uploader() above:
+            # this used to accept ANY valid JWT, so a plain self-
+            # registered account (is_admin=false) could read every
+            # /admin/images* and /admin/meters/* endpoint, despite this
+            # function's own docstring always saying "admin JWT". Now
+            # actually enforces that.
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
+        return user
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Provide an Authorization: Bearer token, X-Device-Key, or X-OCR-Key",
