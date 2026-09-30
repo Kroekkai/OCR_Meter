@@ -416,8 +416,10 @@ class ExternalApiKeyStatus(BaseModel):
     # pushes for this meter are paused until a new key is saved or
     # verify-external passes. Error text only, never the key itself.
     auth_failed_at: dt.datetime | None = None
-    auth_failed_status: int | None = None
-    auth_failed_message: str | None = None
+    # str, not dict — same reason as PushExternalResult.push_last_response:
+    # asyncpg returns JSONB as a raw JSON string, never auto-parsed.
+    # Shape when set: {"status": 401 | 403, "message": "..."}
+    auth_failed_info: str | None = None
 
 
 # --------------------------------------------------------------------------

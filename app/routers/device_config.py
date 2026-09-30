@@ -362,9 +362,8 @@ async def admin_set_external_api_key(
                 -- new key -> lift any 401/403 pause; queued blocked_auth
                 -- rows go out on the next sweep (spec 2.1: ออก key ใหม่)
                 auth_failed_at = NULL,
-                auth_failed_status = NULL,
-                auth_failed_message = NULL
-            RETURNING meter_id, is_active, created_at, rotated_at, auth_failed_at, auth_failed_status, auth_failed_message
+                auth_failed_info = NULL
+            RETURNING meter_id, is_active, created_at, rotated_at, auth_failed_at, auth_failed_info
             """,
             meter_id,
             encrypted,
@@ -376,8 +375,7 @@ async def admin_set_external_api_key(
         created_at=row["created_at"],
         rotated_at=row["rotated_at"],
         auth_failed_at=row["auth_failed_at"],
-        auth_failed_status=row["auth_failed_status"],
-        auth_failed_message=row["auth_failed_message"],
+        auth_failed_info=row["auth_failed_info"],
     )
 
 
@@ -404,7 +402,7 @@ async def admin_get_external_api_key_status(
     """
     meter_id = meter_id.strip().upper()
     row = await pool().fetchrow(
-        "SELECT meter_id, is_active, created_at, rotated_at, auth_failed_at, auth_failed_status, auth_failed_message"
+        "SELECT meter_id, is_active, created_at, rotated_at, auth_failed_at, auth_failed_info"
         " FROM external_api_keys WHERE meter_id = $1",
         meter_id,
     )
@@ -417,8 +415,7 @@ async def admin_get_external_api_key_status(
         created_at=row["created_at"],
         rotated_at=row["rotated_at"],
         auth_failed_at=row["auth_failed_at"],
-        auth_failed_status=row["auth_failed_status"],
-        auth_failed_message=row["auth_failed_message"],
+        auth_failed_info=row["auth_failed_info"],
     )
 
 
@@ -503,7 +500,7 @@ async def admin_verify_external_device(
     await pool().execute(
         """
         UPDATE external_api_keys
-        SET auth_failed_at = NULL, auth_failed_status = NULL, auth_failed_message = NULL
+        SET auth_failed_at = NULL, auth_failed_info = NULL
         WHERE meter_id = $1 AND auth_failed_at IS NOT NULL
         """,
         meter_id,

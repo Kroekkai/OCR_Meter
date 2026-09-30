@@ -897,7 +897,13 @@
       const whenPart = st.rotated_at ? new Date(st.rotated_at).toLocaleString("th-TH") : "-";
       let authPart = "";
       if (st.auth_failed_at) {
-        authPart = " · ⚠ หยุดส่งอยู่: CFO Platform ตอบ " + (st.auth_failed_status || "401/403") +
+        // auth_failed_info — JSON string จาก backend (JSONB ไม่ auto-parse), parse เอง
+        let statusPart = "401/403";
+        try {
+          const info = JSON.parse(st.auth_failed_info || "{}");
+          if (info.status) statusPart = String(info.status);
+        } catch (e) { /* ไม่ใช่ JSON ที่คาดไว้ — ใช้ค่า default */ }
+        authPart = " · ⚠ หยุดส่งอยู่: CFO Platform ตอบ " + statusPart +
           " เมื่อ " + new Date(st.auth_failed_at).toLocaleString("th-TH") +
           " — ใส่ key ใหม่ หรือกดตรวจอุปกรณ์เพื่อส่งต่อ";
       }

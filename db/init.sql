@@ -996,9 +996,36 @@ CREATE TABLE IF NOT EXISTS external_api_keys (
 --       เปิดใช้งานเครื่อง / แก้ IP whitelist ให้แล้วโดยกุญแจเดิมยังใช้ได้, หรือ
 --   (ค) admin กด manual push แล้วสำเร็จ
 -- รายการที่ค้างอยู่ (push_status = 'blocked_auth') จะถูกส่งต่อเองอัตโนมัติ
-ALTER TABLE external_api_keys ADD COLUMN IF NOT EXISTS auth_failed_at      TIMESTAMPTZ;
-ALTER TABLE external_api_keys ADD COLUMN IF NOT EXISTS auth_failed_status  INT;
-ALTER TABLE external_api_keys ADD COLUMN IF NOT EXISTS auth_failed_message TEXT;
+--
+-- auth_failed_at แยกเป็นคอลัมน์ของตัวเอง เพราะถูก WHERE/IS NOT NULL ตรงๆ
+-- หลายจุด (sweep query, push_immediately_if_configured) — แยกจริงจึงคุ้ม.
+-- ส่วน status (401/403) กับ message (ข้อความจาก CFO Platform) ไม่เคยถูก
+-- query แยกกันเลยสักที่ มีไว้แค่โชว์ตอน debug/แจ้งเตือน — เหตุผลเดียวกับที่
+-- ocr_meter.push_last_response ถูกยุบมาก่อนหน้านี้ — จึงรวมเป็น JSONB เดียว
+-- (auth_failed_info) ตั้งแต่แรกแทนที่จะแยก 2 คอลัมน์ไว้ก่อนแล้วมายุบทีหลัง.
+--   ตอนถูกบล็อก: {"status": 401, "message": "..."}
+--   NULL = ไม่เคยถูกบล็อก หรือถูกล้างแล้ว (auth_failed_at ก็ NULL พร้อมกันเสมอ)
+ALTER TABLE external_api_keys ADD COLUMN IF NOT EXISTS auth_failed_at   TIMESTAMPTZ;
+ALTER TABLE external_api_keys ADD COLUMN IF NOT EXISTS auth_failed_info JSONB;
+
+-- Migration (idempotent): เวอร์ชันก่อนหน้านี้เคยแยก auth_failed_status/
+-- auth_failed_message เป็น 2 คอลัมน์ — ย้ายข้อมูลเข้า auth_failed_info
+-- ก่อนแล้วค่อยลบทิ้ง ป้องกันข้อมูลที่ deploy ไปแล้วหาย (ถ้าเคยถูกบล็อกไว้
+-- ก่อนอัปเกรดรอบนี้). ทำเงื่อนไขด้วย DO block เพราะ UPDATE ... SET
+-- auth_failed_info จะ error ถ้าคอลัมน์เก่าไม่มีอยู่แล้ว (DB ที่เพิ่งสร้างใหม่).
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'external_api_keys' AND column_name = 'auth_failed_status'
+    ) THEN
+        UPDATE external_api_keys
+        SET auth_failed_info = jsonb_build_object('status', auth_failed_status, 'message', auth_failed_message)
+        WHERE auth_failed_info IS NULL AND (auth_failed_status IS NOT NULL OR auth_failed_message IS NOT NULL);
+        ALTER TABLE external_api_keys DROP COLUMN auth_failed_status;
+        ALTER TABLE external_api_keys DROP COLUMN auth_failed_message;
+    END IF;
+END $$;
 
 -- One-off migration (idempotent): แถวที่เคยโดน 401/403 ในเวอร์ชันก่อนถูก
 -- ตั้งเป็น failed_permanent ซึ่งไม่มีทางกลับมาส่งเองได้อีก — ย้ายเป็น

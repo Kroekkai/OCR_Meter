@@ -675,12 +675,11 @@ async def _set_key_auth_block(conn, meter_id: str, status_code: int, message: st
     await conn.execute(
         """
         UPDATE external_api_keys
-        SET auth_failed_at = now(), auth_failed_status = $2, auth_failed_message = $3
+        SET auth_failed_at = now(), auth_failed_info = $2
         WHERE meter_id = $1
         """,
         meter_id,
-        status_code,
-        message[:1000],
+        json.dumps({"status": status_code, "message": message[:1000]}),
     )
     logger.warning(
         "CFO Platform rejected the API key for %s (HTTP %s: %s) — pushes for this meter are paused until an admin fixes it",
@@ -694,7 +693,7 @@ async def _clear_key_auth_block(conn, meter_id: str) -> None:
     await conn.execute(
         """
         UPDATE external_api_keys
-        SET auth_failed_at = NULL, auth_failed_status = NULL, auth_failed_message = NULL
+        SET auth_failed_at = NULL, auth_failed_info = NULL
         WHERE meter_id = $1 AND auth_failed_at IS NOT NULL
         """,
         meter_id,
