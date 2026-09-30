@@ -168,7 +168,7 @@ class OcrFailRequest(BaseModel):
 
 
 class OcrManualEditRequest(BaseModel):
-    ocr_reading: float
+    ocr_reading: float = Field(ge=0, description="A meter's cumulative reading can't be negative — spec's own aiValue field is documented as \"number ≥0\".")
 
 
 # --------------------------------------------------------------------------
@@ -227,6 +227,27 @@ class OcrMeterEntry(BaseModel):
     surface (this class, used by GET /admin/meters/ocr-meter too) same
     as every other field here. OcrMeterEntryWithEngine is gone — this
     class alone now covers every place ocr_engine needs to show up.
+    """
+    confidence: float | None
+    """
+    Confirmed request (CFO Platform integration) — the Worker reports
+    this directly (0-100), NOT something derived/calculated from
+    ocr_engine on our end — the two are separate, independently-reported
+    values (ocr_engine is our own internal routing score; confidence is
+    what gets forwarded to CFO Platform's own aiValue/confidence field
+    largely as-is). Optional: a completely failed read may have no
+    meaningful confidence to report, and Worker deployments from before
+    this field existed still work without sending it at all.
+    """
+    external_ref: str | None
+    """
+    Confirmed decision ("แบบ A"): generated and persisted at OCR-result
+    time (right here, in _submit_ocr_result()), not deferred until the
+    first push attempt — format <SN>-<YYYYMMDD>-<HHmm>, see
+    app/external_push.py::generate_external_ref(). Exposed here mainly
+    for visibility/debugging (so this value is visible immediately via
+    the API rather than only queryable straight from the DB) — nothing
+    about pushing to CFO Platform reads it back through this schema.
     """
 
 
@@ -299,6 +320,24 @@ class Esp32UploadLogEntry(BaseModel):
 class OcrEngineMeaningEntry(BaseModel):
     code: int
     meaning: str
+
+
+# --------------------------------------------------------------------------
+# PushExternalResult — confirmed request (ข้อ 17): response shape for
+# POST /admin/meters/ocr-meter/{id}/push-external, the manual/one-off
+# push endpoint. Mirrors ocr_meter's own push_* columns directly (see
+# db/init.sql) rather than reusing OcrMeterEntry, since this response
+# is specifically ABOUT the push attempt's outcome, not the reading
+# itself — outcome is the one field not stored anywhere, computed
+# fresh by attempt_push_for_row() each call.
+class PushExternalResult(BaseModel):
+    outcome: str  # "success" | "failed_retryable" | "failed_permanent" — this attempt's own result, see app/external_push.py::attempt_push_for_row()
+    push_status: str
+    push_attempt_count: int
+    push_last_error: str | None
+    push_response_id: str | None
+    push_cfo_status: str | None
+    push_meter_matched: bool | None
     """
     Confirmed request — result_status/next_action columns removed
     (unused). This single field now carries the score's origin,
@@ -338,3 +377,69 @@ class DeviceConfigSetRequest(BaseModel):
     date2: list[int] = Field(min_length=5, max_length=5)
     photo_count: int = Field(ge=1, le=10)
     photo_delay: int = Field(ge=1, le=60)
+
+
+# --------------------------------------------------------------------------
+# External API key management (ข้อ 18) — NOT in the spec doc at all,
+# same reasoning as DeviceConfigSetRequest above: the spec only
+# describes what a device DOES with its key (send it in X-API-Key),
+# never how an admin gets it INTO this system in the first place.
+class ExternalApiKeySetRequest(BaseModel):
+    api_key: str = Field(min_length=1, description="Plaintext API key as issued by CFO Platform — encrypted before storage, see app/crypto.py.")
+
+
+class ExternalApiKeyStatus(BaseModel):
+    """
+    Confirmed: deliberately NEVER includes the plaintext key, or even
+    the ciphertext — same principle the spec itself states for CFO
+    Platform's own side ("ระบบเก็บกุญแจแบบแฮช เปิดดูย้อนหลังไม่ได้",
+    section 2.1) even though our own storage is technically reversible
+    (see app/crypto.py) unlike a hash. Just enough for an admin UI to
+    show "configured, added 3 days ago" without ever re-displaying the
+    secret itself.
+    """
+    meter_id: str
+    has_key: bool
+    is_active: bool | None = None
+    created_at: dt.datetime | None = None
+    rotated_at: dt.datetime | None = None
+
+
+# --------------------------------------------------------------------------
+# VerifyExternalResult — confirmed request (ข้อ 22): response shape for
+# POST /admin/device-config/{meter_id}/verify-external — mirrors
+# device_config's own external_* columns (see db/init.sql) since this
+# response is specifically about what CFO Platform's GET /device
+# returned and what got saved from it.
+class VerifyExternalResult(BaseModel):
+    meter_id: str
+    device_sn: str
+    device_type: str
+    is_active: bool
+    install_location: str | None
+    meter_no: str
+    meter_type: str
+    tenant_name: str | None
+    location_name: str | None
+
+
+# --------------------------------------------------------------------------
+# PushIssueEntry — confirmed request (ข้อ 21): the closest thing this
+# system has to an "admin notification" for push_meter_matched=false —
+# no email/SMS infrastructure exists here, so surfacing this as a
+# dashboard-visible list (GET /admin/meters/push-issues,
+# app/routers/meters.py) an admin actually checks is the confirmed
+# mechanism, not a push notification. Also surfaces failed_permanent
+# rows (400/401/403/413 — never retried automatically, so an admin is
+# the only way these ever get noticed and fixed) — both cases share
+# the same shape: "a human needs to look at this row".
+class PushIssueEntry(BaseModel):
+    id: int
+    is_test: bool
+    meter_id: str
+    capture_date: dt.date
+    capture_time: dt.time
+    push_status: str
+    push_last_error: str | None
+    push_meter_matched: bool | None
+    push_response_id: str | None

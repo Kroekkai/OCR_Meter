@@ -98,3 +98,31 @@ def is_test_filename(filename: str | None) -> bool:
     if not filename:
         return False
     return bool(_TEST_FILENAME_RE.search(filename))
+
+
+def capture_date_time_from_device_timestamp(device_timestamp: "dt.datetime | None") -> tuple:
+    """
+    Confirmed shared helper (ข้อ 20) — moved here from
+    app/routers/ocr_jobs.py (was module-private there,
+    _capture_date_time_from_device_timestamp) so
+    app/routers/images.py's manual-edit re-push path (ข้อ 20) can reuse
+    it too, instead of a second, possibly-drifting copy.
+
+    capture_date/capture_time mean "when ESP32 captured the photo", not
+    "when OCR ran" or "when this was edited" — pulled from
+    device_timestamp (already stored, denormalized from the anchor
+    image) rather than the current time. device_timestamp comes back
+    from asyncpg as a UTC-aware datetime (Postgres stores TIMESTAMPTZ
+    as UTC internally) — convert back to Bangkok local time first, or
+    the date could be off by a day near midnight, and the time would
+    be wrong by 7 hours.
+
+    device_timestamp is nullable in the schema — falls back to the
+    current server time (Bangkok) in the rare case it's missing, so
+    this never fails outright.
+    """
+    if device_timestamp is not None:
+        local = device_timestamp.astimezone(BANGKOK_TZ)
+    else:
+        local = dt.datetime.now(BANGKOK_TZ)
+    return local.date(), local.time()

@@ -4,8 +4,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
 
 from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_uploader
+from app.config import get_settings
+from app.crypto import decrypt_api_key, encrypt_api_key
 from app.db import pool
-from app.schemas import DeviceConfigOut, DeviceConfigSetRequest
+from app.external_push import ExternalPushClientError, ExternalPushServerError, verify_device
+from app.schemas import (
+    DeviceConfigOut,
+    DeviceConfigSetRequest,
+    ExternalApiKeySetRequest,
+    ExternalApiKeyStatus,
+    VerifyExternalResult,
+)
 
 router = APIRouter(tags=["default"])
 
@@ -295,4 +304,216 @@ async def admin_delete_device_config(
         DEFAULT_CONFIG["date2"],
         DEFAULT_CONFIG["photo_count"],
         DEFAULT_CONFIG["photo_delay"],
+    )
+
+
+@router.put(
+    "/admin/device-config/{meter_id}/external-api-key",
+    response_model=ExternalApiKeyStatus,
+    summary="Admin Set/Rotate External API Key",
+)
+async def admin_set_external_api_key(
+    meter_id: str,
+    body: ExternalApiKeySetRequest,
+    _: CurrentUser = Depends(get_current_admin),
+):
+    """
+    Confirmed request (ข้อ 18) — an admin pastes in the plaintext API
+    key CFO Platform issued for this meter (per the spec's own flow:
+    "ผู้ดูแลระบบออก SN และ API key เพิ่มได้ที่เมนู...ระบบจะแสดงกุญแจ
+    เพียงครั้งเดียว" — that's CFO Platform's admin UI showing it to a
+    human once; this endpoint is where that same human enters it into
+    OUR system afterward). Encrypted via app/crypto.py before storage —
+    never held in plaintext anywhere past this request handler.
+
+    Upsert, confirmed: calling this again for a meter_id that already
+    has a key REPLACES it (rotated_at gets set, is_active forced back
+    to true) — matches the spec's own "ออก API key ใหม่ กุญแจเก่าใช้
+    ไม่ได้ทันที" flow on CFO Platform's side; this is our system's
+    equivalent action when an admin has a new key to enter (old key
+    lost, or rotated on CFO Platform's end).
+
+    get_current_admin, not get_admin_or_service — confirmed: entering a
+    secret is a sensitive write, deliberately requires a real admin JWT
+    login, not a static service key.
+
+    meter_id must already exist in device_config (FK, see db/init.sql)
+    — confirmed: raises 404 rather than silently creating a
+    device_config row as a side effect, since an admin should set up
+    the meter itself first.
+    """
+    meter_id = meter_id.strip().upper()
+    async with pool().acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM device_config WHERE meter_id = $1", meter_id)
+        if not exists:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No device_config row for meter_id={meter_id!r} yet — set up the meter itself first.",
+            )
+        encrypted = encrypt_api_key(body.api_key)
+        row = await conn.fetchrow(
+            """
+            INSERT INTO external_api_keys (meter_id, api_key_encrypted, is_active, rotated_at)
+            VALUES ($1, $2, true, now())
+            ON CONFLICT (meter_id) DO UPDATE SET
+                api_key_encrypted = EXCLUDED.api_key_encrypted,
+                is_active = true,
+                rotated_at = now()
+            RETURNING meter_id, is_active, created_at, rotated_at
+            """,
+            meter_id,
+            encrypted,
+        )
+    return ExternalApiKeyStatus(
+        meter_id=row["meter_id"],
+        has_key=True,
+        is_active=row["is_active"],
+        created_at=row["created_at"],
+        rotated_at=row["rotated_at"],
+    )
+
+
+@router.get(
+    "/admin/device-config/{meter_id}/external-api-key",
+    response_model=ExternalApiKeyStatus,
+    summary="Admin Get External API Key Status",
+)
+async def admin_get_external_api_key_status(
+    meter_id: str,
+    _: CurrentUser = Depends(get_admin_or_service),
+):
+    """
+    Confirmed: status only — has_key/is_active/created_at/rotated_at —
+    never the key itself, plaintext or encrypted (see
+    ExternalApiKeyStatus's own docstring for why). get_admin_or_service
+    here (not get_current_admin like the PUT above) since this is a
+    read with no secret exposed, consistent with this router's other
+    GET endpoints.
+
+    Confirmed: has_key=False (not a 404) when no row exists yet — a
+    meter with no key configured is a normal, expected state (not yet
+    set up for CFO Platform push), not an error.
+    """
+    meter_id = meter_id.strip().upper()
+    row = await pool().fetchrow(
+        "SELECT meter_id, is_active, created_at, rotated_at FROM external_api_keys WHERE meter_id = $1",
+        meter_id,
+    )
+    if row is None:
+        return ExternalApiKeyStatus(meter_id=meter_id, has_key=False)
+    return ExternalApiKeyStatus(
+        meter_id=row["meter_id"],
+        has_key=True,
+        is_active=row["is_active"],
+        created_at=row["created_at"],
+        rotated_at=row["rotated_at"],
+    )
+
+
+@router.post(
+    "/admin/device-config/{meter_id}/verify-external",
+    response_model=VerifyExternalResult,
+    summary="Admin Verify Device Against CFO Platform",
+)
+async def admin_verify_external_device(
+    meter_id: str,
+    _: CurrentUser = Depends(get_current_admin),
+):
+    """
+    Confirmed request (ข้อ 22, and spec section 3's own install
+    checklist step 2: "เรียก GET /device ตรวจสอบว่าจับคู่ถูกต้อง") —
+    calls GET /external/v1/device and saves the descriptive metadata
+    it returns (installLocation/meter.meterNo/meter.tenantName/
+    meter.locationName) into device_config.external_* — confirmed
+    display-only, nothing else in this codebase reads these back to
+    make a decision (see VerifyExternalResult's own docstring).
+
+    Confirmed: 400 if no active API key is configured for this meter
+    yet (same check as the manual-push endpoint) — verify_device()
+    needs a real key to call CFO Platform with, there's nothing to
+    verify without one.
+    """
+    meter_id = meter_id.strip().upper()
+    settings = get_settings()
+    if not settings.external_api_base_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="EXTERNAL_API_BASE_URL is not configured — nothing to verify against yet.",
+        )
+
+    key_row = await pool().fetchrow(
+        "SELECT api_key_encrypted FROM external_api_keys WHERE meter_id = $1 AND is_active = true",
+        meter_id,
+    )
+    if key_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"No active external API key configured for meter_id={meter_id!r}.",
+        )
+    api_key = decrypt_api_key(key_row["api_key_encrypted"])
+
+    try:
+        data = await verify_device(base_url=settings.external_api_base_url, api_key=api_key)
+    except ExternalPushClientError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    except ExternalPushServerError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=e.message) from e
+    except ValueError as e:
+        # Configuration problem (e.g. EXTERNAL_API_BASE_URL isn't https).
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)) from e
+
+    # Confirmed fix — spec section 3, install step 2 states this as a
+    # requirement, not an optional check: "เรียก GET /device ... ต้อง
+    # ได้ SN และเลขที่มิเตอร์ตรงกับตารางในภาคผนวก ก". Without this, an
+    # API key pasted into the wrong meter_id's slot in the dashboard
+    # (e.g. ELE-000002's key saved under ELE-000001) was silently
+    # accepted — every future reading from ELE-000001 would then push
+    # to CFO Platform under a key that identifies it as ELE-000002,
+    # corrupting the OTHER meter's history with no error anywhere.
+    # Case-insensitive on purpose: SNs are uppercased everywhere else
+    # in this codebase (see app/filename.py's own meter_id parsing), so
+    # a case difference alone shouldn't be treated as a real mismatch.
+    # Nothing is written to device_config if this fails — verified
+    # below by returning before the UPDATE.
+    if data.deviceSn.strip().upper() != meter_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"API key mismatch: this key belongs to device SN {data.deviceSn!r}, "
+                f"not {meter_id!r}. Not saving — check which key was pasted into this meter's slot."
+            ),
+        )
+
+    row = await pool().fetchrow(
+        """
+        UPDATE device_config
+        SET external_install_location = $1,
+            external_meter_no = $2,
+            external_tenant_name = $3,
+            external_location_name = $4
+        WHERE meter_id = $5
+        RETURNING meter_id
+        """,
+        data.installLocation,
+        data.meter.meterNo,
+        data.meter.tenantName,
+        data.meter.locationName,
+        meter_id,
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No device_config row for meter_id={meter_id!r} yet — set up the meter itself first.",
+        )
+
+    return VerifyExternalResult(
+        meter_id=meter_id,
+        device_sn=data.deviceSn,
+        device_type=data.deviceType,
+        is_active=data.isActive,
+        install_location=data.installLocation,
+        meter_no=data.meter.meterNo,
+        meter_type=data.meter.type,
+        tenant_name=data.meter.tenantName,
+        location_name=data.meter.locationName,
     )

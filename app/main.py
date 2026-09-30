@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from app import db
 from app.config import get_settings
+from app.external_push import external_push_sweep_loop
 from app.grouping import group_sweep_loop
 from app.prefix_middleware import StripPathPrefixMiddleware
 from app.routers import admin_users, auth_routes, device_config, health, images, meters, ocr_jobs
@@ -17,12 +18,21 @@ async def lifespan(app: FastAPI):
     # closes — see app/grouping.py. Runs independently of any HTTP
     # request, so the wait actually happens even if nobody polls.
     sweep_task = asyncio.create_task(group_sweep_loop())
+    # ข้อ 18, confirmed request — retries/first-attempts CFO Platform
+    # pushes on a schedule, same "runs independently of any HTTP
+    # request" reasoning as sweep_task above. See
+    # app/external_push.py::external_push_sweep_loop() for what it
+    # actually does each tick (a no-op until external_api_base_url is
+    # configured).
+    external_push_task = asyncio.create_task(external_push_sweep_loop())
     yield
     sweep_task.cancel()
-    try:
-        await sweep_task
-    except asyncio.CancelledError:
-        pass
+    external_push_task.cancel()
+    for task in (sweep_task, external_push_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await db.disconnect()
 
 

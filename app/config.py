@@ -97,16 +97,59 @@ class Settings(BaseSettings):
     # decision gets stored (still a "_Test" filename suffix, just
     # decided differently now).
 
-    # --- External push (Store system) --------------------------------------
-    # NOT wired up to anything yet — placeholder config for
-    # app/external_push.py, which is a standalone function only, not yet
-    # called from anywhere. Waiting on the real URL + auth scheme from
-    # the receiving team before this gets any real values or gets
-    # triggered automatically. Defaults are empty on purpose — a blank
-    # URL is a clear signal (not a silent wrong-endpoint call) that this
-    # hasn't been configured yet.
-    external_push_url: str = ""
-    external_push_api_key: str = ""
+    # --- External push (CFO Platform / NT Carbon) ---------------------------
+    # Base URL — confirmed: kept as an env-configured value (.env), not
+    # hardcoded here, even though the spec doc itself states it
+    # directly (section 2: "API Base URL: https://carbon.ntplc.co.th/
+    # engineer-api") and it isn't a secret like the API key — keeping
+    # every environment-specific value in .env in one place, rather
+    # than splitting "public but env-set" from "secret and env-set"
+    # across two different mechanisms (a code default here vs. .env
+    # elsewhere), is the confirmed preference. See .env.example for the
+    # real value to copy in.
+    #
+    # Both endpoints hang off this base:
+    #   POST {base}/external/v1/meter-readings  (push a reading)
+    #   GET  {base}/external/v1/device            (verify a device's SN)
+    # Blank default here is a deliberate loud signal that .env hasn't
+    # been set up yet — once blank, the scheduler below
+    # (external_push_sweep_loop, see app/main.py) skips every tick
+    # without attempting anything, rather than repeatedly trying to
+    # hit an empty URL.
+    #
+    # No API key here, confirmed — a single system-wide key was wrong:
+    # the spec requires ONE KEY PER DEVICE (each tied to its own SN),
+    # not one shared key for the whole integration. Per-device keys live
+    # in external_api_keys (db/init.sql), encrypted via app/crypto.py —
+    # never in this file. THAT is the actual secret still pending —
+    # per-meter keys, issued individually by CFO Platform's own admin
+    # UI ("ระบบจะแสดงกุญแจเพียงครั้งเดียว"), not something published in
+    # the spec doc the way the base URL is.
+    external_api_base_url: str = ""
+
+    # ข้อ 18, confirmed request — how often the background scheduler
+    # (external_push_sweep_loop, app/external_push.py +
+    # app/main.py's lifespan) calls process_due_pushes() to check for
+    # anything needing a (first attempt or retry) push. 30s, not the
+    # 5s group_sweep_interval_seconds uses above — confirmed choice:
+    # the retry schedule's own finest granularity is already 30s (see
+    # RETRY_SCHEDULE_SECONDS in app/external_push.py), so polling any
+    # more often than that can't make a retry fire any sooner, only
+    # waste DB queries finding nothing new each time.
+    external_push_sweep_interval_seconds: int = 30
+
+    # --- External push (CFO Platform): per-device API key encryption --------
+    # confirmed request: external_api_keys.api_key_encrypted must be
+    # reversible (not a one-way hash like users.password_hash), since the
+    # plaintext key has to go back out in the X-API-Key header on every
+    # push. Fernet (symmetric, from the `cryptography` package) is a
+    # flagged default choice — not yet confirmed with you specifically —
+    # swap app/crypto.py for a different scheme (e.g. a KMS) if wanted.
+    # Generate a real value with: python -c "from cryptography.fernet
+    # import Fernet; print(Fernet.generate_key().decode())" — the blank
+    # default is a deliberate loud failure (see app/crypto.py) rather
+    # than a silently-insecure fallback key.
+    external_key_encryption_key: str = ""
 
 
 @lru_cache

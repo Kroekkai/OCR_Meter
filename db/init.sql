@@ -471,7 +471,66 @@ CREATE TABLE IF NOT EXISTS ocr_meter (
     -- CONSTRAINT) ไม่ใส่ REFERENCES ตรงนี้เลย เพื่อให้ migration สำหรับ
     -- DB เดิมที่มี column นี้อยู่แล้ว (ไม่มี FK จาก round 3) ใช้ pattern
     -- เดียวกันได้ ไม่ต้องแยกเป็น 2 กรณี
-    ocr_engine          INT         NOT NULL
+    ocr_engine          INT         NOT NULL,
+    -- external_ref — confirmed request (CFO Platform integration): unique
+    -- reference generated once per reading when we first attempt to push
+    -- it to POST /external/v1/meter-readings, recommended format
+    -- <SN>-<YYYYMMDD>-<HHmm> per the spec. Stored (not recomputed) so
+    -- every retry of the same reading reuses the exact same value —
+    -- that's what makes the push idempotent on the receiving end (their
+    -- own dedup logic keys off this string). Nullable: a row has none
+    -- until the first push attempt actually happens; also stays null
+    -- forever for any reading that never gets pushed at all (e.g. no
+    -- external_sn/API key configured for that meter yet).
+    external_ref        TEXT,
+    -- confidence — confirmed request: OCR Worker ส่งค่านี้มาตรงๆ (0-100)
+    -- ไม่ใช่ค่าที่เราคำนวณ/แปลงมาจาก ocr_engine เอง — เป็นคนละค่าที่รายงาน
+    -- แยกกันอิสระจากกัน Nullable เหตุผลเดียวกับ ocr_reading ด้านบน: ผลอ่าน
+    -- ที่ล้มเหลวสนิทอาจไม่มี confidence ที่มีความหมายให้รายงาน และ Worker
+    -- เวอร์ชันเก่า (ก่อนมี field นี้) ยังทำงานได้ปกติแม้ไม่ส่งมาเลย
+    confidence          NUMERIC,
+    -- push_* — confirmed request (CFO Platform integration, ข้อ 20):
+    -- สถานะการ push ไป CFO Platform ต่อการอ่านค่า 1 รายการ ตรงกับ column
+    -- แทนที่จะแยกตารางใหม่ (สอดคล้องกับแนวทางเดียวกันที่ตัดสินใจไว้กับ
+    -- external_ref/confidence ด้านบน — คอลัมน์บนตารางเดิม ไม่ใช่ตารางแยก)
+    --
+    -- push_status ค่าที่เป็นไปได้:
+    --   not_pushed       — ยังไม่เคยพยายาม push เลย (ค่าเริ่มต้นของทุกแถว)
+    --   pending          — push สำเร็จแล้ว (got 201), รอเจ้าหน้าที่ CFO
+    --                      Platform ตรวจสอบ (ดู push_cfo_status ด้านล่าง —
+    --                      คนละความหมายกับ push_status นี้)
+    --   success          — เหมือน pending แต่เจ้าหน้าที่ยืนยันแล้ว (ไม่ได้ใช้
+    --                      จริงในเวอร์ชันนี้ — ยังไม่มีทางรู้ผลตรวจสอบภายหลัง
+    --                      เพราะ spec ไม่มี endpoint เช็คสถานะทีหลัง — เก็บ
+    --                      ไว้เผื่ออนาคต)
+    --   failed_retryable — เจอ 5xx/timeout/เครือข่ายพัง — ยังไม่เลิกพยายาม
+    --   failed_permanent — เจอ 400/401/403/413 — ตาม spec ห้าม retry เด็ดขาด
+    push_status         TEXT        NOT NULL DEFAULT 'not_pushed',
+    -- push_attempt_count — จำนวนครั้งที่พยายาม push แล้ว (รวมครั้งแรก) ใช้
+    -- คำนวณ delay รอบถัดไปตาม schedule ที่ spec กำหนด (0,30วิ,2นาที,10นาที,
+    -- 1ชม.) ดู app/external_push.py::RETRY_SCHEDULE_SECONDS
+    push_attempt_count  INT         NOT NULL DEFAULT 0,
+    -- push_next_retry_at — เวลาที่ควรลองรอบถัดไป (NULL = ไม่ต้องลองอีกแล้ว
+    -- ไม่ว่าจะเพราะสำเร็จหรือเพราะ failed_permanent)
+    push_next_retry_at  TIMESTAMPTZ,
+    -- push_last_error — ข้อความ error ล่าสุด เก็บไว้ debug (โดยเฉพาะกรณี
+    -- failed_permanent ที่จะไม่มีการลองใหม่อีกแล้ว ต้องรู้ว่าทำไมถึงพัง)
+    push_last_error     TEXT,
+    -- push_response_id — UUID ที่ CFO Platform ตอบกลับมา (data.id) เก็บไว้
+    -- อ้างอิงย้อนหลัง — ไม่ใช่ external_ref (คนละตัวกัน: external_ref เราเป็น
+    -- คนสร้าง, push_response_id เขาเป็นคนสร้าง)
+    push_response_id    TEXT,
+    -- push_cfo_status — สถานะฝั่ง CFO Platform เอง (pending/confirmed/
+    -- rejected) จาก response.data.status — คนละอย่างกับ push_status ข้างบน
+    -- (push_status คือสถานะการส่งของเรา, push_cfo_status คือสถานะการตรวจสอบ
+    -- ของเจ้าหน้าที่เขา) เห็นค่านี้ได้แค่ตอน push ครั้งแรกเท่านั้น เพราะ spec
+    -- ไม่มี endpoint ให้เช็คสถานะภายหลังเลย — ค่านี้จึงอาจไม่ทันสมัยหลังจาก
+    -- เจ้าหน้าที่เขาตรวจสอบเสร็จจริง
+    push_cfo_status     TEXT,
+    -- push_meter_matched — จาก response.data.meterMatched — false = มิเตอร์
+    -- ที่ผูกกับ SN นี้ไม่มีในทะเบียนฝั่งเขา (ต้องแจ้งผู้ดูแล ดู README/
+    -- การพูดคุยเรื่อง meterMatched — ระบบแจ้งเตือนจริงยังไม่ได้ทำ ข้อ 23)
+    push_meter_matched  BOOLEAN
 );
 
 -- อัปเกรด DB ที่มี ocr_meter อยู่แล้วจาก schema เก่า (error_type เป็น TEXT,
@@ -576,7 +635,35 @@ BEGIN
     -- ไป error เอาทีหลัง
     UPDATE ocr_meter SET ocr_engine = 0 WHERE ocr_engine IS NULL OR ocr_engine NOT IN (0, 110, 120, 1110, 1120);
     ALTER TABLE ocr_meter ALTER COLUMN ocr_engine SET NOT NULL;
+
+    -- external_ref — confirmed request (CFO Platform integration).
+    -- Nullable, no backfill needed — see the column's own comment above.
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS external_ref TEXT;
+    -- confidence — confirmed request (OCR Worker reports 0-100 directly).
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS confidence NUMERIC;
+    -- push_* — confirmed request (CFO Platform integration, ข้อ 20).
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_status TEXT NOT NULL DEFAULT 'not_pushed';
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_attempt_count INT NOT NULL DEFAULT 0;
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_next_retry_at TIMESTAMPTZ;
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_last_error TEXT;
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_response_id TEXT;
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_cfo_status TEXT;
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_meter_matched BOOLEAN;
 END $$;
+
+-- external_ref ต้องไม่ซ้ำกัน — confirmed request (แนวทาง "แบบ A": generate
+-- + persist ทันทีตอนผลลัพธ์ OCR เข้ามา ไม่ใช่ตอนจะ push) ป้องกันปัญหาที่
+-- คุยกันไว้: มิเตอร์เดียวกันถ่าย 2 ครั้งในนาทีเดียวกัน (เช่น กดทดสอบซ้ำ
+-- เร็วๆ) จะได้ external_ref ชนกันเป๊ะ (ตัด HHmm ทิ้งวินาที) ถ้าไม่มี
+-- constraint นี้ DB จะยอมให้มี 2 แถวซ้ำ ref กันเงียบๆ โดยไม่มีใครรู้ —
+-- CFO Platform จะเห็นรายการที่ 2 เป็น duplicate:true (นึกว่าเป็นการ
+-- retry ของรายการแรก) แล้วรายการที่ 2 หายไปจริง ทั้งที่เป็นคนละรายการ.
+-- NULL ยังคงซ้ำกันได้หลายแถวตามปกติของ Postgres UNIQUE (แถวที่ยังไม่มี
+-- external_ref เลยไม่ติด constraint นี้) — โค้ดฝั่ง Python
+-- (app/routers/ocr_jobs.py::_submit_ocr_result) เป็นคนจัดการ retry ด้วย
+-- suffix ใหม่เมื่อชน ไม่ใช่ปล่อยให้ INSERT ล้มเหลวตรงๆ
+-- (UNIQUE ของ external_ref ถูกย้ายไปสร้างหลังบล็อก reorder ด้านล่าง — ถ้าสร้างก่อน
+-- บล็อก reorder จะถูกทับหายเมื่อบล็อกสร้างตารางใหม่)
 
 -- จัดลำดับคอลัมน์ให้ตรงกับ CREATE TABLE ด้านบนเป๊ะ (error_type ต้องมา
 -- ก่อน image เสมอ) — ใช้วิธีเดียวกับ ocr_jobs ด้านบน (สร้างตาราง
@@ -585,7 +672,7 @@ END $$;
 -- ถูก" — no-op ถ้าลำดับตรงอยู่แล้ว ปลอดภัยรันซ้ำได้
 DO $$
 DECLARE
-    correct_order TEXT[] := ARRAY['id','meter_id','capture_date','capture_time','ocr_reading','error_type','image','ocr_engine'];
+    correct_order TEXT[] := ARRAY['id','meter_id','capture_date','capture_time','ocr_reading','error_type','image','ocr_engine','external_ref','confidence','push_status','push_attempt_count','push_next_retry_at','push_last_error','push_response_id','push_cfo_status','push_meter_matched'];
     actual_order TEXT[];
 BEGIN
     SELECT array_agg(column_name ORDER BY ordinal_position) INTO actual_order
@@ -610,10 +697,22 @@ BEGIN
             ocr_reading   NUMERIC,
             error_type    INTEGER     NOT NULL REFERENCES error_type(code),
             image           TEXT,
-            ocr_engine    INT         NOT NULL REFERENCES ocr_engine_meaning(code)
+            ocr_engine    INT         NOT NULL REFERENCES ocr_engine_meaning(code),
+            external_ref  TEXT,
+            confidence    NUMERIC,
+            -- push_* ต้องอยู่ที่นี่ด้วยเสมอ (พบตอนทดสอบบน Postgres จริง: ตอนเพิ่ม
+            -- push_* ครั้งแรก ลืมอัปเดตบล็อกนี้ → บล็อกเห็นว่า "ลำดับไม่ตรง" แล้วสร้าง
+            -- ตารางใหม่ที่ไม่มี push_* ทับของเดิม → push_* + UNIQUE หายเงียบๆ ทุกครั้งที่รัน)
+            push_status         TEXT        NOT NULL DEFAULT 'not_pushed',
+            push_attempt_count  INT         NOT NULL DEFAULT 0,
+            push_next_retry_at  TIMESTAMPTZ,
+            push_last_error     TEXT,
+            push_response_id    TEXT,
+            push_cfo_status     TEXT,
+            push_meter_matched  BOOLEAN
         );
-        INSERT INTO ocr_meter_reordered (id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine)
-            SELECT id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine
+        INSERT INTO ocr_meter_reordered (id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine, external_ref, confidence, push_status, push_attempt_count, push_next_retry_at, push_last_error, push_response_id, push_cfo_status, push_meter_matched)
+            SELECT id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine, external_ref, confidence, push_status, push_attempt_count, push_next_retry_at, push_last_error, push_response_id, push_cfo_status, push_meter_matched
             FROM ocr_meter
             ORDER BY id;
         DROP TABLE ocr_meter;
@@ -641,6 +740,10 @@ ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_error_type_fkey FOREIGN KEY (erro
 ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_ocr_engine_fkey;
 ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_ocr_engine_fkey FOREIGN KEY (ocr_engine) REFERENCES ocr_engine_meaning(code);
 
+-- external_ref ห้ามซ้ำ (ดูเหตุผลเต็มที่ comment ด้านบน) — วางหลังบล็อก reorder เสมอ
+ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_external_ref_key;
+ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_external_ref_key UNIQUE (external_ref);
+
 -- capture_date DESC, capture_time DESC รองรับ query แบบที่ OCR client
 -- ต้องใช้บ่อยที่สุด: "ค่าล่าสุดของมิเตอร์นี้คือเท่าไหร่" — DROP ก่อนเผื่อ
 -- ยังมี index ชื่อเดิมค้างจาก definition ที่ต่างออกไป
@@ -664,7 +767,24 @@ CREATE TABLE IF NOT EXISTS ocr_meter_test (
     -- ocr_engine — ยืนยันรอบ 4 จากทีม Worker: ระบบคะแนนสะสม, มี FK ไป
     -- ocr_engine_meaning(code) (ยืนยันครั้งที่ 2 ว่ามีแค่ 5 ค่าจริงๆ) —
     -- ดู comment เต็มที่ ocr_meter ด้านบน (โครงสร้างเดียวกัน)
-    ocr_engine          INT         NOT NULL
+    ocr_engine          INT         NOT NULL,
+    -- external_ref — confirmed request (CFO Platform integration) — ดู
+    -- comment เต็มที่คอลัมน์เดียวกันใน ocr_meter ด้านบน (ความหมายเดียวกัน
+    -- ทุกประการ แค่สำหรับข้อมูลทดสอบแทน)
+    external_ref        TEXT,
+    -- confidence — confirmed request: ความหมายเดียวกับ ocr_meter ด้านบน
+    -- (OCR Worker ส่งมาตรงๆ 0-100, Nullable)
+    confidence          NUMERIC,
+    -- push_* — ความหมายเดียวกับ ocr_meter ด้านบนทุกประการ (ข้อมูลทดสอบก็
+    -- ต้อง push ได้เหมือนกัน — เช่นตอนขั้นตอนติดตั้งอุปกรณ์ที่ spec บอกว่า
+    -- "ส่งรายการทดสอบ 1 รายการ แล้วแจ้งเจ้าหน้าที่ให้ตรวจ")
+    push_status         TEXT        NOT NULL DEFAULT 'not_pushed',
+    push_attempt_count  INT         NOT NULL DEFAULT 0,
+    push_next_retry_at  TIMESTAMPTZ,
+    push_last_error     TEXT,
+    push_response_id    TEXT,
+    push_cfo_status     TEXT,
+    push_meter_matched  BOOLEAN
 );
 -- confirmed request: image_error -> image (ตอนนี้ใส่เสมอ ไม่ใช่แค่ตอน error
 -- แล้ว เหมือนกับ ocr_meter ด้านบน) — no-op ถ้าเคย rename ไปแล้ว หรือเป็น
@@ -706,6 +826,22 @@ ALTER TABLE ocr_meter_test ADD CONSTRAINT ocr_meter_test_ocr_engine_fkey FOREIGN
 -- needed for this at all; if a stray anchor_image_path column exists
 -- from that earlier version, drop it.
 ALTER TABLE ocr_meter_test DROP COLUMN IF EXISTS anchor_image_path;
+-- external_ref — confirmed request (CFO Platform integration) — ดู
+-- comment เต็มที่คอลัมน์เดียวกันใน ocr_meter ด้านบน
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS external_ref TEXT;
+-- confidence — confirmed request (OCR Worker reports 0-100 directly).
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS confidence NUMERIC;
+-- push_* — ความหมายเดียวกับ ocr_meter ด้านบน
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_status TEXT NOT NULL DEFAULT 'not_pushed';
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_attempt_count INT NOT NULL DEFAULT 0;
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_next_retry_at TIMESTAMPTZ;
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_last_error TEXT;
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_response_id TEXT;
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_cfo_status TEXT;
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_meter_matched BOOLEAN;
+-- external_ref ต้องไม่ซ้ำกัน — เหตุผลเดียวกับ ocr_meter ด้านบน
+ALTER TABLE ocr_meter_test DROP CONSTRAINT IF EXISTS ocr_meter_test_external_ref_key;
+ALTER TABLE ocr_meter_test ADD CONSTRAINT ocr_meter_test_external_ref_key UNIQUE (external_ref);
 CREATE INDEX IF NOT EXISTS idx_ocr_meter_test_meter_id ON ocr_meter_test (meter_id, capture_date DESC, capture_time DESC);
 
 -- --------------------------------------------------------------------------
@@ -743,7 +879,19 @@ CREATE TABLE IF NOT EXISTS device_config (
     -- on auto-provisioned defaults, nobody has explicitly set this
     -- meter's schedule; false = an admin used
     -- PUT /admin/device-config/{meter_id} at least once.
-    is_default    BOOLEAN   NOT NULL DEFAULT true
+    is_default    BOOLEAN   NOT NULL DEFAULT true,
+    -- external_* — confirmed request (ข้อ 22, CFO Platform integration):
+    -- metadata from GET /external/v1/device's own response (section
+    -- 3.1) — populated by app/routers/device_config.py's
+    -- admin_verify_external_device() when an admin runs the verify
+    -- step, never by ESP32/the OCR Worker. Purely descriptive
+    -- (display-only in the dashboard) — nothing else in this codebase
+    -- reads these back to make a decision. All nullable: never
+    -- populated at all until an admin actually runs verification once.
+    external_install_location TEXT,
+    external_meter_no         TEXT,
+    external_tenant_name      TEXT,
+    external_location_name    TEXT
 );
 
 -- เผื่อ device_config มีอยู่แล้วจากรอบก่อนที่ยังไม่มี CHECK constraint —
@@ -765,6 +913,11 @@ ALTER TABLE device_config ADD CONSTRAINT device_config_photo_delay_check CHECK (
 -- ให้ผลเหมือนกัน — no-op บน fresh install เพราะ CREATE TABLE มีคอลัมน์
 -- นี้อยู่แล้ว
 ALTER TABLE device_config ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT true;
+-- external_* — confirmed request (ข้อ 22, CFO Platform integration).
+ALTER TABLE device_config ADD COLUMN IF NOT EXISTS external_install_location TEXT;
+ALTER TABLE device_config ADD COLUMN IF NOT EXISTS external_meter_no TEXT;
+ALTER TABLE device_config ADD COLUMN IF NOT EXISTS external_tenant_name TEXT;
+ALTER TABLE device_config ADD COLUMN IF NOT EXISTS external_location_name TEXT;
 
 -- ⚠️ FK ไปหา device_config — ยืนยันแล้วรอบที่ 3 (ยอมรับผลที่ตามมา:
 -- DELETE /admin/device-config/{meter_id} จะลบจริงไม่ได้อีกต่อไป
@@ -784,6 +937,36 @@ ALTER TABLE ocr_meter DROP CONSTRAINT IF EXISTS ocr_meter_meter_id_fkey;
 ALTER TABLE ocr_meter ADD CONSTRAINT ocr_meter_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
 ALTER TABLE ocr_meter_test DROP CONSTRAINT IF EXISTS ocr_meter_test_meter_id_fkey;
 ALTER TABLE ocr_meter_test ADD CONSTRAINT ocr_meter_test_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES device_config(meter_id);
+
+-- --------------------------------------------------------------------------
+-- external_api_keys — confirmed request (CFO Platform integration).
+-- Deliberately its OWN table, separate from device_config, even though
+-- it's a strict 1:1 with meter_id — device_config is read on every
+-- single GET /devices/config call (every ESP32 wake cycle) and this
+-- key must never accidentally ride along in a SELECT * / a debug log
+-- dump of that hot path. Keeping the secret in its own table shrinks
+-- the blast radius to just the handful of places that actually need to
+-- read it (the external-push code itself).
+--
+-- api_key_encrypted — confirmed request: reversible encryption, NOT a
+-- one-way hash like users.password_hash — this value has to come back
+-- out in plaintext to go in the X-API-Key header on every push. See
+-- app/crypto.py for the encrypt/decrypt helpers (Fernet, symmetric) —
+-- flagged as a default choice, not yet confirmed with you specifically;
+-- swap it out if you want a different scheme (e.g. a KMS).
+--
+-- is_active — confirmed request: lets a key be revoked (e.g. lost/
+-- compromised, per the spec's "ทำหาย → ออก key ใหม่ กุญแจเก่าใช้ไม่ได้
+-- ทันที") without deleting the row outright, so the old key's
+-- created_at/rotated_at history isn't lost.
+CREATE TABLE IF NOT EXISTS external_api_keys (
+    meter_id            TEXT        PRIMARY KEY REFERENCES device_config(meter_id),
+    api_key_encrypted   TEXT        NOT NULL,
+    is_active           BOOLEAN     NOT NULL DEFAULT true,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    rotated_at          TIMESTAMPTZ
+);
+
 -- esp32_upload_log's meter_id FK is added near the end of this file
 -- instead, right after that table's own reorder migration — confirmed
 -- bug found in production: adding it here (before the reorder) meant

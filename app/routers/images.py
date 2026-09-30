@@ -8,7 +8,14 @@ from fastapi.responses import FileResponse
 from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_uploader
 from app.config import get_settings
 from app.db import GROUP_ID_INFO, PREFIX_FOR_UTILITY_TYPE, pool, utility_type_for_meter_id
-from app.filename import BANGKOK_TZ, FilenameParseError, is_test_filename, parse_upload_filename
+from app.external_push import (
+    PUSHABLE_TABLE,
+    ExternalRefCollisionError,
+    fire_and_forget,
+    generate_unique_external_ref,
+    push_immediately_if_configured,
+)
+from app.filename import BANGKOK_TZ, FilenameParseError, capture_date_time_from_device_timestamp, is_test_filename, parse_upload_filename
 from app.grouping import finalize_group, has_normal_group_today, mark_group_dropped
 from app.repo import get_image_row, image_out
 from app.routers.device_config import get_or_create_device_config
@@ -585,6 +592,20 @@ async def admin_edit_ocr_manually(
     Per db/init.sql there is no column that preserves the OCR-produced
     value once an admin overwrites it here, and no column that records
     why (admin_reason was removed).
+
+    Confirmed fix (ข้อ 20, "เอาตาม spec"): also syncs ocr_meter/
+    ocr_meter_test (whichever this reading actually landed in — see
+    is_test_filename() below), if a row already exists there — this
+    endpoint used to touch ocr_jobs/images only, silently leaving the
+    "clean" result table (and anything already pushed to CFO Platform
+    from it) stale after a manual correction. Per spec section 5's own
+    words: "ต้องการแก้ค่าที่ส่งไปแล้ว → ส่งรายการใหม่ด้วย externalRef
+    ใหม่ เจ้าหน้าที่จะปฏิเสธรายการเก่า" — so this generates a FRESH
+    external_ref (never reuses the old one) and resets every push_*
+    column back to not-yet-pushed, then fires an immediate re-push
+    attempt (same fire_and_forget pattern as a brand new OCR result —
+    see push_immediately_if_configured()'s own docstring) rather than
+    waiting for the next scheduler tick.
     """
     image_row = await get_image_row(item_id)
     if image_row is None:
@@ -592,7 +613,7 @@ async def admin_edit_ocr_manually(
 
     group_id = image_row["group_id"]
     latest_job = await pool().fetchrow(
-        "SELECT id FROM ocr_jobs WHERE group_id = $1 ORDER BY id DESC LIMIT 1",
+        "SELECT id, device_timestamp FROM ocr_jobs WHERE group_id = $1 ORDER BY id DESC LIMIT 1",
         group_id,
     )
     if latest_job is None:
@@ -600,6 +621,23 @@ async def admin_edit_ocr_manually(
             status_code=status.HTTP_409_CONFLICT,
             detail="This image's group has no ocr_jobs row yet — upload/reprocess first",
         )
+
+    meter_id = image_row["meter_id"]
+    # Confirmed fix, found during a correctness audit — MUST use
+    # latest_job's own device_timestamp (the anchor image's, per
+    # app/grouping.py's own denormalization into ocr_jobs), NOT
+    # image_row's — item_id can be ANY image in the group (this
+    # endpoint's own docstring says so explicitly), and each image in
+    # a burst has its OWN device_timestamp from its own filename (a
+    # few seconds apart from its group-mates, not identical). Using
+    # image_row's here would silently fail to find the matching
+    # ocr_meter/ocr_meter_test row whenever an admin edits via a
+    # non-anchor image — this reading's capture_date/capture_time were
+    # computed from the ANCHOR's timestamp when _submit_ocr_result()
+    # first inserted that row (see app/routers/ocr_jobs.py), so the
+    # lookup here must use that exact same source to match it.
+    capture_date, capture_time = capture_date_time_from_device_timestamp(latest_job["device_timestamp"])
+    target_table = "ocr_meter_test" if is_test_filename(image_row["original_filename"]) else "ocr_meter"
 
     async with pool().acquire() as conn:
         async with conn.transaction():
@@ -614,5 +652,63 @@ async def admin_edit_ocr_manually(
                 latest_job["id"],
             )
             await conn.execute("UPDATE images SET ocr_status = 'done' WHERE group_id = $1", group_id)
+
+            # Confirmed fix (ข้อ 20) — sync the "clean" result table too,
+            # if a row for this exact reading already exists there (it
+            # won't yet if OCR hasn't finished/landed for this group at
+            # all — that's not an error, just nothing to sync).
+            existing_meter_row = await conn.fetchrow(
+                f"SELECT id, external_ref FROM {target_table} WHERE meter_id = $1 AND capture_date = $2 AND capture_time = $3",
+                meter_id,
+                capture_date,
+                capture_time,
+            )
+            meter_row_id = None
+            if existing_meter_row is not None:
+                meter_row_id = existing_meter_row["id"]
+
+                async def _reset_and_update(ref: str, row_id=meter_row_id) -> None:
+                    await conn.execute(
+                        f"""
+                        UPDATE {target_table}
+                        SET ocr_reading = $1,
+                            external_ref = $2,
+                            push_status = 'not_pushed',
+                            push_attempt_count = 0,
+                            push_next_retry_at = NULL,
+                            push_last_error = NULL,
+                            push_response_id = NULL,
+                            push_cfo_status = NULL,
+                            push_meter_matched = NULL
+                        WHERE id = $3
+                        """,
+                        body.ocr_reading,
+                        ref,
+                        row_id,
+                    )
+
+                try:
+                    # exclude_ref, confirmed fix (spec-compliance audit)
+                    # — see generate_unique_external_ref()'s own
+                    # docstring: without this, an edit that doesn't
+                    # change meter_id/capture_date/capture_time (the
+                    # normal case) would compute the exact same ref
+                    # this row already has, silently violating spec
+                    # section 5's "ส่งรายการใหม่ด้วย externalRef ใหม่".
+                    await generate_unique_external_ref(
+                        conn, meter_id, capture_date, capture_time, _reset_and_update,
+                        exclude_ref=existing_meter_row["external_ref"],
+                    )
+                except ExternalRefCollisionError as e:
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)) from e
+
+    # Test readings (ocr_meter_test) still get their ocr_reading corrected
+    # above (so this system's own test data stays accurate) but are never
+    # re-pushed — confirmed decision, see PUSHABLE_TABLE in
+    # app/external_push.py.
+    if meter_row_id is not None and target_table == PUSHABLE_TABLE:
+        fire_and_forget(
+            push_immediately_if_configured(meter_id, target_table, meter_row_id, get_settings().external_api_base_url)
+        )
 
     return dict(updated_job)

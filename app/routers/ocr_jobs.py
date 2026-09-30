@@ -1,11 +1,19 @@
 import datetime as dt
 import logging
 
+import asyncpg
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, status
 
 from app.auth import CurrentUser, get_admin_or_service, get_ocr_client
+from app.config import get_settings
 from app.db import pool
-from app.filename import BANGKOK_TZ, is_test_filename
+from app.external_push import (
+    ExternalRefCollisionError,
+    fire_and_forget,
+    generate_unique_external_ref,
+    push_immediately_if_configured,
+)
+from app.filename import capture_date_time_from_device_timestamp, is_test_filename
 from app.repo import get_group_images
 from app.schemas import JobStatus, OcrClaimResponse, OcrFailRequest, OcrJobOut, OcrMeterEntry, VALID_OCR_ENGINE_CODES
 from app import storage
@@ -21,28 +29,6 @@ def _job_out(row) -> OcrJobOut:
 
 def _meter_out(row) -> OcrMeterEntry:
     return OcrMeterEntry(**dict(row))
-
-
-def _capture_date_time_from_device_timestamp(device_timestamp: dt.datetime | None) -> tuple[dt.date, dt.time]:
-    """
-    capture_date/capture_time mean "when ESP32 captured the photo", not
-    "when OCR ran" — pulled from the job's own device_timestamp (already
-    stored, denormalized from the anchor image) rather than anything the
-    OCR client sends. device_timestamp comes back from asyncpg as a
-    UTC-aware datetime (Postgres stores TIMESTAMPTZ as UTC internally) —
-    convert back to Bangkok local time first, or the date could be off
-    by a day near midnight, and the time would be wrong by 7 hours.
-    (Function/columns used to be called reading_date/reading_time.)
-
-    device_timestamp is nullable in the schema — falls back to the
-    current server time (Bangkok) in the rare case it's missing, so this
-    never fails outright.
-    """
-    if device_timestamp is not None:
-        local = device_timestamp.astimezone(BANGKOK_TZ)
-    else:
-        local = dt.datetime.now(BANGKOK_TZ)
-    return local.date(), local.time()
 
 
 @router.get("", response_model=list[OcrJobOut], summary="Admin List Ocr Jobs")
@@ -114,6 +100,7 @@ async def _submit_ocr_result(
     ocr_reading: float | None,
     error_type: int,
     ocr_engine: int,
+    confidence: float | None,
     *,
     expected_test: bool,
     wrong_endpoint_hint: str,
@@ -168,6 +155,24 @@ async def _submit_ocr_result(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"ocr_engine must be one of {VALID_OCR_ENGINE_CODES} — got {ocr_engine!r}",
         )
+    if confidence is not None and not (0 <= confidence <= 100):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"confidence must be between 0 and 100 — got {confidence!r}",
+        )
+    if ocr_reading is not None and ocr_reading < 0:
+        # Confirmed fix (spec-compliance audit) — spec's own field
+        # table for aiValue says "number ≥0" explicitly. Validating
+        # here, at the point this reading first enters the system,
+        # catches an OCR Worker bug or typo immediately (422, obvious
+        # cause) rather than letting a negative value flow all the way
+        # to the CFO Platform push and fail there as a 400
+        # (failed_permanent — indistinguishable in the dashboard from
+        # a real CFO Platform-side rejection, much harder to diagnose).
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"ocr_reading must be ≥0 (a meter's cumulative reading can't be negative) — got {ocr_reading!r}",
+        )
 
     async with pool().acquire() as conn:
         async with conn.transaction():
@@ -191,7 +196,7 @@ async def _submit_ocr_result(
                     ),
                 )
 
-            capture_date, capture_time = _capture_date_time_from_device_timestamp(job["device_timestamp"])
+            capture_date, capture_time = capture_date_time_from_device_timestamp(job["device_timestamp"])
 
             # No file write at all — just reference the anchor's filename,
             # already sitting on disk since the original ESP32 upload.
@@ -211,21 +216,41 @@ async def _submit_ocr_result(
             image = str(storage.original_path(job["group_id"], job["original_filename"]))
 
             target_table = "ocr_meter_test" if expected_test else "ocr_meter"
-            meter_row = await conn.fetchrow(
-                f"""
-                INSERT INTO {target_table}
-                    (meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING *
-                """,
-                job["meter_id"],
-                capture_date,
-                capture_time,
-                ocr_reading,
-                error_type,
-                image,
-                ocr_engine,
-            )
+
+            # external_ref — confirmed decision ("แบบ A"): generate +
+            # persist HERE, at OCR-result time, not deferred until the
+            # first push attempt. Collision handling is required, not
+            # optional — see external_ref's own UNIQUE constraint
+            # comment in db/init.sql for exactly why a silent duplicate
+            # would be wrong (CFO Platform would treat the second
+            # reading as a retry of the first and drop it). Shared
+            # retry loop, confirmed refactor (ข้อ 20) — see
+            # generate_unique_external_ref()'s own docstring; the
+            # manual-edit re-push path reuses this exact same logic
+            # rather than a second, possibly-drifting copy of it.
+            async def _insert(ref: str) -> asyncpg.Record:
+                return await conn.fetchrow(
+                    f"""
+                    INSERT INTO {target_table}
+                        (meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine, confidence, external_ref)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    RETURNING *
+                    """,
+                    job["meter_id"],
+                    capture_date,
+                    capture_time,
+                    ocr_reading,
+                    error_type,
+                    image,
+                    ocr_engine,
+                    confidence,
+                    ref,
+                )
+
+            try:
+                meter_row = await generate_unique_external_ref(conn, job["meter_id"], capture_date, capture_time, _insert)
+            except ExternalRefCollisionError as e:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)) from e
 
             await conn.execute(
                 "UPDATE ocr_jobs SET status = 'done', ocr_reading = $1 WHERE id = $2",
@@ -237,6 +262,33 @@ async def _submit_ocr_result(
             # considered (and picked from) all of them.
             await conn.execute("UPDATE images SET ocr_status = 'done' WHERE group_id = $1", job["group_id"])
 
+    # "เอาตาม spec" — confirmed: attempt a push right away rather than
+    # waiting for external_push_sweep_loop's next tick (up to
+    # external_push_sweep_interval_seconds later) — see
+    # push_immediately_if_configured()'s own docstring for why this is
+    # the spec-faithful behavior. fire_and_forget() (not a bare
+    # asyncio.create_task()), confirmed fix found during a correctness
+    # audit — see that helper's own comment in app/external_push.py for
+    # why a bare create_task() call here was a real bug (the task could
+    # silently get garbage-collected mid-HTTP-call, with zero error or
+    # log). Not awaited either way — a slow/failed CFO Platform call
+    # must never delay this endpoint's own response to the OCR Worker.
+    #
+    # Confirmed decision: test readings (expected_test → ocr_meter_test)
+    # are NEVER pushed — that table exists to exercise this system's own
+    # pipeline, and nothing in the CFO Platform payload marks a reading
+    # as a test (see PUSHABLE_TABLE in app/external_push.py). Skipped
+    # here so no task is even created; push_immediately_if_configured()
+    # and attempt_push_for_row() independently refuse it too.
+    if not expected_test:
+        fire_and_forget(
+            push_immediately_if_configured(
+                job["meter_id"],
+                target_table,
+                meter_row["id"],
+                get_settings().external_api_base_url,
+            )
+        )
     return _meter_out(meter_row)
 
 
@@ -272,6 +324,15 @@ async def admin_submit_ocr_result(
             "function body (same reason as error_type above: a Literal type on a Form() field doesn't "
             "reliably coerce the string multipart/form-data sends). See "
             "GET /admin/meters/ocr-engine-meaning for what each one means."
+        ),
+    ),
+    confidence: float | None = Form(
+        default=None,
+        description=(
+            "Optional, 0-100. Confirmed request (CFO Platform integration) — reported directly by "
+            "the Worker, NOT derived/calculated from ocr_engine on this server's end; the two are "
+            "separate, independently-reported values. Forwarded largely as-is to CFO Platform's own "
+            "aiValue/confidence field when this reading gets pushed externally."
         ),
     ),
     _: CurrentUser = Depends(get_ocr_client),
@@ -330,6 +391,7 @@ async def admin_submit_ocr_result(
         ocr_reading,
         error_type,
         ocr_engine,
+        confidence,
         expected_test=False,
         wrong_endpoint_hint="POST .../result-test",
     )
@@ -353,6 +415,10 @@ async def admin_submit_ocr_result_test(
     ocr_engine: int = Form(
         ...,
         description="Always required, same meaning as POST .../result — see that endpoint's description.",
+    ),
+    confidence: float | None = Form(
+        default=None,
+        description="Optional, 0-100, same meaning as POST .../result — see that endpoint's description.",
     ),
     _: CurrentUser = Depends(get_ocr_client),
 ):
@@ -378,6 +444,7 @@ async def admin_submit_ocr_result_test(
         ocr_reading,
         error_type,
         ocr_engine,
+        confidence,
         expected_test=True,
         wrong_endpoint_hint="POST .../result",
     )

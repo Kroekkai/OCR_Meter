@@ -2,10 +2,20 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from app.auth import CurrentUser, get_admin_or_service
+from app.auth import CurrentUser, get_admin_or_service, get_current_admin
 from app.config import get_settings
+from app.crypto import decrypt_api_key
 from app.db import pool, utility_type_for_meter_id
-from app.schemas import Esp32UploadLogEntry, MeterHistoryEntry, OcrEngineMeaningEntry, OcrMeterEntry, OcrMeterTestEntry
+from app.external_push import PUSHABLE_TABLE, attempt_push_for_row
+from app.schemas import (
+    Esp32UploadLogEntry,
+    MeterHistoryEntry,
+    OcrEngineMeaningEntry,
+    OcrMeterEntry,
+    OcrMeterTestEntry,
+    PushExternalResult,
+    PushIssueEntry,
+)
 
 router = APIRouter(prefix="/admin/meters", tags=["default"])
 
@@ -306,3 +316,128 @@ async def admin_list_ocr_engine_meaning(
     """
     rows = await pool().fetch("SELECT * FROM ocr_engine_meaning ORDER BY code")
     return [OcrEngineMeaningEntry(**dict(r)) for r in rows]
+
+
+@router.post(
+    "/ocr-meter/{entry_id}/push-external",
+    response_model=PushExternalResult,
+    summary="Admin Manually Push One Reading To CFO Platform",
+)
+async def admin_push_ocr_meter_external(
+    entry_id: int,
+    _: CurrentUser = Depends(get_current_admin),
+):
+    """
+    Confirmed request (ข้อ 17) — ONE manual push attempt for one
+    already-OCR'd reading, triggered by an admin, not by the (not yet
+    built — ข้อ 21) automatic retry scheduler. Confirmed use case: the
+    very first real-world test once real CFO Platform credentials
+    exist, without needing the full automated system running yet — and
+    generally, forcing an immediate retry for one specific row without
+    waiting for its push_next_retry_at.
+
+    get_current_admin (a real admin JWT), not get_admin_or_service —
+    confirmed: this action has a real external side effect (an actual
+    HTTP call to CFO Platform, possibly creating a real record on their
+    end), unlike this router's other endpoints, which only read.
+
+    Delegates the actual attempt to attempt_push_for_row() — same
+    function process_due_pushes() (the batch/retry path, not wired up
+    to run automatically yet) will use, so a manual push here and a
+    future automatic retry behave identically, no separate code path.
+    """
+    # Confirmed decision: only ocr_meter is ever pushed — no is_test
+    # option anymore (ocr_meter_test is for exercising this system's
+    # own pipeline, never sent to CFO Platform). For the spec's install
+    # step 3 ("ส่งรายการทดสอบ 1 รายการ"), an admin pushes ONE chosen real
+    # ocr_meter row by id here, and CFO Platform's staff can reject it
+    # on their side ("ปฏิเสธรายการทดสอบทิ้งได้").
+    table = PUSHABLE_TABLE
+    settings = get_settings()
+    if not settings.external_api_base_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="EXTERNAL_API_BASE_URL is not configured — nothing to push to yet.",
+        )
+
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(f"SELECT * FROM {table} WHERE id = $1", entry_id)
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No row with id={entry_id} in {table}")
+        row = dict(row)
+        if row["external_ref"] is None:
+            # Confirmed: should never actually happen — every row gets an
+            # external_ref at OCR-result time (ข้อ 10) — but checked
+            # explicitly rather than letting push_meter_reading() fail
+            # confusingly on a None value.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Row id={entry_id} has no external_ref — this should never happen for a row already in {table}.",
+            )
+
+        key_row = await conn.fetchrow(
+            "SELECT api_key_encrypted FROM external_api_keys WHERE meter_id = $1 AND is_active = true",
+            row["meter_id"],
+        )
+        if key_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No active external API key configured for meter_id={row['meter_id']!r}.",
+            )
+        api_key = decrypt_api_key(key_row["api_key_encrypted"])
+
+        try:
+            outcome = await attempt_push_for_row(conn, row, table, api_key, settings.external_api_base_url)
+        except ValueError as e:
+            # Configuration problem (e.g. EXTERNAL_API_BASE_URL isn't https) —
+            # a clear 500 with the reason, not an opaque traceback.
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)) from e
+        updated = await conn.fetchrow(f"SELECT * FROM {table} WHERE id = $1", entry_id)
+
+    return PushExternalResult(
+        outcome=outcome,
+        push_status=updated["push_status"],
+        push_attempt_count=updated["push_attempt_count"],
+        push_last_error=updated["push_last_error"],
+        push_response_id=updated["push_response_id"],
+        push_cfo_status=updated["push_cfo_status"],
+        push_meter_matched=updated["push_meter_matched"],
+    )
+
+
+@router.get(
+    "/push-issues",
+    response_model=list[PushIssueEntry],
+    summary="Admin List Push Issues Needing Attention",
+)
+async def admin_list_push_issues(
+    limit: int = Query(default=100, ge=1, le=500),
+    _: CurrentUser = Depends(get_admin_or_service),
+):
+    """
+    Confirmed request (ข้อ 21) — the closest thing this system has to
+    an "admin notification" for push_meter_matched=false (see
+    PushIssueEntry's own docstring for why: no email/SMS
+    infrastructure exists here, so a dashboard-visible list an admin
+    actually checks is the confirmed mechanism). Also surfaces
+    failed_permanent rows (400/401/403/413 — never retried
+    automatically by external_push_sweep_loop, so this list is the
+    only way these ever get noticed).
+
+    ocr_meter only — confirmed decision: ocr_meter_test is never pushed
+    (see PUSHABLE_TABLE in app/external_push.py), so it can never have
+    a push issue to report. is_test is kept in the response shape
+    (always false) so the dashboard needn't change.
+    """
+    rows = await pool().fetch(
+        """
+        SELECT id, false AS is_test, meter_id, capture_date, capture_time,
+               push_status, push_last_error, push_meter_matched, push_response_id
+        FROM ocr_meter
+        WHERE push_meter_matched = false OR push_status = 'failed_permanent'
+        ORDER BY capture_date DESC, capture_time DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    return [PushIssueEntry(**dict(r)) for r in rows]

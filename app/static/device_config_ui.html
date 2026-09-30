@@ -264,6 +264,67 @@
     width: 100%;
     box-sizing: border-box;
   }
+  /* ---------- push issues panel (ข้อ 21/24) ---------- */
+  #push-issues-btn {
+    position: relative;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  #push-issues-btn .badge-count {
+    display: inline-block;
+    margin-left: 6px;
+    background: var(--danger, #d64545);
+    color: #fff;
+    border-radius: 10px;
+    padding: 1px 7px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  #push-issues-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 100;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 40px 20px;
+  }
+  #push-issues-overlay.open { display: flex; }
+  #push-issues-panel {
+    background: var(--panel, #fff);
+    border-radius: 10px;
+    max-width: 900px;
+    width: 100%;
+    max-height: 80vh;
+    overflow-y: auto;
+    padding: 20px;
+  }
+  #push-issues-panel .panel-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+  }
+  .push-issue-row {
+    display: grid;
+    grid-template-columns: 110px 150px 130px 1fr;
+    gap: 10px;
+    align-items: start;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    font-size: 13px;
+  }
+  .push-issue-row .status-failed_permanent { color: var(--danger, #d64545); font-weight: 600; }
+  .push-issue-row .status-pending { color: var(--text-muted); }
+  .push-issue-row .not-matched { color: var(--danger, #d64545); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -286,10 +347,25 @@
   <header>
     <h1>Meter config <span>— ตารางถ่ายภาพ ESP32</span></h1>
     <div id="whoami">
+      <button id="push-issues-btn" type="button">⚠ Push Issues<span class="badge-count" id="push-issues-count" style="display:none"></span></button>
       <span id="whoami-name"></span>
       <button id="logout-btn">ออกจากระบบ</button>
     </div>
   </header>
+
+  <div id="push-issues-overlay">
+    <div id="push-issues-panel">
+      <div class="panel-head">
+        <h2>รายการที่ต้องตรวจสอบ (Push ไป CFO Platform)</h2>
+        <button type="button" id="push-issues-close">ปิด</button>
+      </div>
+      <div class="hint" style="margin-bottom:12px">
+        แสดงรายการที่ push ล้มเหลวแบบถาวร (ต้องแก้ไขเอง ระบบจะไม่ retry ให้อัตโนมัติ) หรือมิเตอร์ไม่ตรงกับทะเบียนฝั่ง CFO Platform (<code>meterMatched: false</code>)
+      </div>
+      <div id="push-issues-body"></div>
+    </div>
+  </div>
+
   <main id="config-view">
     <div id="list-pane">
       <div class="pane-head">
@@ -396,6 +472,23 @@
           <span id="save-msg"></span>
         </div>
 
+        <fieldset>
+          <legend>CFO Platform API Key</legend>
+          <div class="field">
+            <label>สถานะ</label>
+            <div class="static-box" id="f-api-key-status">-</div>
+            <div class="hint">ระบบไม่แสดงค่ากุญแจเดิมซ้ำอีก (เหมือนฝั่ง CFO Platform เอง) — ใส่ค่าใหม่ด้านล่างเพื่อตั้ง/เปลี่ยนกุญแจเท่านั้น</div>
+          </div>
+          <div class="field">
+            <label>ใส่ API key ใหม่ (จะแทนที่ของเดิมทันที)</label>
+            <input type="password" id="f-api-key-input" placeholder="วาง API key ที่ได้รับจาก CFO Platform" autocomplete="off">
+          </div>
+          <div class="actions">
+            <button type="button" class="primary" id="api-key-save-btn">บันทึก API Key</button>
+            <span id="api-key-msg"></span>
+          </div>
+        </fieldset>
+
         <div id="tr-section">
           <div class="section-divider">ผลทดสอบล่าสุด</div>
           <div id="tr-empty" class="tr-empty">ยังไม่มีผลทดสอบสำหรับมิเตอร์นี้</div>
@@ -444,7 +537,71 @@
     $("app").style.display = "block";
     $("whoami-name").textContent = localStorage.getItem(USER_KEY) || "";
     loadList();
+    loadPushIssuesCount();
   }
+
+  // ---------- push issues (ข้อ 21/24) ----------
+  function pushStatusLabel(status) {
+    if (status === "failed_permanent") return "ล้มเหลวถาวร (ต้องแก้ไขเอง)";
+    if (status === "failed_retryable") return "กำลัง retry อยู่";
+    if (status === "pending") return "ส่งแล้ว รอตรวจสอบ";
+    if (status === "not_pushed") return "ยังไม่ได้ส่ง";
+    return status;
+  }
+
+  async function loadPushIssuesCount() {
+    try {
+      const res = await api("meters/push-issues?limit=500");
+      const issues = await res.json();
+      const badge = $("push-issues-count");
+      if (issues.length > 0) {
+        badge.textContent = issues.length;
+        badge.style.display = "inline-block";
+      } else {
+        badge.style.display = "none";
+      }
+    } catch (e) { /* handled in api() */ }
+  }
+
+  async function loadPushIssuesPanel() {
+    const body = $("push-issues-body");
+    body.textContent = "กำลังโหลด...";
+    try {
+      const res = await api("meters/push-issues?limit=500");
+      const issues = await res.json();
+      if (issues.length === 0) {
+        body.innerHTML = '<div class="tr-empty">ไม่มีรายการที่ต้องตรวจสอบตอนนี้</div>';
+        return;
+      }
+      body.innerHTML = issues.map((it) => {
+        const when = it.capture_date + " " + it.capture_time;
+        const statusClass = "status-" + it.push_status;
+        const matchedPart = it.push_meter_matched === false
+          ? '<div class="not-matched">meterMatched: false — มิเตอร์นี้ไม่มีในทะเบียน CFO Platform</div>'
+          : "";
+        const errPart = it.push_last_error ? '<div>' + it.push_last_error + '</div>' : "";
+        return (
+          '<div class="push-issue-row">' +
+          '<div>' + it.meter_id + (it.is_test ? ' <span class="hint">(ทดสอบ)</span>' : '') + '</div>' +
+          '<div>' + when + '</div>' +
+          '<div class="' + statusClass + '">' + pushStatusLabel(it.push_status) + '</div>' +
+          '<div>' + matchedPart + errPart + '</div>' +
+          '</div>'
+        );
+      }).join("");
+    } catch (e) { /* handled in api() */ }
+  }
+
+  $("push-issues-btn").addEventListener("click", () => {
+    $("push-issues-overlay").classList.add("open");
+    loadPushIssuesPanel();
+  });
+  $("push-issues-close").addEventListener("click", () => {
+    $("push-issues-overlay").classList.remove("open");
+  });
+  $("push-issues-overlay").addEventListener("click", (e) => {
+    if (e.target.id === "push-issues-overlay") $("push-issues-overlay").classList.remove("open");
+  });
 
   $("login-btn").addEventListener("click", async () => {
     const username = $("li-user").value.trim();
@@ -557,7 +714,7 @@
   }
 
   $("new-btn").addEventListener("click", () => {
-    const meterId = prompt("รหัสมิเตอร์ที่จะตั้งค่า เช่น E103, W201, G050");
+    const meterId = prompt("รหัสมิเตอร์ที่จะตั้งค่า เช่น ELE-000001, WAT-000001, GAS-000001");
     if (!meterId) return;
     selectMeter(meterId.trim().toUpperCase());
   });
@@ -571,6 +728,7 @@
       const cfg = await res.json();
       renderDetail(cfg);
       loadTestResults(meterId);
+      loadApiKeyStatus(meterId);
     } catch (e) { /* handled in api() */ }
   }
 
@@ -709,6 +867,54 @@
       loadList();
     } catch (e) { /* handled in api() */ }
   });
+
+  // ---------- CFO Platform API key (ข้อ 18) ----------
+  async function loadApiKeyStatus(meterId) {
+    $("f-api-key-status").textContent = "กำลังโหลด...";
+    $("api-key-msg").textContent = "";
+    try {
+      const res = await api("device-config/" + encodeURIComponent(meterId) + "/external-api-key");
+      const st = await res.json();
+      if (!st.has_key) {
+        $("f-api-key-status").textContent = "ยังไม่ได้ตั้งค่า";
+        return;
+      }
+      const activePart = st.is_active ? "ใช้งานอยู่" : "ปิดใช้งานอยู่";
+      const whenPart = st.rotated_at ? new Date(st.rotated_at).toLocaleString("th-TH") : "-";
+      $("f-api-key-status").textContent = activePart + " · เปลี่ยนล่าสุด " + whenPart;
+    } catch (e) { /* handled in api() */ }
+  }
+
+  async function saveApiKey() {
+    const key = $("f-api-key-input").value.trim();
+    if (!key) {
+      showApiKeyMsg("กรอก API key ก่อนกดบันทึก", true);
+      return;
+    }
+    if (!currentMeterId) return;
+    try {
+      const res = await api("device-config/" + encodeURIComponent(currentMeterId) + "/external-api-key", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: key }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        showApiKeyMsg("บันทึกไม่สำเร็จ: " + (err.detail ? JSON.stringify(err.detail) : res.status), true);
+        return;
+      }
+      $("f-api-key-input").value = ""; // เคลียร์ช่องทันที — ไม่ปล่อยให้ plaintext ค้างอยู่บนหน้าจอ
+      showApiKeyMsg("บันทึกแล้ว", false);
+      loadApiKeyStatus(currentMeterId);
+    } catch (e) { /* handled in api() */ }
+  }
+  $("api-key-save-btn").addEventListener("click", saveApiKey);
+
+  function showApiKeyMsg(text, isErr) {
+    const el = $("api-key-msg");
+    el.textContent = text;
+    el.className = isErr ? "err" : "ok";
+  }
 
   // ---------- dropdown options ----------
   // Dropdowns instead of free-typed numbers so an out-of-range value
