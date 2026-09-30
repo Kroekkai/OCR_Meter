@@ -418,9 +418,10 @@ async def admin_list_push_issues(
     PushIssueEntry's own docstring for why: no email/SMS
     infrastructure exists here, so a dashboard-visible list an admin
     actually checks is the confirmed mechanism). Also surfaces
-    failed_permanent rows (400/401/403/413 — never retried
-    automatically by external_push_sweep_loop, so this list is the
-    only way these ever get noticed).
+    failed_permanent rows (400/413 — never retried automatically by
+    external_push_sweep_loop, so this list is the only way these ever
+    get noticed) and blocked_auth rows (401/403 — spec 4.3 "แจ้ง
+    ผู้ดูแล": paused until the meter's key is replaced or re-verified).
 
     ocr_meter only — confirmed decision: ocr_meter_test is never pushed
     (see PUSHABLE_TABLE in app/external_push.py), so it can never have
@@ -432,7 +433,7 @@ async def admin_list_push_issues(
         SELECT id, false AS is_test, meter_id, capture_date, capture_time,
                push_status, push_last_response, push_meter_matched
         FROM ocr_meter
-        WHERE push_meter_matched = false OR push_status = 'failed_permanent'
+        WHERE push_meter_matched = false OR push_status IN ('failed_permanent', 'blocked_auth')
         ORDER BY capture_date DESC, capture_time DESC
         LIMIT $1
         """,

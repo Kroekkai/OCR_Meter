@@ -323,6 +323,7 @@
     font-size: 13px;
   }
   .push-issue-row .status-failed_permanent { color: var(--danger, #d64545); font-weight: 600; }
+  .push-issue-row .status-blocked_auth { color: var(--danger, #d64545); font-weight: 600; }
   .push-issue-row .status-pending { color: var(--text-muted); }
   .push-issue-row .not-matched { color: var(--danger, #d64545); font-weight: 600; }
 </style>
@@ -543,6 +544,7 @@
   // ---------- push issues (ข้อ 21/24) ----------
   function pushStatusLabel(status) {
     if (status === "failed_permanent") return "ล้มเหลวถาวร (ต้องแก้ไขเอง)";
+    if (status === "blocked_auth") return "API key ใช้ไม่ได้ (401/403) — ใส่ key ใหม่ หรือกดตรวจอุปกรณ์";
     if (status === "failed_retryable") return "กำลัง retry อยู่";
     if (status === "pending") return "ส่งแล้ว รอตรวจสอบ";
     if (status === "not_pushed") return "ยังไม่ได้ส่ง";
@@ -893,7 +895,13 @@
       }
       const activePart = st.is_active ? "ใช้งานอยู่" : "ปิดใช้งานอยู่";
       const whenPart = st.rotated_at ? new Date(st.rotated_at).toLocaleString("th-TH") : "-";
-      $("f-api-key-status").textContent = activePart + " · เปลี่ยนล่าสุด " + whenPart;
+      let authPart = "";
+      if (st.auth_failed_at) {
+        authPart = " · ⚠ หยุดส่งอยู่: CFO Platform ตอบ " + (st.auth_failed_status || "401/403") +
+          " เมื่อ " + new Date(st.auth_failed_at).toLocaleString("th-TH") +
+          " — ใส่ key ใหม่ หรือกดตรวจอุปกรณ์เพื่อส่งต่อ";
+      }
+      $("f-api-key-status").textContent = activePart + " · เปลี่ยนล่าสุด " + whenPart + authPart;
     } catch (e) { /* handled in api() */ }
   }
 

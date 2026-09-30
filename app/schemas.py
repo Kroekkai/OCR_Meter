@@ -331,7 +331,7 @@ class OcrEngineMeaningEntry(BaseModel):
 # itself — outcome is the one field not stored anywhere, computed
 # fresh by attempt_push_for_row() each call.
 class PushExternalResult(BaseModel):
-    outcome: str  # "success" | "failed_retryable" | "failed_permanent" — this attempt's own result, see app/external_push.py::attempt_push_for_row()
+    outcome: str  # "success" | "failed_retryable" | "failed_permanent" | "blocked_auth" — this attempt's own result, see app/external_push.py::attempt_push_for_row()
     push_status: str
     push_attempt_count: int
     # Confirmed consolidation — was 3 separate fields (push_last_error/
@@ -412,6 +412,12 @@ class ExternalApiKeyStatus(BaseModel):
     is_active: bool | None = None
     created_at: dt.datetime | None = None
     rotated_at: dt.datetime | None = None
+    # Set when CFO Platform answered 401/403 for this key (spec 4.3) —
+    # pushes for this meter are paused until a new key is saved or
+    # verify-external passes. Error text only, never the key itself.
+    auth_failed_at: dt.datetime | None = None
+    auth_failed_status: int | None = None
+    auth_failed_message: str | None = None
 
 
 # --------------------------------------------------------------------------

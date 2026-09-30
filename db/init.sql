@@ -505,7 +505,11 @@ CREATE TABLE IF NOT EXISTS ocr_meter (
     --                      เพราะ spec ไม่มี endpoint เช็คสถานะทีหลัง — เก็บ
     --                      ไว้เผื่ออนาคต)
     --   failed_retryable — เจอ 5xx/timeout/เครือข่ายพัง — ยังไม่เลิกพยายาม
-    --   failed_permanent — เจอ 400/401/403/413 — ตาม spec ห้าม retry เด็ดขาด
+    --   failed_permanent — เจอ 400/413 (ข้อมูล/รูปของรายการนี้ผิด) — ตาม spec
+    --                      ห้าม retry เด็ดขาด
+    --   blocked_auth     — เจอ 401/403 (กุญแจของเครื่องใช้ไม่ได้) — ไม่ retry
+    --                      ตามรอบ แต่ยังอยู่ในคิว: ส่งต่ออัตโนมัติเมื่อกุญแจถูก
+    --                      แก้แล้ว (ดู external_api_keys.auth_failed_at)
     push_status         TEXT        NOT NULL DEFAULT 'not_pushed',
     -- push_attempt_count — จำนวนครั้งที่พยายาม push แล้ว (รวมครั้งแรก) ใช้
     -- คำนวณ delay รอบถัดไปตาม schedule ที่ spec กำหนด (0,30วิ,2นาที,10นาที,
@@ -982,6 +986,29 @@ CREATE TABLE IF NOT EXISTS external_api_keys (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     rotated_at          TIMESTAMPTZ
 );
+
+-- auth_failed_* — spec ข้อ 4.3: 401 = "หยุดส่ง แจ้งผู้ดูแล", 403 = "แจ้ง
+-- ผู้ดูแล". ทั้งคู่เป็นปัญหาของ "กุญแจของเครื่อง" ไม่ใช่ของรายการใดรายการหนึ่ง
+-- จึงบันทึกไว้ที่ระดับกุญแจ: auth_failed_at ไม่เป็น NULL = หยุดส่งทุกรายการ
+-- ของ meter นี้ (sweep / immediate push ข้ามทั้งหมด) จนกว่าจะ
+--   (ก) ใส่ API key ใหม่ (PUT external-api-key ล้างค่านี้), หรือ
+--   (ข) กดตรวจอุปกรณ์ (verify-external) แล้วผ่าน — กรณีผู้ดูแลฝั่ง CFO
+--       เปิดใช้งานเครื่อง / แก้ IP whitelist ให้แล้วโดยกุญแจเดิมยังใช้ได้, หรือ
+--   (ค) admin กด manual push แล้วสำเร็จ
+-- รายการที่ค้างอยู่ (push_status = 'blocked_auth') จะถูกส่งต่อเองอัตโนมัติ
+ALTER TABLE external_api_keys ADD COLUMN IF NOT EXISTS auth_failed_at      TIMESTAMPTZ;
+ALTER TABLE external_api_keys ADD COLUMN IF NOT EXISTS auth_failed_status  INT;
+ALTER TABLE external_api_keys ADD COLUMN IF NOT EXISTS auth_failed_message TEXT;
+
+-- One-off migration (idempotent): แถวที่เคยโดน 401/403 ในเวอร์ชันก่อนถูก
+-- ตั้งเป็น failed_permanent ซึ่งไม่มีทางกลับมาส่งเองได้อีก — ย้ายเป็น
+-- blocked_auth ให้ sweep ลองใหม่ (ถ้ากุญแจยังเสีย จะโดน 401 ครั้งเดียวแล้ว
+-- ระงับทั้งเครื่องตามกลไกใหม่)
+UPDATE ocr_meter
+SET push_status = 'blocked_auth', push_next_retry_at = NULL
+WHERE push_status = 'failed_permanent'
+  AND (push_last_response->>'error' LIKE 'HTTP 401:%'
+       OR push_last_response->>'error' LIKE 'HTTP 403:%');
 
 -- esp32_upload_log's meter_id FK is added near the end of this file
 -- instead, right after that table's own reorder migration — confirmed

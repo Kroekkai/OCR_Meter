@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import decimal
 import io
 import json
 import logging
@@ -35,7 +36,7 @@ from typing import Awaitable, Callable, TypeVar
 import asyncpg
 import httpx
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from app.crypto import decrypt_api_key
 
@@ -185,6 +186,8 @@ class ExternalPushError(Exception):
 class ExternalPushClientError(ExternalPushError):
     """
     400 (bad/missing field), 401 (bad/disabled API key), 403 (forbidden), or 413 (file too large).
+    attempt_push_for_row() splits these: 400/413 -> failed_permanent for
+    that row; 401/403 -> blocked_auth + a key-level pause (AUTH_BLOCK_STATUS_CODES).
     Confirmed: the spec says never retry these — the same request will
     fail the same way every time (a 401 in particular means the key
     itself is the problem, not this one attempt).
@@ -234,18 +237,30 @@ class DeviceVerifyData(BaseModel):
 
 class MeterReadingPushData(BaseModel):
     """
-    POST .../meter-readings success (201) data object — confirmed shape
-    from spec section 4.2. status/duplicate/meterMatched meanings are
-    from that same section's own field table, not inferred.
+    POST .../meter-readings success (201) data object — field names from
+    spec section 4.2. status/duplicate/meterMatched meanings are from
+    that same section's own field table, not inferred.
+
+    Every field is OPTIONAL on purpose (spec-compliance fix): a 201 means
+    CFO Platform has already accepted and stored the reading. If this
+    model were strict, one unexpected value (e.g. meterNo: null when
+    meterMatched is false) would fail validation, land in
+    attempt_push_for_row()'s generic except -> failed_retryable, and the
+    same already-accepted reading would be re-sent every hour forever
+    (each retry answered duplicate:true, each failing the same parse).
+    Success is decided by the HTTP status alone; these fields are only
+    what we record about it.
     """
 
-    id: str
-    externalRef: str
-    deviceSn: str
-    meterNo: str
-    status: str  # "pending" | "confirmed" | "rejected" — CFO Platform staff review outcome, see section 1.1's flow
-    duplicate: bool  # confirmed: true means this externalRef was already seen — CFO Platform returned the EXISTING record, did not create a new one
-    meterMatched: bool  # confirmed: false means the meter tied to this SN isn't in CFO Platform's own registry — flag for an admin, see this project's own discussion of meterMatched
+    model_config = ConfigDict(extra="ignore")
+
+    id: str | None = None
+    externalRef: str | None = None
+    deviceSn: str | None = None
+    meterNo: str | None = None
+    status: str | None = None  # "pending" | "confirmed" | "rejected" — CFO Platform staff review outcome (section 1.1)
+    duplicate: bool | None = None  # true = externalRef already seen, CFO Platform returned the EXISTING record (section 5)
+    meterMatched: bool | None = None  # false = meter tied to this SN isn't in CFO Platform's registry — admin must be told (4.2)
     imageUrl: str | None = None
 
 
@@ -284,7 +299,7 @@ def build_meter_reading_payload(
     capture_date: dt.date,
     ocr_reading: float | None,
     confidence: float | None,
-) -> dict[str, str | float]:
+) -> dict[str, str]:
     """
     Confirmed request — builds the multipart FORM FIELDS only, per spec
     section 4.1. Does NOT include the image itself (the caller attaches
@@ -318,7 +333,7 @@ def build_meter_reading_payload(
     entirely when None (same reasoning as aiValue: an absent field, not
     a fabricated 0, is correct for "no confidence to report").
     """
-    payload: dict[str, str | float] = {
+    payload: dict[str, str] = {
         "externalRef": external_ref,
         "readingDate": capture_date.isoformat(),
     }
@@ -333,10 +348,33 @@ def build_meter_reading_payload(
         # — verified directly, not assumed. Converting to float first
         # avoids this unconditionally, whether the caller passed a float
         # or a Decimal straight from a DB row.
-        payload["aiValue"] = round(float(ocr_reading), 2)
+        #
+        # Formatted as a plain decimal STRING with exactly 2 places (same
+        # as the spec's own Python example, f"{value:.2f}") instead of a
+        # float: str(float) can produce scientific notation ("1e+16") and
+        # float rounding misrounds halves (round(2.675, 2) == 2.67).
+        # Decimal(str(x)) keeps the value exactly as the DB/OCR had it.
+        payload["aiValue"] = _format_ai_value(ocr_reading)
     if confidence is not None:
-        payload["confidence"] = float(confidence)
+        payload["confidence"] = _format_plain_number(confidence)
     return payload
+
+
+def _format_ai_value(value) -> str:
+    """aiValue per spec 4.1: number ≥0, ≤2 decimal places, '.' as the decimal point, never exponent notation."""
+    d = decimal.Decimal(str(value)).quantize(decimal.Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
+    if d < 0:
+        # Already rejected at ingest (ocr_jobs.py) — re-checked here so a bad
+        # row can never go out as a negative value (spec: "number ≥0").
+        # Same category as a 400: the data itself is wrong, retrying won't help.
+        raise ExternalPushClientError(400, f"aiValue ติดลบ ({value!r}) — ไม่ส่ง (spec 4.1: number ≥0)")
+    return format(d, "f")
+
+
+def _format_plain_number(value) -> str:
+    """confidence per spec 4.1: number 0–100 — plain decimal notation, no exponent."""
+    d = decimal.Decimal(str(value)).normalize()
+    return format(d, "f")
 
 
 def _parse_error_response(response: httpx.Response) -> tuple[str, dict]:
@@ -555,13 +593,38 @@ async def push_meter_reading(
     except httpx.HTTPError as e:
         raise ExternalPushServerError(f"Network error calling {url}: {e}") from e
 
-    if response.status_code == 201:
-        return MeterReadingPushData.model_validate(response.json()["data"])
+    if response.status_code in (200, 201):
+        # Spec 4.2 / section 5: 201 (also for duplicate:true). 200 accepted
+        # defensively — any 2xx means CFO Platform stored the reading, and
+        # treating it as a failure would only cause pointless re-sends.
+        return _parse_success_data(response, external_ref)
 
     message, errors = _parse_error_response(response)
     if response.status_code in (400, 401, 403, 413):
         raise ExternalPushClientError(response.status_code, message, errors)
     raise ExternalPushServerError(message, status_code=response.status_code)
+
+
+def _parse_success_data(response: httpx.Response, external_ref: str) -> MeterReadingPushData:
+    """
+    Never raises — see MeterReadingPushData's docstring. If the body isn't
+    the documented shape at all, log it and return a minimal record: the
+    push still counts as successful (CFO Platform has the reading).
+    """
+    try:
+        data = response.json().get("data") or {}
+        parsed = MeterReadingPushData.model_validate(data)
+    except (ValueError, AttributeError, ValidationError) as e:
+        logger.warning(
+            "CFO Platform returned HTTP %s for %s but the body could not be parsed (%s) — treating as success",
+            response.status_code,
+            external_ref,
+            e,
+        )
+        parsed = MeterReadingPushData()
+    if parsed.externalRef is None:
+        parsed.externalRef = external_ref
+    return parsed
 
 
 # --------------------------------------------------------------------------
@@ -602,12 +665,48 @@ def _require_pushable_table(table: str) -> None:
         )
 
 
+# Spec 4.3: these mean the device's KEY can't be used (wrong/disabled key,
+# device switched off, IP not allowed, no ingest permission) — see the
+# blocked_auth handling in attempt_push_for_row().
+AUTH_BLOCK_STATUS_CODES = (401, 403)
+
+
+async def _set_key_auth_block(conn, meter_id: str, status_code: int, message: str) -> None:
+    await conn.execute(
+        """
+        UPDATE external_api_keys
+        SET auth_failed_at = now(), auth_failed_status = $2, auth_failed_message = $3
+        WHERE meter_id = $1
+        """,
+        meter_id,
+        status_code,
+        message[:1000],
+    )
+    logger.warning(
+        "CFO Platform rejected the API key for %s (HTTP %s: %s) — pushes for this meter are paused until an admin fixes it",
+        meter_id,
+        status_code,
+        message,
+    )
+
+
+async def _clear_key_auth_block(conn, meter_id: str) -> None:
+    await conn.execute(
+        """
+        UPDATE external_api_keys
+        SET auth_failed_at = NULL, auth_failed_status = NULL, auth_failed_message = NULL
+        WHERE meter_id = $1 AND auth_failed_at IS NOT NULL
+        """,
+        meter_id,
+    )
+
+
 async def attempt_push_for_row(conn, row: dict, table: str, api_key: str, base_url: str) -> str:
     """
     Confirmed request (ข้อ 19) — ONE push attempt for one ocr_meter
     row, then updates that row's push_* columns based on
     the outcome. Returns a short status string ("success" /
-    "failed_retryable" / "failed_permanent") for the caller to tally,
+    "failed_retryable" / "failed_permanent" / "blocked_auth") for the caller to tally,
     doesn't raise — every ExternalPushError case is caught and turned
     into a DB update instead, since a failed push is an expected,
     routine outcome here, not something the caller needs to handle as
@@ -666,10 +765,14 @@ async def attempt_push_for_row(conn, row: dict, table: str, api_key: str, base_u
                 push_attempt_count = push_attempt_count + 1
             WHERE id = $3
             """,
-            json.dumps({"response_id": data.id, "cfo_status": data.status}),
+            json.dumps({"response_id": data.id, "cfo_status": data.status, "duplicate": data.duplicate}),
             data.meterMatched,
             row["id"],
         )
+        # The key evidently works (e.g. an admin's manual push after CFO
+        # Platform re-enabled the device) — lift any auth block so the
+        # rest of this meter's queued rows resume on the next sweep.
+        await _clear_key_auth_block(conn, row["meter_id"])
         return "success"
 
     except FileNotFoundError as e:
@@ -701,7 +804,29 @@ async def attempt_push_for_row(conn, row: dict, table: str, api_key: str, base_u
         return "failed_permanent"
 
     except ExternalPushClientError as e:
-        # confirmed: 400/401/403/413 — never retry, ever. push_next_retry_at
+        if e.status_code in AUTH_BLOCK_STATUS_CODES:
+            # Spec 4.3: 401 → "หยุดส่ง แจ้งผู้ดูแล", 403 → "แจ้งผู้ดูแล".
+            # A KEY problem, not this row's: every other row of this meter
+            # would fail identically. So: don't retry on a schedule (spec:
+            # ห้าม retry 401/403), stop sending for the whole meter (key-level
+            # block), keep this row queued as blocked_auth so it goes out
+            # automatically once the key is fixed — instead of being stranded
+            # as failed_permanent forever.
+            await _set_key_auth_block(conn, row["meter_id"], e.status_code, e.message)
+            await conn.execute(
+                f"""
+                UPDATE {table}
+                SET push_status = 'blocked_auth',
+                    push_last_response = $1,
+                    push_next_retry_at = NULL,
+                    push_attempt_count = push_attempt_count + 1
+                WHERE id = $2
+                """,
+                json.dumps({"error": f"HTTP {e.status_code}: {e.message}"}),
+                row["id"],
+            )
+            return "blocked_auth"
+        # 400/413 — the data/image of THIS row is the problem. Never retry. push_next_retry_at
         # stays NULL forever, which is what keeps process_due_pushes()'s
         # WHERE clause from ever picking this row up again.
         await conn.execute(
@@ -791,15 +916,22 @@ async def process_due_pushes(conn, base_url: str, max_batch: int = 50) -> dict[s
     unbounded backlog all at once.
     """
     _require_https(base_url)  # misconfiguration: fail the whole tick loudly, once, before touching any row
-    summary = {"success": 0, "failed_retryable": 0, "failed_permanent": 0, "skipped_no_key": 0}
+    summary = {
+        "success": 0,
+        "failed_retryable": 0,
+        "failed_permanent": 0,
+        "blocked_auth": 0,
+        "skipped_no_key": 0,
+        "skipped_auth_blocked": 0,
+    }
 
     for table in (PUSHABLE_TABLE,):
         rows = await conn.fetch(
             f"""
-            SELECT m.*, k.api_key_encrypted
+            SELECT m.*, k.api_key_encrypted, k.auth_failed_at
             FROM {table} m
             LEFT JOIN external_api_keys k ON k.meter_id = m.meter_id AND k.is_active = true
-            WHERE m.push_status IN ('not_pushed', 'failed_retryable')
+            WHERE m.push_status IN ('not_pushed', 'failed_retryable', 'blocked_auth')
               AND (m.push_next_retry_at IS NULL OR m.push_next_retry_at <= now())
               AND m.external_ref IS NOT NULL
             ORDER BY m.id
@@ -807,14 +939,22 @@ async def process_due_pushes(conn, base_url: str, max_batch: int = 50) -> dict[s
             """,
             max_batch,
         )
+        blocked_this_batch: set[str] = set()
         for row in rows:
             row = dict(row)
             if row["api_key_encrypted"] is None:
                 summary["skipped_no_key"] += 1
                 continue
+            if row["auth_failed_at"] is not None or row["meter_id"] in blocked_this_batch:
+                # Spec 4.3 (401: หยุดส่ง) — key is known-bad, don't keep
+                # hitting CFO Platform with it. Row stays queued.
+                summary["skipped_auth_blocked"] += 1
+                continue
             api_key = decrypt_api_key(row["api_key_encrypted"])
             outcome = await attempt_push_for_row(conn, row, table, api_key, base_url)
             summary[outcome] += 1
+            if outcome == "blocked_auth":
+                blocked_this_batch.add(row["meter_id"])
 
     return summary
 
@@ -907,11 +1047,15 @@ async def push_immediately_if_configured(meter_id: str, table: str, row_id: int,
             if row is None or row["external_ref"] is None:
                 return  # confirmed: should not normally happen — see attempt_push_for_row's own note on this
             key_row = await conn.fetchrow(
-                "SELECT api_key_encrypted FROM external_api_keys WHERE meter_id = $1 AND is_active = true",
+                "SELECT api_key_encrypted, auth_failed_at FROM external_api_keys WHERE meter_id = $1 AND is_active = true",
                 meter_id,
             )
             if key_row is None:
                 return  # not configured for CFO Platform push yet — not an error, see docstring
+            if key_row["auth_failed_at"] is not None:
+                # Key is paused after a 401/403 (spec 4.3: หยุดส่ง) — leave the
+                # row queued; the sweep sends it once the key is fixed.
+                return
             api_key = decrypt_api_key(key_row["api_key_encrypted"])
             await attempt_push_for_row(conn, dict(row), table, api_key, base_url)
     except Exception:
