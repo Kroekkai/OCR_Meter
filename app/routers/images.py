@@ -676,9 +676,7 @@ async def admin_edit_ocr_manually(
                             push_status = 'not_pushed',
                             push_attempt_count = 0,
                             push_next_retry_at = NULL,
-                            push_last_error = NULL,
-                            push_response_id = NULL,
-                            push_cfo_status = NULL,
+                            push_last_response = NULL,
                             push_meter_matched = NULL
                         WHERE id = $3
                         """,

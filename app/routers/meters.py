@@ -398,9 +398,7 @@ async def admin_push_ocr_meter_external(
         outcome=outcome,
         push_status=updated["push_status"],
         push_attempt_count=updated["push_attempt_count"],
-        push_last_error=updated["push_last_error"],
-        push_response_id=updated["push_response_id"],
-        push_cfo_status=updated["push_cfo_status"],
+        push_last_response=updated["push_last_response"],
         push_meter_matched=updated["push_meter_matched"],
     )
 
@@ -432,7 +430,7 @@ async def admin_list_push_issues(
     rows = await pool().fetch(
         """
         SELECT id, false AS is_test, meter_id, capture_date, capture_time,
-               push_status, push_last_error, push_meter_matched, push_response_id
+               push_status, push_last_response, push_meter_matched
         FROM ocr_meter
         WHERE push_meter_matched = false OR push_status = 'failed_permanent'
         ORDER BY capture_date DESC, capture_time DESC

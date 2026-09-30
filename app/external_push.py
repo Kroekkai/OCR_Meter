@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import io
+import json
 import logging
 import mimetypes
 from pathlib import Path
@@ -636,11 +637,12 @@ async def attempt_push_for_row(conn, row: dict, table: str, api_key: str, base_u
             f"""
             UPDATE {table}
             SET push_status = 'failed_permanent',
-                push_last_error = 'No image path recorded on this row — nothing to send',
+                push_last_response = $1,
                 push_next_retry_at = NULL,
                 push_attempt_count = push_attempt_count + 1
-            WHERE id = $1
+            WHERE id = $2
             """,
+            json.dumps({"error": "No image path recorded on this row — nothing to send"}),
             row["id"],
         )
         return "failed_permanent"
@@ -658,16 +660,13 @@ async def attempt_push_for_row(conn, row: dict, table: str, api_key: str, base_u
             f"""
             UPDATE {table}
             SET push_status = 'pending',
-                push_response_id = $1,
-                push_cfo_status = $2,
-                push_meter_matched = $3,
-                push_last_error = NULL,
+                push_last_response = $1,
+                push_meter_matched = $2,
                 push_next_retry_at = NULL,
                 push_attempt_count = push_attempt_count + 1
-            WHERE id = $4
+            WHERE id = $3
             """,
-            data.id,
-            data.status,
+            json.dumps({"response_id": data.id, "cfo_status": data.status}),
             data.meterMatched,
             row["id"],
         )
@@ -691,12 +690,12 @@ async def attempt_push_for_row(conn, row: dict, table: str, api_key: str, base_u
             f"""
             UPDATE {table}
             SET push_status = 'failed_permanent',
-                push_last_error = $1,
+                push_last_response = $1,
                 push_next_retry_at = NULL,
                 push_attempt_count = push_attempt_count + 1
             WHERE id = $2
             """,
-            f"Image file not found: {e}",
+            json.dumps({"error": f"Image file not found: {e}"}),
             row["id"],
         )
         return "failed_permanent"
@@ -709,12 +708,12 @@ async def attempt_push_for_row(conn, row: dict, table: str, api_key: str, base_u
             f"""
             UPDATE {table}
             SET push_status = 'failed_permanent',
-                push_last_error = $1,
+                push_last_response = $1,
                 push_next_retry_at = NULL,
                 push_attempt_count = push_attempt_count + 1
             WHERE id = $2
             """,
-            f"HTTP {e.status_code}: {e.message}",
+            json.dumps({"error": f"HTTP {e.status_code}: {e.message}"}),
             row["id"],
         )
         return "failed_permanent"
@@ -727,12 +726,12 @@ async def attempt_push_for_row(conn, row: dict, table: str, api_key: str, base_u
             f"""
             UPDATE {table}
             SET push_status = 'failed_retryable',
-                push_last_error = $1,
+                push_last_response = $1,
                 push_attempt_count = $2,
                 push_next_retry_at = $3
             WHERE id = $4
             """,
-            e.message,
+            json.dumps({"error": e.message}),
             new_attempt_count,
             next_retry_at,
             row["id"],
@@ -755,12 +754,12 @@ async def attempt_push_for_row(conn, row: dict, table: str, api_key: str, base_u
             f"""
             UPDATE {table}
             SET push_status = 'failed_retryable',
-                push_last_error = $1,
+                push_last_response = $1,
                 push_attempt_count = $2,
                 push_next_retry_at = $3
             WHERE id = $4
             """,
-            f"Unexpected error: {type(e).__name__}: {e}",
+            json.dumps({"error": f"Unexpected error: {type(e).__name__}: {e}"}),
             new_attempt_count,
             next_retry_at,
             row["id"],

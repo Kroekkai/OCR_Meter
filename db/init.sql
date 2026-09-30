@@ -497,8 +497,9 @@ CREATE TABLE IF NOT EXISTS ocr_meter (
     -- push_status ค่าที่เป็นไปได้:
     --   not_pushed       — ยังไม่เคยพยายาม push เลย (ค่าเริ่มต้นของทุกแถว)
     --   pending          — push สำเร็จแล้ว (got 201), รอเจ้าหน้าที่ CFO
-    --                      Platform ตรวจสอบ (ดู push_cfo_status ด้านล่าง —
-    --                      คนละความหมายกับ push_status นี้)
+    --                      Platform ตรวจสอบ (ดู cfo_status ใน
+    --                      push_last_response ด้านล่าง — คนละความหมายกับ
+    --                      push_status นี้)
     --   success          — เหมือน pending แต่เจ้าหน้าที่ยืนยันแล้ว (ไม่ได้ใช้
     --                      จริงในเวอร์ชันนี้ — ยังไม่มีทางรู้ผลตรวจสอบภายหลัง
     --                      เพราะ spec ไม่มี endpoint เช็คสถานะทีหลัง — เก็บ
@@ -513,20 +514,24 @@ CREATE TABLE IF NOT EXISTS ocr_meter (
     -- push_next_retry_at — เวลาที่ควรลองรอบถัดไป (NULL = ไม่ต้องลองอีกแล้ว
     -- ไม่ว่าจะเพราะสำเร็จหรือเพราะ failed_permanent)
     push_next_retry_at  TIMESTAMPTZ,
-    -- push_last_error — ข้อความ error ล่าสุด เก็บไว้ debug (โดยเฉพาะกรณี
-    -- failed_permanent ที่จะไม่มีการลองใหม่อีกแล้ว ต้องรู้ว่าทำไมถึงพัง)
-    push_last_error     TEXT,
-    -- push_response_id — UUID ที่ CFO Platform ตอบกลับมา (data.id) เก็บไว้
-    -- อ้างอิงย้อนหลัง — ไม่ใช่ external_ref (คนละตัวกัน: external_ref เราเป็น
-    -- คนสร้าง, push_response_id เขาเป็นคนสร้าง)
-    push_response_id    TEXT,
-    -- push_cfo_status — สถานะฝั่ง CFO Platform เอง (pending/confirmed/
-    -- rejected) จาก response.data.status — คนละอย่างกับ push_status ข้างบน
-    -- (push_status คือสถานะการส่งของเรา, push_cfo_status คือสถานะการตรวจสอบ
-    -- ของเจ้าหน้าที่เขา) เห็นค่านี้ได้แค่ตอน push ครั้งแรกเท่านั้น เพราะ spec
-    -- ไม่มี endpoint ให้เช็คสถานะภายหลังเลย — ค่านี้จึงอาจไม่ทันสมัยหลังจาก
-    -- เจ้าหน้าที่เขาตรวจสอบเสร็จจริง
-    push_cfo_status     TEXT,
+    -- push_last_response — confirmed consolidation (ยุบ push_last_error +
+    -- push_response_id + push_cfo_status เดิม 3 คอลัมน์ เหลือ 1 คอลัมน์
+    -- เดียว): ไม่มีจุดไหนในโค้ด query/WHERE บน 3 คอลัมน์นี้แยกกันเลยสักที่
+    -- (ต่างจาก push_meter_matched ที่ push-issues filter ตรงๆ จึงยังคงแยก
+    -- คอลัมน์ไว้) — ทั้ง 3 ตัวมีไว้ "โชว์ให้ดูตอน debug" เท่านั้น รวมเป็น
+    -- JSON เดียวจึงไม่เสียอะไร ลดจำนวนคอลัมน์ลง 2 คอลัมน์
+    --   ตอนสำเร็จ:  {"response_id": "...", "cfo_status": "pending"}
+    --     response_id = UUID ที่ CFO Platform ตอบกลับมา (data.id) —
+    --       ไม่ใช่ external_ref (คนละตัวกัน: external_ref เราเป็นคนสร้าง,
+    --       response_id เขาเป็นคนสร้าง)
+    --     cfo_status = สถานะฝั่งเขาเอง (pending/confirmed/rejected) จาก
+    --       response.data.status — เห็นได้แค่ตอน push ครั้งแรกเท่านั้น
+    --       เพราะ spec ไม่มี endpoint เช็คสถานะภายหลังเลย จึงอาจไม่ทันสมัย
+    --       หลังจากเจ้าหน้าที่เขาตรวจสอบเสร็จจริง
+    --   ตอนล้มเหลว: {"error": "ข้อความ error ล่าสุด"} — เก็บไว้ debug
+    --     โดยเฉพาะกรณี failed_permanent ที่จะไม่มีการลองใหม่อีกแล้ว
+    --   NULL = ยังไม่เคย push เลย หรือถูก reset (manual edit)
+    push_last_response  JSONB,
     -- push_meter_matched — จาก response.data.meterMatched — false = มิเตอร์
     -- ที่ผูกกับ SN นี้ไม่มีในทะเบียนฝั่งเขา (ต้องแจ้งผู้ดูแล ดู README/
     -- การพูดคุยเรื่อง meterMatched — ระบบแจ้งเตือนจริงยังไม่ได้ทำ ข้อ 23)
@@ -645,10 +650,16 @@ BEGIN
     ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_status TEXT NOT NULL DEFAULT 'not_pushed';
     ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_attempt_count INT NOT NULL DEFAULT 0;
     ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_next_retry_at TIMESTAMPTZ;
-    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_last_error TEXT;
-    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_response_id TEXT;
-    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_cfo_status TEXT;
+    ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_last_response JSONB;
     ALTER TABLE ocr_meter ADD COLUMN IF NOT EXISTS push_meter_matched BOOLEAN;
+    -- Confirmed consolidation — see push_last_response's own comment on
+    -- the CREATE TABLE above. Plain DROP, no data migration: confirmed
+    -- via `SELECT count(*) FROM ocr_meter WHERE push_status !=
+    -- 'not_pushed'` = 0 on the real production DB before this ran, so
+    -- there was nothing in these 3 columns worth carrying over.
+    ALTER TABLE ocr_meter DROP COLUMN IF EXISTS push_last_error;
+    ALTER TABLE ocr_meter DROP COLUMN IF EXISTS push_response_id;
+    ALTER TABLE ocr_meter DROP COLUMN IF EXISTS push_cfo_status;
 END $$;
 
 -- external_ref ต้องไม่ซ้ำกัน — confirmed request (แนวทาง "แบบ A": generate
@@ -672,7 +683,7 @@ END $$;
 -- ถูก" — no-op ถ้าลำดับตรงอยู่แล้ว ปลอดภัยรันซ้ำได้
 DO $$
 DECLARE
-    correct_order TEXT[] := ARRAY['id','meter_id','capture_date','capture_time','ocr_reading','error_type','image','ocr_engine','external_ref','confidence','push_status','push_attempt_count','push_next_retry_at','push_last_error','push_response_id','push_cfo_status','push_meter_matched'];
+    correct_order TEXT[] := ARRAY['id','meter_id','capture_date','capture_time','ocr_reading','error_type','image','ocr_engine','external_ref','confidence','push_status','push_attempt_count','push_next_retry_at','push_last_response','push_meter_matched'];
     actual_order TEXT[];
 BEGIN
     SELECT array_agg(column_name ORDER BY ordinal_position) INTO actual_order
@@ -706,13 +717,11 @@ BEGIN
             push_status         TEXT        NOT NULL DEFAULT 'not_pushed',
             push_attempt_count  INT         NOT NULL DEFAULT 0,
             push_next_retry_at  TIMESTAMPTZ,
-            push_last_error     TEXT,
-            push_response_id    TEXT,
-            push_cfo_status     TEXT,
+            push_last_response  JSONB,
             push_meter_matched  BOOLEAN
         );
-        INSERT INTO ocr_meter_reordered (id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine, external_ref, confidence, push_status, push_attempt_count, push_next_retry_at, push_last_error, push_response_id, push_cfo_status, push_meter_matched)
-            SELECT id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine, external_ref, confidence, push_status, push_attempt_count, push_next_retry_at, push_last_error, push_response_id, push_cfo_status, push_meter_matched
+        INSERT INTO ocr_meter_reordered (id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine, external_ref, confidence, push_status, push_attempt_count, push_next_retry_at, push_last_response, push_meter_matched)
+            SELECT id, meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine, external_ref, confidence, push_status, push_attempt_count, push_next_retry_at, push_last_response, push_meter_matched
             FROM ocr_meter
             ORDER BY id;
         DROP TABLE ocr_meter;
@@ -775,15 +784,18 @@ CREATE TABLE IF NOT EXISTS ocr_meter_test (
     -- confidence — confirmed request: ความหมายเดียวกับ ocr_meter ด้านบน
     -- (OCR Worker ส่งมาตรงๆ 0-100, Nullable)
     confidence          NUMERIC,
-    -- push_* — ความหมายเดียวกับ ocr_meter ด้านบนทุกประการ (ข้อมูลทดสอบก็
-    -- ต้อง push ได้เหมือนกัน — เช่นตอนขั้นตอนติดตั้งอุปกรณ์ที่ spec บอกว่า
-    -- "ส่งรายการทดสอบ 1 รายการ แล้วแจ้งเจ้าหน้าที่ให้ตรวจ")
+    -- push_* — ความหมายเดียวกับ ocr_meter ด้านบนทุกประการในแง่โครงสร้าง
+    -- คอลัมน์ (คงไว้เผื่ออนาคต แม้ตอนนี้จะไม่ได้ใช้งานจริงแล้วก็ตาม) —
+    -- confirmed decision ภายหลัง: ocr_meter_test ไม่ถูก push ไป CFO
+    -- Platform เลย ไม่ว่าทางไหน (PUSHABLE_TABLE = "ocr_meter" เท่านั้น
+    -- ใน app/external_push.py) เพราะตารางนี้มีไว้ทดสอบระบบของเราเอง —
+    -- รายการทดสอบ 1 รายการที่ spec ขั้นตอนติดตั้งพูดถึง ("ส่งรายการ
+    -- ทดสอบ 1 รายการ แล้วแจ้งเจ้าหน้าที่ให้ตรวจ") หมายถึงเลือกแถวจริง
+    -- 1 แถวจาก ocr_meter มา push ด้วยมือ ไม่ใช่ข้อมูลจากตารางนี้
     push_status         TEXT        NOT NULL DEFAULT 'not_pushed',
     push_attempt_count  INT         NOT NULL DEFAULT 0,
     push_next_retry_at  TIMESTAMPTZ,
-    push_last_error     TEXT,
-    push_response_id    TEXT,
-    push_cfo_status     TEXT,
+    push_last_response  JSONB,
     push_meter_matched  BOOLEAN
 );
 -- confirmed request: image_error -> image (ตอนนี้ใส่เสมอ ไม่ใช่แค่ตอน error
@@ -835,10 +847,14 @@ ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS confidence NUMERIC;
 ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_status TEXT NOT NULL DEFAULT 'not_pushed';
 ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_attempt_count INT NOT NULL DEFAULT 0;
 ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_next_retry_at TIMESTAMPTZ;
-ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_last_error TEXT;
-ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_response_id TEXT;
-ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_cfo_status TEXT;
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_last_response JSONB;
 ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS push_meter_matched BOOLEAN;
+-- Confirmed consolidation — see push_last_response's own comment on the
+-- ocr_meter CREATE TABLE above. No data migration needed (this table
+-- was never pushed to CFO Platform at all — see PUSHABLE_TABLE).
+ALTER TABLE ocr_meter_test DROP COLUMN IF EXISTS push_last_error;
+ALTER TABLE ocr_meter_test DROP COLUMN IF EXISTS push_response_id;
+ALTER TABLE ocr_meter_test DROP COLUMN IF EXISTS push_cfo_status;
 -- external_ref ต้องไม่ซ้ำกัน — เหตุผลเดียวกับ ocr_meter ด้านบน
 ALTER TABLE ocr_meter_test DROP CONSTRAINT IF EXISTS ocr_meter_test_external_ref_key;
 ALTER TABLE ocr_meter_test ADD CONSTRAINT ocr_meter_test_external_ref_key UNIQUE (external_ref);

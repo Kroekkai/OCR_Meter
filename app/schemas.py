@@ -334,9 +334,18 @@ class PushExternalResult(BaseModel):
     outcome: str  # "success" | "failed_retryable" | "failed_permanent" — this attempt's own result, see app/external_push.py::attempt_push_for_row()
     push_status: str
     push_attempt_count: int
-    push_last_error: str | None
-    push_response_id: str | None
-    push_cfo_status: str | None
+    # Confirmed consolidation — was 3 separate fields (push_last_error/
+    # push_response_id/push_cfo_status), none of which any code ever
+    # queried or branched on individually — merged into ocr_meter/
+    # ocr_meter_test's own push_last_response JSONB column (see its
+    # comment in db/init.sql for the exact shape). str, not dict —
+    # confirmed: asyncpg returns JSONB columns as a raw JSON string,
+    # never auto-parsed, without an explicit type codec registered
+    # (not done anywhere in this codebase) — verified directly against
+    # a live connection, not assumed. The caller (or the dashboard JS)
+    # parses it if it needs the structure; most callers just display
+    # it as-is.
+    push_last_response: str | None
     push_meter_matched: bool | None
     """
     Confirmed request — result_status/next_action columns removed
@@ -440,6 +449,7 @@ class PushIssueEntry(BaseModel):
     capture_date: dt.date
     capture_time: dt.time
     push_status: str
-    push_last_error: str | None
+    # str, not dict — see PushExternalResult's own comment on
+    # push_last_response for why (asyncpg returns JSONB as raw string).
+    push_last_response: str | None
     push_meter_matched: bool | None
-    push_response_id: str | None

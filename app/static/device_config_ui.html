@@ -579,7 +579,19 @@
         const matchedPart = it.push_meter_matched === false
           ? '<div class="not-matched">meterMatched: false — มิเตอร์นี้ไม่มีในทะเบียน CFO Platform</div>'
           : "";
-        const errPart = it.push_last_error ? '<div>' + it.push_last_error + '</div>' : "";
+        // push_last_response — confirmed consolidation (ยุบ push_last_error/
+        // push_response_id/push_cfo_status เดิม 3 คอลัมน์ ลง JSON เดียว) —
+        // เป็น JSON string ดิบจาก backend เสมอ (asyncpg คืนค่า JSONB แบบนี้
+        // ไม่เคย auto-parse — verified) ต้อง parse เองที่นี่ ถ้า parse ไม่ได้
+        // หรือไม่มี .error เลย (เช่น แถวที่สำเร็จแล้ว มีแค่ response_id/
+        // cfo_status) ก็ไม่ต้องโชว้อะไรตรงนี้ — ไม่ใช่ error ที่ต้องเตือน
+        let errPart = "";
+        if (it.push_last_response) {
+          try {
+            const resp = JSON.parse(it.push_last_response);
+            if (resp && resp.error) errPart = '<div>' + resp.error + '</div>';
+          } catch (e) { /* malformed/legacy value — ไม่ต้องแสดงอะไร ไม่ใช่จุดวิกฤต */ }
+        }
         return (
           '<div class="push-issue-row">' +
           '<div>' + it.meter_id + (it.is_test ? ' <span class="hint">(ทดสอบ)</span>' : '') + '</div>' +
