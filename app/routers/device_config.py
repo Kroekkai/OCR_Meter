@@ -358,8 +358,13 @@ async def admin_set_external_api_key(
             ON CONFLICT (meter_id) DO UPDATE SET
                 api_key_encrypted = EXCLUDED.api_key_encrypted,
                 is_active = true,
-                rotated_at = now()
-            RETURNING meter_id, is_active, created_at, rotated_at
+                rotated_at = now(),
+                -- new key -> lift any 401/403 pause; queued blocked_auth
+                -- rows go out on the next sweep (spec 2.1: ออก key ใหม่)
+                auth_failed_at = NULL,
+                auth_failed_status = NULL,
+                auth_failed_message = NULL
+            RETURNING meter_id, is_active, created_at, rotated_at, auth_failed_at, auth_failed_status, auth_failed_message
             """,
             meter_id,
             encrypted,
@@ -370,6 +375,9 @@ async def admin_set_external_api_key(
         is_active=row["is_active"],
         created_at=row["created_at"],
         rotated_at=row["rotated_at"],
+        auth_failed_at=row["auth_failed_at"],
+        auth_failed_status=row["auth_failed_status"],
+        auth_failed_message=row["auth_failed_message"],
     )
 
 
@@ -396,7 +404,8 @@ async def admin_get_external_api_key_status(
     """
     meter_id = meter_id.strip().upper()
     row = await pool().fetchrow(
-        "SELECT meter_id, is_active, created_at, rotated_at FROM external_api_keys WHERE meter_id = $1",
+        "SELECT meter_id, is_active, created_at, rotated_at, auth_failed_at, auth_failed_status, auth_failed_message"
+        " FROM external_api_keys WHERE meter_id = $1",
         meter_id,
     )
     if row is None:
@@ -407,6 +416,9 @@ async def admin_get_external_api_key_status(
         is_active=row["is_active"],
         created_at=row["created_at"],
         rotated_at=row["rotated_at"],
+        auth_failed_at=row["auth_failed_at"],
+        auth_failed_status=row["auth_failed_status"],
+        auth_failed_message=row["auth_failed_message"],
     )
 
 
@@ -483,6 +495,19 @@ async def admin_verify_external_device(
                 f"not {meter_id!r}. Not saving — check which key was pasted into this meter's slot."
             ),
         )
+
+    # Verify passed with this key (spec 3 step 2) — so the key works again
+    # (e.g. CFO Platform re-enabled the device / fixed the IP allowlist
+    # without issuing a new key). Lift any 401/403 pause so queued
+    # blocked_auth rows resume on the next sweep.
+    await pool().execute(
+        """
+        UPDATE external_api_keys
+        SET auth_failed_at = NULL, auth_failed_status = NULL, auth_failed_message = NULL
+        WHERE meter_id = $1 AND auth_failed_at IS NOT NULL
+        """,
+        meter_id,
+    )
 
     row = await pool().fetchrow(
         """
