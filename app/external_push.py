@@ -922,6 +922,7 @@ async def process_due_pushes(conn, base_url: str, max_batch: int = 50) -> dict[s
         "blocked_auth": 0,
         "skipped_no_key": 0,
         "skipped_auth_blocked": 0,
+        "skipped_key_error": 0,
     }
 
     for table in (PUSHABLE_TABLE,):
@@ -949,7 +950,33 @@ async def process_due_pushes(conn, base_url: str, max_batch: int = 50) -> dict[s
                 # hitting CFO Platform with it. Row stays queued.
                 summary["skipped_auth_blocked"] += 1
                 continue
-            api_key = decrypt_api_key(row["api_key_encrypted"])
+            try:
+                api_key = decrypt_api_key(row["api_key_encrypted"])
+            except Exception:
+                # Confirmed bug fix (full spec/code audit): decrypt_api_key()
+                # used to run un-guarded here. Its failure (a corrupted
+                # ciphertext, or EXTERNAL_KEY_ENCRYPTION_KEY rotated/misset
+                # since this key was saved) would raise OUT of this loop
+                # entirely -> out of process_due_pushes() -> caught only at
+                # external_push_sweep_loop()'s tick-level try/except. Net
+                # effect: ONE meter with an undecryptable key silently
+                # stopped every OTHER meter's rows in the same batch from
+                # being attempted too (head-of-line blocking again, same
+                # class of bug as the missing-image-path one above, just a
+                # local encryption failure instead of a CFO Platform
+                # response this time). Contained to this one row/meter now,
+                # same as every other per-row failure category — the DB
+                # row itself is left untouched (not CFO Platform's fault,
+                # so not marked blocked_auth/failed_*), it simply gets
+                # retried next tick, same as if it had been skipped for no
+                # key at all.
+                logger.exception(
+                    "could not decrypt API key for meter_id=%s (row id=%s) — skipping this row this tick, will retry next sweep",
+                    row["meter_id"],
+                    row["id"],
+                )
+                summary["skipped_key_error"] += 1
+                continue
             outcome = await attempt_push_for_row(conn, row, table, api_key, base_url)
             summary[outcome] += 1
             if outcome == "blocked_auth":
