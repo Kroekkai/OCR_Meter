@@ -140,6 +140,7 @@
      separate page, so meter_id/date columns are dropped from the card
      (the whole section is already scoped to one meter) and group_id is
      shown instead */
+  #rr-section { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
   #tr-section { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
   .section-divider { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; }
   .tr-empty { color: var(--text-muted); font-size: 13px; padding: 4px 0; }
@@ -189,6 +190,7 @@
   .tr-meta { flex: 1; min-width: 0; }
   .tr-meta .tr-group { font-family: var(--mono); font-size: 13px; color: var(--text-muted); }
   .tr-meta .tr-reading { font-family: var(--mono); font-size: 18px; margin-top: 2px; }
+  .tr-meta .tr-confidence { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
   .tr-badge {
     display: inline-block;
     font-size: 11px;
@@ -490,6 +492,12 @@
           </div>
         </fieldset>
 
+        <div id="rr-section">
+          <div class="section-divider">ผลลัพธ์จริงล่าสุด (ตามตารางเวลาปกติ)</div>
+          <div id="rr-empty" class="tr-empty">ยังไม่มีผลลัพธ์จริงสำหรับมิเตอร์นี้</div>
+          <div id="rr-list"></div>
+        </div>
+
         <div id="tr-section">
           <div class="section-divider">ผลทดสอบล่าสุด</div>
           <div id="tr-empty" class="tr-empty">ยังไม่มีผลทดสอบสำหรับมิเตอร์นี้</div>
@@ -741,6 +749,7 @@
       const res = await api("device-config/" + encodeURIComponent(meterId));
       const cfg = await res.json();
       renderDetail(cfg);
+      loadRealResults(meterId);
       loadTestResults(meterId);
       loadApiKeyStatus(meterId);
     } catch (e) { /* handled in api() */ }
@@ -1083,8 +1092,95 @@
     badge.textContent = label.text;
     meta.appendChild(badge);
 
+    // ยังไม่เคยแสดงค่า confidence ในหน้านี้เลยมาก่อน (แค่เก็บไว้ในฐานข้อมูล/
+    // API) — เพิ่มบรรทัดนี้ไว้ใต้ badge สถานะ ใช้ร่วมกับผลลัพธ์จริงด้านล่างด้วย
+    meta.appendChild(confidenceLine(entry.confidence));
+
     card.appendChild(meta);
     $("tr-list").appendChild(card);
+  }
+
+  // entry.confidence มาจาก Worker โดยตรง (0-100) เป็นค่า optional — แถวที่
+  // อ่านไม่ได้เลยอาจไม่มีค่านี้ส่งมา ไม่ใช่สัญญาณว่าโค้ดฝั่งนี้พัง
+  function confidenceLine(confidence) {
+    const el = document.createElement("div");
+    el.className = "tr-confidence";
+    el.textContent = confidence !== null && confidence !== undefined
+      ? "ความมั่นใจ " + confidence + "%"
+      : "ความมั่นใจ —";
+    return el;
+  }
+
+  // ---------- real results (ocr_meter) — ข้อมูลจริงตามตารางเวลาปกติของ
+  // มิเตอร์ที่เลือกอยู่ แยกจาก "ผลทดสอบล่าสุด" (ocr_meter_test) ด้านล่าง
+  // เพื่อให้เช็กระหว่างพัฒนา/ทดสอบระบบได้ง่ายขึ้น โดยไม่ต้องเปิด psql เอง
+  // ทุกครั้ง — เดิมหน้านี้ไม่เคยมีช่องทางดูข้อมูลจริงเลย มีแต่ Push Issues
+  // ซึ่งโชว์เฉพาะแถวที่มีปัญหา (failed/blocked_auth/meterMatched=false)
+  // เท่านั้น ไม่ใช่รายการทั้งหมด ----------
+  async function loadRealResults(meterId) {
+    $("rr-list").innerHTML = "";
+    $("rr-empty").textContent = "กำลังโหลด...";
+    $("rr-empty").style.display = "block";
+    try {
+      const res = await api("meters/ocr-meter?limit=10&meter_id=" + encodeURIComponent(meterId));
+      const items = await res.json();
+      if (!items.length) {
+        $("rr-empty").textContent = "ยังไม่มีผลลัพธ์จริงสำหรับมิเตอร์นี้";
+        return;
+      }
+      $("rr-empty").style.display = "none";
+      items.forEach((entry) => renderRealResultCard(entry));
+    } catch (e) {
+      $("rr-empty").textContent = "โหลดไม่สำเร็จ";
+    }
+  }
+
+  function renderRealResultCard(entry) {
+    const card = document.createElement("div");
+    card.className = "tr-card";
+
+    const thumbWrap = document.createElement("div");
+    thumbWrap.className = "tr-thumb-wrap";
+
+    const thumb = document.createElement("img");
+    thumb.className = "tr-thumb";
+    thumbWrap.appendChild(thumb);
+    // entry.image คือ full path ของภาพอยู่แล้ว (ทุกแถว ไม่ใช่แค่ตอน error) —
+    // loadThumb() ใช้ร่วมกับผลทดสอบได้เลยเพราะรับแค่ path แล้วตัดเอาเฉพาะ
+    // ชื่อไฟล์ไปเรียก images-by-filename เหมือนกัน
+    loadThumb(thumb, entry.image);
+    card.appendChild(thumbWrap);
+
+    const meta = document.createElement("div");
+    meta.className = "tr-meta";
+
+    const when = document.createElement("div");
+    when.className = "tr-group";
+    when.textContent = entry.capture_date + " " + entry.capture_time;
+    meta.appendChild(when);
+
+    const reading = document.createElement("div");
+    reading.className = "tr-reading";
+    reading.textContent = entry.ocr_reading !== null ? entry.ocr_reading : "—";
+    meta.appendChild(reading);
+
+    const label = ERROR_TYPE_LABEL[entry.error_type] || { text: "ไม่ทราบ", cls: "err" };
+    const badge = document.createElement("span");
+    badge.className = "tr-badge " + label.cls;
+    badge.textContent = label.text;
+    meta.appendChild(badge);
+
+    meta.appendChild(confidenceLine(entry.confidence));
+
+    // สถานะการส่งไป CFO Platform — ข้อมูลนี้ไม่มีใน ocr_meter_test เลย
+    // (ไม่เคยถูกส่งออก) จึงมีแค่ในการ์ดผลลัพธ์จริงเท่านั้น
+    const pushLine = document.createElement("div");
+    pushLine.className = "tr-confidence";
+    pushLine.textContent = pushStatusLabel(entry.push_status);
+    meta.appendChild(pushLine);
+
+    card.appendChild(meta);
+    $("rr-list").appendChild(card);
   }
 
   // ---------- boot ----------
