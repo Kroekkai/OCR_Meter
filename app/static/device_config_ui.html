@@ -328,6 +328,63 @@
   .push-issue-row .status-blocked_auth { color: var(--danger, #d64545); font-weight: 600; }
   .push-issue-row .status-pending { color: var(--text-muted); }
   .push-issue-row .not-matched { color: var(--danger, #d64545); font-weight: 600; }
+
+  /* ---------- mobile back button (list <-> detail on phones) ----------
+     ซ่อนไว้เป็นค่าเริ่มต้นเสมอ (จอกว้าง) โชว์เฉพาะใน media query มือถือ
+     ด้านล่าง ปุ่มนี้อยู่ใน #detail-pane เอง เลยไม่ต้องกังวลเรื่องโชว์ผิด
+     จังหวะ เพราะ #detail-pane ทั้งก้อนถูกซ่อนไว้อยู่แล้วตอนยังไม่ได้เลือก
+     มิเตอร์บนจอมือถือ (ดู media query) */
+  #mobile-back-btn { display: none; margin-bottom: 16px; }
+  .mlabel { display: none; color: var(--text-muted); font-weight: 400; }
+
+  /* ---------- responsive: phones / narrow screens ----------
+     แก้ปัญหาหลัก 3 อย่างของเลย์เอาต์เดิมบนมือถือ:
+     1) main ใช้ grid 2 คอลัมน์ตายตัว (280px + 1fr) ไม่มี media query เลย
+        สักจุด — หน้าจอมือถือเลยถูกบีบจนอ่านไม่ออก
+     2) ฟอร์มใช้ grid 3/2 คอลัมน์ (.row3/.row2) และตาราง Push Issues ใช้
+        grid 4 คอลัมน์ตายตัว (.push-issue-row) ซึ่งแคบเกินจะกดบนจอเล็ก
+     3) input/select ใช้ font-size 14px ซึ่งต่ำกว่า 16px — Safari บน
+        iPhone จะซูมหน้าจอเองอัตโนมัติทุกครั้งที่แตะช่องกรอก น่ารำคาญมาก
+  */
+  @media (max-width: 720px) {
+    header { flex-wrap: wrap; gap: 10px; padding: 12px 16px; }
+    #whoami { flex-wrap: wrap; gap: 8px; font-size: 12px; }
+
+    main { grid-template-columns: 1fr; min-height: calc(100vh - 96px); }
+    #list-pane, #detail-pane { display: block; }
+    #detail-pane { display: none; }
+    #config-view.mobile-detail-open #list-pane { display: none; }
+    #config-view.mobile-detail-open #detail-pane { display: block; }
+
+    #list-pane { padding: 14px; border-right: none; }
+    #detail-pane { padding: 16px; max-width: none; }
+
+    #mobile-back-btn { display: inline-flex; align-items: center; gap: 6px; }
+
+    /* ฟอร์มที่เคยเรียง 3/2 คอลัมน์ ย้ายมาเรียงแนวตั้งทีละช่อง กดง่ายกว่า
+       มากบนจอแคบ ถึงจะเสียพื้นที่แนวตั้งไปบ้างก็ตาม */
+    .row3, .row3.daily-mode, .row2 { grid-template-columns: 1fr; gap: 10px; }
+
+    /* ตาราง Push Issues (4 คอลัมน์ตายตัว) พังบนจอมือถือแน่นอน — เรียง
+       เป็นการ์ดแนวตั้งแทน พร้อมป้ายกำกับสั้น ๆ หน้าแต่ละค่า */
+    .push-issue-row {
+      grid-template-columns: 1fr;
+      gap: 4px;
+    }
+    .mlabel { display: inline; }
+
+    /* ป้องกัน Safari มือถือซูมเองตอนแตะช่องกรอก (ต้อง >= 16px) */
+    input, select { font-size: 16px; }
+
+    /* ปุ่ม/แถวมิเตอร์ ขยายพื้นที่แตะให้นิ้วกดง่ายขึ้น */
+    .meter-row { padding: 12px 10px; }
+    button { padding: 9px 14px; }
+
+    .tr-card { gap: 10px; padding: 10px; }
+
+    #push-issues-overlay { padding: 12px; align-items: stretch; }
+    #push-issues-panel { padding: 14px; max-height: 92vh; }
+  }
 </style>
 </head>
 <body>
@@ -385,6 +442,7 @@
       <div id="list-body"></div>
     </div>
     <div id="detail-pane">
+      <button type="button" id="mobile-back-btn">&larr; กลับไปที่รายการมิเตอร์</button>
       <div id="detail-empty">
         <p>เลือกมิเตอร์จากรายการด้านซ้าย หรือกด "+ ใหม่" เพื่อตั้งค่ามิเตอร์ที่ยังไม่เคยตั้งค่ามาก่อน</p>
       </div>
@@ -602,11 +660,15 @@
             if (resp && resp.error) errPart = '<div>' + resp.error + '</div>';
           } catch (e) { /* malformed/legacy value — ไม่ต้องแสดงอะไร ไม่ใช่จุดวิกฤต */ }
         }
+        // mlabel — ป้ายกำกับสั้น ๆ ที่โชว์เฉพาะตอนจอแคบ (ดู .mlabel ใน
+        // media query) เพราะพอตาราง 4 คอลัมน์ยุบเป็นเรียงแนวตั้งบนมือถือ
+        // ตำแหน่งคอลัมน์เดิมที่เคยบอกความหมายอยู่ในตัว (ซ้ายสุด=มิเตอร์,
+        // ถัดไป=เวลา, ...) จะหายไป ต้องมีป้ายกำกับกำกับไว้แทน
         return (
           '<div class="push-issue-row">' +
-          '<div>' + it.meter_id + (it.is_test ? ' <span class="hint">(ทดสอบ)</span>' : '') + '</div>' +
-          '<div>' + when + '</div>' +
-          '<div class="' + statusClass + '">' + pushStatusLabel(it.push_status) + '</div>' +
+          '<div><span class="mlabel">มิเตอร์: </span>' + it.meter_id + (it.is_test ? ' <span class="hint">(ทดสอบ)</span>' : '') + '</div>' +
+          '<div><span class="mlabel">เวลา: </span>' + when + '</div>' +
+          '<div class="' + statusClass + '"><span class="mlabel">สถานะ: </span>' + pushStatusLabel(it.push_status) + '</div>' +
           '<div>' + matchedPart + errPart + '</div>' +
           '</div>'
         );
@@ -742,9 +804,17 @@
   });
 
   // ---------- detail ----------
+  // จอมือถือ (ดู media query ด้านบน): list-pane กับ detail-pane แสดงทีละ
+  // อันแทนที่จะเบียดกันเป็น 2 คอลัมน์แบบจอกว้าง — isMobileLayout() เช็กตรง
+  // กับ breakpoint เดียวกับ CSS (720px) เป๊ะ ๆ เพื่อไม่ให้ JS กับ CSS ขัดกัน
+  function isMobileLayout() {
+    return window.matchMedia("(max-width: 720px)").matches;
+  }
+
   async function selectMeter(meterId) {
     currentMeterId = meterId;
     highlightActive();
+    if (isMobileLayout()) $("config-view").classList.add("mobile-detail-open");
     try {
       const res = await api("device-config/" + encodeURIComponent(meterId));
       const cfg = await res.json();
@@ -754,6 +824,10 @@
       loadApiKeyStatus(meterId);
     } catch (e) { /* handled in api() */ }
   }
+
+  $("mobile-back-btn").addEventListener("click", () => {
+    $("config-view").classList.remove("mobile-detail-open");
+  });
 
   function renderDetail(cfg) {
     $("detail-empty").style.display = "none";
