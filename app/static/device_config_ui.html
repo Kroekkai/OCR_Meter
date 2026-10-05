@@ -385,6 +385,27 @@
     #push-issues-overlay { padding: 12px; align-items: stretch; }
     #push-issues-panel { padding: 14px; max-height: 92vh; }
   }
+
+  /* ---------- wide screens: ใช้พื้นที่ว่างด้านขวาที่เหลือจากฟอร์ม (ซึ่ง
+     ถูก max-width ไว้ที่ 560px) ให้เป็นประโยชน์ แทนที่จะปล่อยว่างเปล่า —
+     เอา "ผลลัพธ์จริงล่าสุด" + "ผลทดสอบล่าสุด" มาวางเป็นคอลัมน์ที่ 2 ข้างๆ
+     ฟอร์ม แทนที่จะให้ไหลต่อท้ายฟอร์มลงมาด้านล่างเหมือนจอแคบ/จอขนาดปกติ.
+     ตั้ง threshold ไว้ที่ 1200px เพราะต้องมีที่พอสำหรับ list-pane (280px)
+     + ฟอร์ม (560px) + คอลัมน์ผล (ขั้นต่ำ ~300px) + ช่องไฟ ถึงจะไม่อึดอัด */
+  @media (min-width: 1200px) {
+    #detail-pane { max-width: none; }
+    #detail-form {
+      display: flex !important; /* ทับ inline style="display:block" ที่ JS ตั้งตอนเลือกมิเตอร์ */
+      gap: 36px;
+      align-items: flex-start;
+    }
+    #detail-form-main { flex: 0 0 560px; max-width: 560px; }
+    #detail-form-side { flex: 1 1 320px; min-width: 300px; max-width: 480px; }
+    /* เดิม rr-section มีเส้นคั่น+ระยะห่างด้านบน เพราะมันเคยต่อท้ายฟอร์ม
+       ด้านล่างเสมอ — พอกลายเป็นหัวคอลัมน์ที่ 2 แล้ว ไม่ต้องมีเส้นคั่นเหนือ
+       มันอีกต่อไป (tr-section ที่ตามมายังมีเส้นคั่นจาก rr-section ตามปกติ) */
+    #detail-form-side #rr-section { margin-top: 0; padding-top: 0; border-top: none; }
+  }
 </style>
 </head>
 <body>
@@ -447,6 +468,7 @@
         <p>เลือกมิเตอร์จากรายการด้านซ้าย หรือกด "+ ใหม่" เพื่อตั้งค่ามิเตอร์ที่ยังไม่เคยตั้งค่ามาก่อน</p>
       </div>
       <div id="detail-form" style="display:none">
+        <div id="detail-form-main">
         <div class="detail-head">
           <h2 id="d-meter-id"></h2>
           <span class="badge" id="d-badge"></span>
@@ -549,7 +571,9 @@
             <span id="api-key-msg"></span>
           </div>
         </fieldset>
+        </div><!-- /#detail-form-main -->
 
+        <div id="detail-form-side">
         <div id="rr-section">
           <div class="section-divider">ผลลัพธ์จริงล่าสุด (ตามตารางเวลาปกติ)</div>
           <div id="rr-empty" class="tr-empty">ยังไม่มีผลลัพธ์จริงสำหรับมิเตอร์นี้</div>
@@ -561,6 +585,7 @@
           <div id="tr-empty" class="tr-empty">ยังไม่มีผลทดสอบสำหรับมิเตอร์นี้</div>
           <div id="tr-list"></div>
         </div>
+        </div><!-- /#detail-form-side -->
       </div>
     </div>
   </main>
