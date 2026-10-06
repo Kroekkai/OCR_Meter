@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # middleware is a no-op on any path that doesn't start with this
     # prefix. Set to "" if not behind a proxy with a base path at all.
     base_path_prefix: str = "/iot"
-    port: int = 3003
+    port: int = 3005
 
     # --- Auth: JWT ---------------------------------------------------------
     # Must match meter-dashboard's JWT_SECRET exactly — both services
