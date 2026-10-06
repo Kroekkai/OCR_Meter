@@ -15,7 +15,7 @@ COPY scripts ./scripts
 RUN mkdir -p /data/images
 VOLUME ["/data/images"]
 
-EXPOSE 3003
+EXPOSE 3005
 
 # Single Python process on port 3003 only, as required.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3003"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3005"]
