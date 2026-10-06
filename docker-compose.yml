@@ -1,7 +1,7 @@
 services:
   ocr-meter-store:
     build: .
-    image: ocr-meter-store:2.0.0
+    image: ocr-meter-server-api
     container_name: ocr-meter-store
     restart: unless-stopped
     ports:
