@@ -298,6 +298,25 @@
     padding: 40px 20px;
   }
   #push-issues-overlay.open { display: flex; }
+
+  /* เปลี่ยนรหัสผ่าน (modal) */
+  #pw-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    z-index: 110; align-items: flex-start; justify-content: center; padding: 60px 20px;
+  }
+  #pw-overlay.open { display: flex; }
+  #pw-panel {
+    background: var(--surface); color: var(--text); border: 1px solid var(--border);
+    border-radius: 10px; width: 100%; max-width: 380px; padding: 20px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+  }
+  #pw-panel h2 { font-size: 16px; font-weight: 500; margin: 0 0 14px; }
+  #pw-panel label { display: block; font-size: 12px; color: var(--text-muted); margin: 10px 0 4px; }
+  #pw-panel .pw-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+  #pw-msg { font-size: 13px; margin-top: 10px; min-height: 18px; }
+  #pw-msg.err { color: #ff7a75; }
+  #pw-msg.ok { color: var(--accent); }
+  #manage-users-btn { display: none; }
   #push-issues-panel {
     background: var(--surface);
     color: var(--text);
@@ -434,10 +453,29 @@
     <h1>Meter config <span>— ตารางถ่ายภาพ ESP32</span></h1>
     <div id="whoami">
       <button id="push-issues-btn" type="button">⚠ Push Issues<span class="badge-count" id="push-issues-count" style="display:none"></span></button>
+      <button id="manage-users-btn" type="button">จัดการผู้ดูแล</button>
       <span id="whoami-name"></span>
+      <button id="change-pw-btn" type="button">เปลี่ยนรหัสผ่าน</button>
       <button id="logout-btn">ออกจากระบบ</button>
     </div>
   </header>
+
+  <div id="pw-overlay">
+    <div id="pw-panel">
+      <h2>เปลี่ยนรหัสผ่าน</h2>
+      <label for="pw-current">รหัสผ่านปัจจุบัน</label>
+      <input type="password" id="pw-current" autocomplete="current-password">
+      <label for="pw-new">รหัสผ่านใหม่ (อย่างน้อย 8 ตัวอักษร)</label>
+      <input type="password" id="pw-new" autocomplete="new-password">
+      <label for="pw-confirm">ยืนยันรหัสผ่านใหม่</label>
+      <input type="password" id="pw-confirm" autocomplete="new-password">
+      <div id="pw-msg"></div>
+      <div class="pw-actions">
+        <button type="button" id="pw-cancel">ยกเลิก</button>
+        <button type="button" class="primary" id="pw-save">บันทึก</button>
+      </div>
+    </div>
+  </div>
 
   <div id="push-issues-overlay">
     <div id="push-issues-panel">
@@ -635,7 +673,57 @@
     $("whoami-name").textContent = localStorage.getItem(USER_KEY) || "";
     loadList();
     loadPushIssuesCount();
+    loadMe();
   }
+
+  // ---------- บัญชีที่ login อยู่ / ปุ่มเฉพาะ super admin ----------
+  // การซ่อนปุ่มเป็นแค่เรื่องหน้าตา — สิทธิ์จริงตรวจที่เซิร์ฟเวอร์ทุก API
+  async function loadMe() {
+    $("manage-users-btn").style.display = "none";
+    try {
+      const res = await api("../me");
+      if (!res.ok) return;
+      const me = await res.json();
+      if (me.is_super_admin) $("manage-users-btn").style.display = "inline-block";
+    } catch (e) { /* handled in api() */ }
+  }
+
+  $("manage-users-btn").addEventListener("click", () => { window.location.href = "users-ui"; });
+
+  // ---------- เปลี่ยนรหัสผ่านของตัวเอง ----------
+  function pwMsg(text, cls) { const m = $("pw-msg"); m.textContent = text; m.className = cls || ""; }
+  function closePw() {
+    $("pw-overlay").classList.remove("open");
+    ["pw-current", "pw-new", "pw-confirm"].forEach((id) => { $(id).value = ""; });
+    pwMsg("");
+  }
+  $("change-pw-btn").addEventListener("click", () => { closePw(); $("pw-overlay").classList.add("open"); $("pw-current").focus(); });
+  $("pw-cancel").addEventListener("click", closePw);
+  $("pw-overlay").addEventListener("click", (e) => { if (e.target === $("pw-overlay")) closePw(); });
+  $("pw-save").addEventListener("click", async () => {
+    const current = $("pw-current").value, next = $("pw-new").value, confirm = $("pw-confirm").value;
+    if (!current || !next) return pwMsg("กรอกข้อมูลให้ครบ", "err");
+    if (next.length < 8) return pwMsg("รหัสผ่านใหม่ต้องมีอย่างน้อย 8 ตัวอักษร", "err");
+    if (next !== confirm) return pwMsg("ยืนยันรหัสผ่านใหม่ไม่ตรงกัน", "err");
+    if (next === current) return pwMsg("รหัสผ่านใหม่ต้องไม่ซ้ำกับรหัสผ่านเดิม", "err");
+    try {
+      const res = await api("../me/password", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ current_password: current, new_password: next }),
+      });
+      if (res.status === 204) {
+        ["pw-current", "pw-new", "pw-confirm"].forEach((id) => { $(id).value = ""; });
+        pwMsg("เปลี่ยนรหัสผ่านแล้ว", "ok");
+        setTimeout(closePw, 1200);
+      } else if (res.status === 400) {
+        const d = await res.json().catch(() => ({}));
+        pwMsg(d.detail === "Current password is incorrect" ? "รหัสผ่านปัจจุบันไม่ถูกต้อง" : "รหัสผ่านใหม่ต้องไม่ซ้ำกับรหัสผ่านเดิม", "err");
+      } else {
+        pwMsg("เปลี่ยนรหัสผ่านไม่สำเร็จ (" + res.status + ")", "err");
+      }
+    } catch (e) { /* handled in api() */ }
+  });
 
   // ---------- push issues (ข้อ 21/24) ----------
   function pushStatusLabel(status) {

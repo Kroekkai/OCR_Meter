@@ -81,7 +81,24 @@ class UserOut(BaseModel):
     username: str
     is_admin: bool
     is_device: bool
+    is_super_admin: bool = False
     created_at: dt.datetime
+
+
+class MeOut(BaseModel):
+    id: int
+    username: str
+    is_admin: bool
+    is_super_admin: bool
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+class ResetPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=8, max_length=256)
 
 
 class AdminCreateUserRequest(BaseModel):
@@ -89,6 +106,8 @@ class AdminCreateUserRequest(BaseModel):
     password: str = Field(min_length=8, max_length=256)
     is_admin: bool = False
     is_device: bool = False
+    # super admin เป็น admin เสมอ — ถ้า true ระบบจะตั้ง is_admin = true ให้เอง
+    is_super_admin: bool = False
 
 
 # --------------------------------------------------------------------------

@@ -29,6 +29,7 @@ async def main() -> None:
     parser.add_argument("--password", required=True)
     parser.add_argument("--admin", action="store_true")
     parser.add_argument("--device", action="store_true")
+    parser.add_argument("--super-admin", action="store_true", help="super admin (implies --admin)")
     args = parser.parse_args()
 
     await db.connect()
@@ -39,14 +40,15 @@ async def main() -> None:
             return
         row = await db.pool().fetchrow(
             """
-            INSERT INTO users (username, password_hash, is_admin, is_device)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, username, is_admin, is_device
+            INSERT INTO users (username, password_hash, is_admin, is_device, is_super_admin)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, username, is_admin, is_device, is_super_admin
             """,
             args.username,
             hash_secret(args.password),
-            args.admin,
+            args.admin or args.super_admin,
             args.device,
+            args.super_admin,
         )
         print(f"Created user: {dict(row)}")
     finally:

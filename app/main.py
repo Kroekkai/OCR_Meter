@@ -47,6 +47,7 @@ app = FastAPI(
 app.include_router(health.router)
 app.include_router(auth_routes.router)
 app.include_router(admin_users.router)
+app.include_router(admin_users.ui_router)
 # ocr_jobs ต้อง include ก่อน images เสมอ — ocr_jobs.router มี
 # "GET /admin/images/ocr" (literal, ไม่มี path param) ส่วน images.router
 # มี "GET /admin/images/{item_id}" (path param เดียวกันตำแหน่งเดียวกัน)

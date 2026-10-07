@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>จัดการผู้ดูแลระบบ</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --surface: #1c1f26;
+    --surface-hover: #242832;
+    --border: #2a2e38;
+    --text: #e8e6e0;
+    --text-muted: #8b8980;
+    --accent: #4fb8a8;
+    --accent-dim: #2d6b62;
+    --danger: #d9534f;
+    --danger-dim: #5c2b29;
+    --super: #e8b339;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; line-height: 1.5; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 24px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  header h1 { font-size: 16px; font-weight: 500; margin: 0; }
+  header h1 span { color: var(--text-muted); font-weight: 400; }
+  #whoami { color: var(--text-muted); font-size: 13px; display: flex; align-items: center; gap: 12px; }
+  button { font-family: var(--sans); font-size: 13px; cursor: pointer; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 7px 14px; }
+  button:hover { background: var(--surface-hover); border-color: var(--accent-dim); }
+  button.primary { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
+  button.primary:hover { background: var(--accent); color: #0d1f1c; }
+  button.danger { color: #f5b8b5; }
+  button.danger:hover { background: var(--danger-dim); border-color: var(--danger); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  input, select { font-family: var(--sans); font-size: 14px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 10px; width: 100%; }
+  input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
+  main { max-width: 960px; margin: 0 auto; padding: 24px; display: grid; grid-template-columns: 1fr 320px; gap: 24px; align-items: start; }
+  section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+  section h2 { font-size: 15px; font-weight: 500; margin: 0 0 14px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { color: var(--text-muted); font-weight: 400; font-size: 12px; }
+  td.name { font-family: var(--mono); font-weight: 600; }
+  td.actions { text-align: right; white-space: nowrap; }
+  td.actions button { margin-left: 6px; padding: 5px 10px; font-size: 12px; }
+  .role { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); }
+  .role.super { color: var(--super); border-color: #6b5420; }
+  .role.admin { color: var(--accent); border-color: var(--accent-dim); }
+  .role.user { color: var(--text-muted); }
+  .you { color: var(--text-muted); font-size: 12px; margin-left: 6px; }
+  label { display: block; font-size: 12px; color: var(--text-muted); margin: 10px 0 4px; }
+  .msg { font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .msg.err { color: #ff7a75; }
+  .msg.ok { color: var(--accent); }
+  .hint { font-size: 12px; color: var(--text-muted); margin-top: 12px; }
+  #reset-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 100; align-items: flex-start; justify-content: center; padding: 60px 20px; }
+  #reset-overlay.open { display: flex; }
+  #reset-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; width: 100%; max-width: 380px; padding: 20px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+  #reset-panel h2 { font-size: 16px; font-weight: 500; margin: 0 0 6px; }
+  .row-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+  @media (max-width: 760px) {
+    main { grid-template-columns: 1fr; padding: 16px; }
+    td.actions button { margin: 4px 0 0 4px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>จัดการผู้ดูแลระบบ <span>— เฉพาะ super admin</span></h1>
+  <div id="whoami">
+    <button type="button" id="back-btn">← กลับหน้า Meter config</button>
+    <span id="whoami-name"></span>
+  </div>
+</header>
+
+<main>
+  <section>
+    <h2>บัญชีผู้ดูแล</h2>
+    <table>
+      <thead><tr><th>ชื่อผู้ใช้</th><th>บทบาท</th><th>สร้างเมื่อ</th><th></th></tr></thead>
+      <tbody id="user-rows"></tbody>
+    </table>
+    <div class="msg" id="list-msg"></div>
+    <div class="hint">ลบบัญชีของตัวเองไม่ได้ และต้องเหลือ super admin อย่างน้อย 1 บัญชีเสมอ บัญชีของระบบ (อุปกรณ์ / ระบบ OCR) ไม่แสดงในหน้านี้</div>
+  </section>
+
+  <section>
+    <h2>เพิ่มผู้ดูแล</h2>
+    <label for="new-username">ชื่อผู้ใช้ (3–64 ตัวอักษร)</label>
+    <input id="new-username" autocomplete="off">
+    <label for="new-password">รหัสผ่าน (อย่างน้อย 8 ตัวอักษร)</label>
+    <input type="password" id="new-password" autocomplete="new-password">
+    <label for="new-confirm">ยืนยันรหัสผ่าน</label>
+    <input type="password" id="new-confirm" autocomplete="new-password">
+    <label for="new-role">บทบาท</label>
+    <select id="new-role">
+      <option value="admin">Admin — ตั้งค่ามิเตอร์ได้</option>
+      <option value="super_admin">Super admin — ตั้งค่ามิเตอร์ + จัดการผู้ดูแล</option>
+    </select>
+    <div class="row-actions"><button type="button" class="primary" id="create-btn">เพิ่มบัญชี</button></div>
+    <div class="msg" id="create-msg"></div>
+  </section>
+</main>
+
+<div id="reset-overlay">
+  <div id="reset-panel">
+    <h2>ตั้งรหัสผ่านใหม่</h2>
+    <div class="hint" id="reset-target"></div>
+    <label for="reset-new">รหัสผ่านใหม่ (อย่างน้อย 8 ตัวอักษร)</label>
+    <input type="password" id="reset-new" autocomplete="new-password">
+    <label for="reset-confirm">ยืนยันรหัสผ่านใหม่</label>
+    <input type="password" id="reset-confirm" autocomplete="new-password">
+    <div class="msg" id="reset-msg"></div>
+    <div class="row-actions">
+      <button type="button" id="reset-cancel">ยกเลิก</button>
+      <button type="button" class="primary" id="reset-save">บันทึก</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  // ใช้ token เดียวกับหน้า Meter config (อยู่ใต้ path เดียวกัน)
+  const TOKEN_KEY = "meter_config_token";
+  const CONFIG_PAGE = "device-config-ui";
+  const $ = (id) => document.getElementById(id);
+  let me = null;
+  let resetUser = null;
+
+  function token() { return localStorage.getItem(TOKEN_KEY); }
+  function goConfig() { window.location.href = CONFIG_PAGE; }
+  function msg(id, text, cls) { const m = $(id); m.textContent = text; m.className = "msg " + (cls || ""); }
+
+  async function api(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({ "Authorization": "Bearer " + token() }, opts.headers || {});
+    const res = await fetch(path, opts);
+    if (res.status === 401) { localStorage.removeItem(TOKEN_KEY); goConfig(); throw new Error("unauthorized"); }
+    if (res.status === 403 && path === "users") { goConfig(); throw new Error("forbidden"); }
+    return res;
+  }
+
+  function roleBadge(u) {
+    if (u.is_super_admin) return '<span class="role super">Super admin</span>';
+    if (u.is_admin) return '<span class="role admin">Admin</span>';
+    return '<span class="role user">ผู้ใช้ทั่วไป</span>';
+  }
+  function fmtDate(s) {
+    try { return new Date(s).toLocaleDateString("th-TH", { year: "numeric", month: "short", day: "numeric" }); }
+    catch (e) { return s; }
+  }
+  function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+  async function loadUsers() {
+    const res = await api("users");
+    if (!res.ok) return msg("list-msg", "โหลดรายชื่อไม่สำเร็จ (" + res.status + ")", "err");
+    const users = await res.json();
+    const tbody = $("user-rows");
+    tbody.innerHTML = "";
+    users.forEach((u) => {
+      const isMe = me && u.id === me.id;
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        '<td class="name">' + esc(u.username) + (isMe ? '<span class="you">(คุณ)</span>' : "") + "</td>" +
+        "<td>" + roleBadge(u) + "</td>" +
+        "<td>" + esc(fmtDate(u.created_at)) + "</td>" +
+        '<td class="actions"></td>';
+      const cell = tr.querySelector(".actions");
+      if (!isMe) {
+        const rb = document.createElement("button");
+        rb.textContent = "ตั้งรหัสผ่านใหม่";
+        rb.addEventListener("click", () => openReset(u));
+        const db = document.createElement("button");
+        db.className = "danger";
+        db.textContent = "ลบ";
+        db.addEventListener("click", () => deleteUser(u));
+        cell.appendChild(rb); cell.appendChild(db);
+      }
+      tbody.appendChild(tr);
+    });
+  }
+
+  async function deleteUser(u) {
+    if (!confirm('ลบบัญชี "' + u.username + '" ?\nบัญชีนี้จะใช้งานไม่ได้ทันที')) return;
+    const res = await api("users/" + u.id, { method: "DELETE" });
+    if (res.status === 204) { msg("list-msg", 'ลบบัญชี "' + u.username + '" แล้ว', "ok"); return loadUsers(); }
+    const d = await res.json().catch(() => ({}));
+    const map = {
+      "Cannot delete your own account": "ลบบัญชีของตัวเองไม่ได้",
+      "Cannot delete the last super admin": "ลบไม่ได้ — ต้องเหลือ super admin อย่างน้อย 1 บัญชี",
+      "Service accounts cannot be deleted": "บัญชีของระบบลบไม่ได้",
+    };
+    msg("list-msg", map[d.detail] || ("ลบไม่สำเร็จ (" + res.status + ")"), "err");
+    loadUsers();
+  }
+
+  $("create-btn").addEventListener("click", async () => {
+    const username = $("new-username").value.trim();
+    const password = $("new-password").value;
+    const confirmPw = $("new-confirm").value;
+    const role = $("new-role").value;
+    if (username.length < 3) return msg("create-msg", "ชื่อผู้ใช้ต้องมีอย่างน้อย 3 ตัวอักษร", "err");
+    if (password.length < 8) return msg("create-msg", "รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร", "err");
+    if (password !== confirmPw) return msg("create-msg", "ยืนยันรหัสผ่านไม่ตรงกัน", "err");
+    const res = await api("users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password, is_admin: true, is_super_admin: role === "super_admin" }),
+    });
+    if (res.status === 201) {
+      ["new-username", "new-password", "new-confirm"].forEach((id) => { $(id).value = ""; });
+      msg("create-msg", 'เพิ่มบัญชี "' + username + '" แล้ว', "ok");
+      return loadUsers();
+    }
+    if (res.status === 409) return msg("create-msg", "ชื่อผู้ใช้นี้มีอยู่แล้ว", "err");
+    if (res.status === 422) return msg("create-msg", "ข้อมูลไม่ถูกต้อง (ตรวจความยาวชื่อผู้ใช้และรหัสผ่าน)", "err");
+    msg("create-msg", "เพิ่มบัญชีไม่สำเร็จ (" + res.status + ")", "err");
+  });
+
+  function openReset(u) {
+    resetUser = u;
+    $("reset-target").textContent = "บัญชี: " + u.username;
+    $("reset-new").value = ""; $("reset-confirm").value = "";
+    msg("reset-msg", "");
+    $("reset-overlay").classList.add("open");
+    $("reset-new").focus();
+  }
+  function closeReset() { $("reset-overlay").classList.remove("open"); $("reset-new").value = ""; $("reset-confirm").value = ""; resetUser = null; }
+  $("reset-cancel").addEventListener("click", closeReset);
+  $("reset-overlay").addEventListener("click", (e) => { if (e.target === $("reset-overlay")) closeReset(); });
+  $("reset-save").addEventListener("click", async () => {
+    const pw = $("reset-new").value;
+    if (pw.length < 8) return msg("reset-msg", "รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร", "err");
+    if (pw !== $("reset-confirm").value) return msg("reset-msg", "ยืนยันรหัสผ่านไม่ตรงกัน", "err");
+    const res = await api("users/" + resetUser.id + "/password", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_password: pw }),
+    });
+    if (res.status === 204) {
+      const name = resetUser.username;
+      closeReset();
+      return msg("list-msg", 'ตั้งรหัสผ่านใหม่ให้ "' + name + '" แล้ว', "ok");
+    }
+    msg("reset-msg", "ตั้งรหัสผ่านไม่สำเร็จ (" + res.status + ")", "err");
+  });
+
+  $("back-btn").addEventListener("click", goConfig);
+
+  // ---------- boot: ต้อง login แล้ว และต้องเป็น super admin ----------
+  (async function boot() {
+    if (!token()) return goConfig();
+    try {
+      const res = await api("../me");
+      if (!res.ok) return goConfig();
+      me = await res.json();
+      if (!me.is_super_admin) return goConfig();
+      $("whoami-name").textContent = me.username;
+      loadUsers();
+    } catch (e) { /* redirected in api() */ }
+  })();
+})();
+</script>
+</body>
+</html>

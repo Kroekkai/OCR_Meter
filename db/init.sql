@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- super admin: จัดการบัญชีผู้ดูแล (เพิ่ม/ลบ/รีเซ็ตรหัสผ่าน) ได้
+-- รันซ้ำได้กับฐานข้อมูลเดิม — บัญชีเดิมทั้งหมดเป็น false
+-- ตั้ง super admin คนแรกด้วย:
+--   UPDATE users SET is_super_admin = true, is_admin = true WHERE username = '<ชื่อบัญชี>';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_super_admin BOOLEAN NOT NULL DEFAULT false;
+
 -- --- Unified images table (all meter types) --------------------------------
 -- แยกตามตัวอักษรแรกของ meter_id ตอนอัปโหลด (E->electric, W->water,
 -- G->gas) — meter_id เก็บเป็นตัวพิมพ์ใหญ่เสมอ (normalize ตอน parse ชื่อ

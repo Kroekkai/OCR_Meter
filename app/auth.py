@@ -74,6 +74,7 @@ class CurrentUser:
     username: str
     is_admin: bool
     is_device: bool
+    is_super_admin: bool = False
 
 
 def create_access_token(user_id: int, username: str, is_admin: bool) -> str:
@@ -104,12 +105,12 @@ def _decode_token(token: str) -> dict:
 async def _user_from_token(token: str) -> CurrentUser:
     payload = _decode_token(token)
     row = await pool().fetchrow(
-        "SELECT id, username, is_admin, is_device FROM users WHERE id = $1",
+        "SELECT id, username, is_admin, is_device, is_super_admin FROM users WHERE id = $1",
         payload.get("uid"),
     )
     if row is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User no longer exists")
-    return CurrentUser(id=row["id"], username=row["username"], is_admin=row["is_admin"], is_device=row["is_device"])
+    return CurrentUser(id=row["id"], username=row["username"], is_admin=row["is_admin"], is_device=row["is_device"], is_super_admin=row["is_super_admin"])
 
 
 async def _user_from_header_token(authorization: str | None) -> CurrentUser:
@@ -140,17 +141,28 @@ async def get_current_admin(
     return user
 
 
+async def get_current_super_admin(user: CurrentUser = Depends(get_current_admin)) -> CurrentUser:
+    """
+    Requires a valid JWT for a super admin (is_super_admin = true).
+    สิทธิ์อ่านจากฐานข้อมูลทุกคำขอ (ผ่าน _user_from_token) ไม่ได้เชื่อค่าใน
+    token — ลด/ถอนสิทธิ์แล้วมีผลทันที ไม่ต้องรอ token หมดอายุ
+    """
+    if not user.is_super_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
+    return user
+
+
 # --------------------------------------------------------------------------
 # Static device / service keys (optional shortcut, see module docstring)
 # --------------------------------------------------------------------------
 async def _user_by_username(username: str) -> CurrentUser | None:
     row = await pool().fetchrow(
-        "SELECT id, username, is_admin, is_device FROM users WHERE username = $1",
+        "SELECT id, username, is_admin, is_device, is_super_admin FROM users WHERE username = $1",
         username,
     )
     if row is None:
         return None
-    return CurrentUser(id=row["id"], username=row["username"], is_admin=row["is_admin"], is_device=row["is_device"])
+    return CurrentUser(id=row["id"], username=row["username"], is_admin=row["is_admin"], is_device=row["is_device"], is_super_admin=row["is_super_admin"])
 
 
 async def _try_static_key(header_value: str | None, configured_key: str | None, configured_username: str | None) -> CurrentUser | None:
