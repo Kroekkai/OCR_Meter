@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 
-from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_uploader
+from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_uploader, enforce_device_meter
 from app.config import get_settings
 from app.db import GROUP_ID_INFO, PREFIX_FOR_UTILITY_TYPE, pool, utility_type_for_meter_id
 from app.external_push import (
@@ -187,6 +187,8 @@ async def upload_image(
         utility_type = utility_type_for_meter_id(meter_id)
     except (FilenameParseError, ValueError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    # token รายเครื่องอัปโหลดได้เฉพาะภาพของมิเตอร์ตัวเอง (รหัสมิเตอร์จากชื่อไฟล์)
+    enforce_device_meter(device, meter_id)
 
     max_bytes = get_settings().max_upload_mb * 1024 * 1024
     data = await file.read()

@@ -30,6 +30,7 @@ addition for those routes, not something confirmed from your real code.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import secrets
 from dataclasses import dataclass
 
@@ -75,6 +76,9 @@ class CurrentUser:
     is_admin: bool
     is_device: bool
     is_super_admin: bool = False
+    # ตั้งค่าเมื่อยืนยันตัวตนด้วย token รายเครื่อง — อุปกรณ์ใช้ได้เฉพาะมิเตอร์นี้
+    # None = ไม่ผูกกับมิเตอร์ใด (key กลาง DEVICE_API_KEY หรือ JWT)
+    device_meter_id: str | None = None
 
 
 def create_access_token(user_id: int, username: str, is_admin: bool) -> str:
@@ -183,6 +187,47 @@ async def _try_static_key(header_value: str | None, configured_key: str | None, 
     return user
 
 
+DEVICE_TOKEN_PREFIX = "dt_"
+
+
+def hash_device_token(token: str) -> str:
+    """SHA-256 ของ token รายเครื่อง — token สุ่มยาว จึงไม่ต้องใช้ bcrypt"""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def new_device_token() -> str:
+    return DEVICE_TOKEN_PREFIX + secrets.token_urlsafe(32)
+
+
+async def _try_device_token(header_value: str | None) -> CurrentUser | None:
+    """
+    token รายเครื่อง (ขึ้นต้นด้วย dt_) — หาค่าแฮชในตาราง device_tokens
+    ถ้าเจอ คืน CurrentUser ที่ผูกกับ meter_id ของ token นั้น
+    ถ้าขึ้นต้นด้วย dt_ แต่ไม่พบ (ถูกเพิกถอน/เปลี่ยนแล้ว) ตอบ 401 ทันที
+    """
+    if not header_value or not header_value.startswith(DEVICE_TOKEN_PREFIX):
+        return None
+    row = await pool().fetchrow(
+        "UPDATE device_tokens SET last_used_at = now() WHERE token_hash = $1 RETURNING meter_id",
+        hash_device_token(header_value),
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or revoked device token")
+    return CurrentUser(
+        id=0, username=f"device:{row['meter_id']}", is_admin=False, is_device=True,
+        device_meter_id=row["meter_id"],
+    )
+
+
+def enforce_device_meter(user: CurrentUser, meter_id: str) -> None:
+    """อุปกรณ์ที่ใช้ token รายเครื่องเข้าถึงได้เฉพาะมิเตอร์ของตัวเอง"""
+    if user.device_meter_id is not None and user.device_meter_id != meter_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"This device token belongs to {user.device_meter_id}, not {meter_id}",
+        )
+
+
 async def get_uploader(
     authorization: str | None = Header(default=None),
     x_device_key: str | None = Header(default=None),
@@ -203,6 +248,11 @@ async def get_uploader(
     since a real JWT always starts with "Bearer " and this raw form
     never does — no ambiguity between the two.
     """
+    # token รายเครื่อง (dt_...) — ส่งมาทาง X-Device-Key หรือใส่ใน Authorization ตรง ๆ ก็ได้
+    for candidate in (x_device_key, authorization):
+        via_device_token = await _try_device_token(candidate)
+        if via_device_token is not None:
+            return via_device_token
     settings = get_settings()
     via_key = await _try_static_key(x_device_key, settings.device_api_key, settings.device_api_key_username)
     if via_key is not None:

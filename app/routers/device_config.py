@@ -3,7 +3,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
 
-from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_uploader
+from app.auth import CurrentUser, get_admin_or_service, get_current_admin, get_current_super_admin, get_uploader, enforce_device_meter, hash_device_token, new_device_token
 from app.config import get_settings
 from app.crypto import decrypt_api_key, encrypt_api_key
 from app.db import pool
@@ -14,6 +14,8 @@ from app.schemas import (
     ExternalApiKeySetRequest,
     ExternalApiKeyStatus,
     VerifyExternalResult,
+    DeviceTokenIssued,
+    DeviceTokenStatus,
 )
 
 router = APIRouter(tags=["default"])
@@ -113,7 +115,7 @@ async def get_or_create_device_config(conn, meter_id: str):
 @router.get("/devices/config", response_model=DeviceConfigOut, summary="Get Device Config")
 async def get_device_config(
     meter_id: str = Query(..., max_length=16),
-    _: CurrentUser = Depends(get_uploader),
+    device: CurrentUser = Depends(get_uploader),
 ):
     """
     NOT part of the original confirmed spec — added from a separate API
@@ -144,6 +146,7 @@ async def get_device_config(
     record of every meter_id ever seen, confirmed request.
     """
     meter_id = meter_id.strip().upper()
+    enforce_device_meter(device, meter_id)
     async with pool().acquire() as conn:
         row = await get_or_create_device_config(conn, meter_id)
     return _config_out(row)
@@ -539,3 +542,74 @@ async def admin_verify_external_device(
         tenant_name=data.meter.tenantName,
         location_name=data.meter.locationName,
     )
+
+
+# ---------------------------------------------------------------------------
+# token ของอุปกรณ์รายเครื่อง
+# ---------------------------------------------------------------------------
+@router.get(
+    "/admin/device-config/{meter_id}/device-token",
+    response_model=DeviceTokenStatus,
+    summary="Admin Get Device Token Status",
+)
+async def admin_get_device_token(meter_id: str, _: CurrentUser = Depends(get_current_admin)):
+    """สถานะ token ของอุปกรณ์ — ไม่คืนค่า token (ระบบเก็บเฉพาะค่าแฮช)"""
+    meter_id = meter_id.strip().upper()
+    row = await pool().fetchrow(
+        "SELECT token_prefix, created_at, rotated_at, last_used_at FROM device_tokens WHERE meter_id = $1", meter_id
+    )
+    if row is None:
+        return DeviceTokenStatus(meter_id=meter_id, has_token=False)
+    return DeviceTokenStatus(meter_id=meter_id, has_token=True, **dict(row))
+
+
+@router.post(
+    "/admin/device-config/{meter_id}/device-token",
+    response_model=DeviceTokenIssued,
+    status_code=status.HTTP_201_CREATED,
+    summary="Admin Issue/Rotate Device Token",
+)
+async def admin_issue_device_token(meter_id: str, _: CurrentUser = Depends(get_current_super_admin)):
+    """
+    เฉพาะ super admin — ผู้ดูแลระบบทั่วไปดูสถานะได้อย่างเดียว
+    ออก token ใหม่ให้อุปกรณ์ของมิเตอร์นี้ ถ้ามีอยู่แล้วจะแทนที่ทันที (token เดิมใช้ไม่ได้)
+    ค่า token แสดงในคำตอบนี้ครั้งเดียว ระบบเก็บเฉพาะค่าแฮช — ถ้าทำหายต้องออกใหม่
+    """
+    meter_id = meter_id.strip().upper()
+    async with pool().acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM device_config WHERE meter_id = $1", meter_id)
+        if not exists:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No device_config row for meter_id={meter_id!r} yet — set up the meter itself first.",
+            )
+        token = new_device_token()
+        row = await conn.fetchrow(
+            """
+            INSERT INTO device_tokens (meter_id, token_hash, token_prefix)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (meter_id) DO UPDATE SET
+                token_hash = EXCLUDED.token_hash,
+                token_prefix = EXCLUDED.token_prefix,
+                rotated_at = now(),
+                last_used_at = NULL
+            RETURNING token_prefix, created_at, rotated_at
+            """,
+            meter_id,
+            hash_device_token(token),
+            token[:11],
+        )
+    return DeviceTokenIssued(meter_id=meter_id, token=token, **dict(row))
+
+
+@router.delete(
+    "/admin/device-config/{meter_id}/device-token",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Admin Revoke Device Token",
+)
+async def admin_revoke_device_token(meter_id: str, _: CurrentUser = Depends(get_current_super_admin)):
+    """เฉพาะ super admin — เพิกถอน token ของอุปกรณ์ — อุปกรณ์ที่ใช้ token นี้จะได้ 401 ทันที"""
+    meter_id = meter_id.strip().upper()
+    deleted = await pool().fetchval("DELETE FROM device_tokens WHERE meter_id = $1 RETURNING 1", meter_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No device token for this meter")

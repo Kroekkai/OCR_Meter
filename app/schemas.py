@@ -480,3 +480,20 @@ class PushIssueEntry(BaseModel):
     # push_last_response for why (asyncpg returns JSONB as raw string).
     push_last_response: str | None
     push_meter_matched: bool | None
+
+
+class DeviceTokenStatus(BaseModel):
+    meter_id: str
+    has_token: bool
+    token_prefix: str | None = None
+    created_at: dt.datetime | None = None
+    rotated_at: dt.datetime | None = None
+    last_used_at: dt.datetime | None = None
+
+
+class DeviceTokenIssued(BaseModel):
+    meter_id: str
+    token: str
+    token_prefix: str
+    created_at: dt.datetime
+    rotated_at: dt.datetime | None = None

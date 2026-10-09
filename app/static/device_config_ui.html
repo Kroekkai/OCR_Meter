@@ -317,6 +317,15 @@
   #pw-msg.err { color: #ff7a75; }
   #pw-msg.ok { color: var(--accent); }
   #manage-users-btn { display: none; }
+
+  /* token ของอุปกรณ์ */
+  .dt-issued { display: none; margin-bottom: 10px; }
+  .dt-issued.show { display: block; }
+  .dt-issued label { display: block; font-size: 12px; color: #ffb347; margin-bottom: 4px; }
+  .dt-row { display: flex; gap: 8px; }
+  .dt-row input { flex: 1; font-family: var(--mono); font-size: 13px; }
+  #dt-revoke-btn { display: none; }
+  #dt-actions { display: none; }
   #push-issues-panel {
     background: var(--surface);
     color: var(--text);
@@ -614,6 +623,28 @@
             <span id="api-key-msg"></span>
           </div>
         </fieldset>
+
+        <fieldset>
+          <legend>Token ของอุปกรณ์ (ESP32)</legend>
+          <div class="field">
+            <label>สถานะ</label>
+            <div class="static-box" id="f-dt-status">-</div>
+            <div class="hint">token นี้ใช้ได้เฉพาะมิเตอร์นี้ — อุปกรณ์อัปโหลดภาพหรือขอตารางเวลาของมิเตอร์อื่นไม่ได้ ระบบเก็บเฉพาะค่าแฮช จึงแสดง token ได้ครั้งเดียวตอนออก</div>
+          </div>
+          <div id="dt-issued" class="dt-issued">
+            <label>token ใหม่ (คัดลอกไปตั้งค่าในอุปกรณ์ตอนนี้ — ปิดหน้านี้แล้วจะดูอีกไม่ได้)</label>
+            <div class="dt-row">
+              <input type="text" id="dt-token" readonly>
+              <button type="button" id="dt-copy-btn">คัดลอก</button>
+            </div>
+          </div>
+          <div class="hint" id="dt-super-only">ออกหรือเพิกถอน token ได้เฉพาะ super admin</div>
+          <div class="actions" id="dt-actions">
+            <button type="button" class="primary" id="dt-issue-btn">ออก token</button>
+            <button type="button" class="danger" id="dt-revoke-btn">เพิกถอน</button>
+            <span id="dt-msg"></span>
+          </div>
+        </fieldset>
         </div><!-- /#detail-form-main -->
 
         <div id="detail-form-side">
@@ -678,13 +709,22 @@
 
   // ---------- บัญชีที่ login อยู่ / ปุ่มเฉพาะ super admin ----------
   // การซ่อนปุ่มเป็นแค่เรื่องหน้าตา — สิทธิ์จริงตรวจที่เซิร์ฟเวอร์ทุก API
+  // ปุ่มออก/เพิกถอน token แสดงเฉพาะ super admin (สิทธิ์จริงตรวจที่เซิร์ฟเวอร์)
+  let isSuperAdmin = false;
+  function applyDeviceTokenRole() {
+    $("dt-actions").style.display = isSuperAdmin ? "flex" : "none";
+    $("dt-super-only").style.display = isSuperAdmin ? "none" : "block";
+  }
+
   async function loadMe() {
     $("manage-users-btn").style.display = "none";
     try {
       const res = await api("../me");
       if (!res.ok) return;
       const me = await res.json();
-      if (me.is_super_admin) $("manage-users-btn").style.display = "inline-block";
+      isSuperAdmin = !!me.is_super_admin;
+      if (isSuperAdmin) $("manage-users-btn").style.display = "inline-block";
+      applyDeviceTokenRole();
     } catch (e) { /* handled in api() */ }
   }
 
@@ -940,8 +980,67 @@
       loadRealResults(meterId);
       loadTestResults(meterId);
       loadApiKeyStatus(meterId);
+      loadDeviceToken(meterId);
     } catch (e) { /* handled in api() */ }
   }
+
+  // ---------- token ของอุปกรณ์รายเครื่อง ----------
+  function dtMsg(text, isErr) { const el = $("dt-msg"); el.textContent = text; el.className = isErr ? "err" : "ok"; }
+  function hideIssued() { $("dt-issued").classList.remove("show"); $("dt-token").value = ""; }
+  function fmtTime(t) { return t ? new Date(t).toLocaleString("th-TH") : "-"; }
+
+  async function loadDeviceToken(meterId) {
+    hideIssued(); dtMsg("");
+    $("f-dt-status").textContent = "กำลังโหลด...";
+    try {
+      const res = await api("device-config/" + encodeURIComponent(meterId) + "/device-token");
+      const st = await res.json();
+      if (!st.has_token) {
+        $("f-dt-status").textContent = "ยังไม่ได้ออก token — อุปกรณ์ใช้ key กลางอยู่";
+        $("dt-issue-btn").textContent = "ออก token";
+        $("dt-revoke-btn").style.display = "none";
+        return;
+      }
+      $("f-dt-status").textContent = st.token_prefix + "… · ออกเมื่อ " + fmtTime(st.rotated_at || st.created_at) +
+        " · ใช้ล่าสุด " + (st.last_used_at ? fmtTime(st.last_used_at) : "ยังไม่เคยใช้");
+      $("dt-issue-btn").textContent = "ออก token ใหม่";
+      $("dt-revoke-btn").style.display = "inline-block";
+    } catch (e) { /* handled in api() */ }
+  }
+
+  $("dt-issue-btn").addEventListener("click", async () => {
+    if (!currentMeterId) return;
+    const hasToken = $("dt-revoke-btn").style.display !== "none";
+    if (hasToken && !confirm("ออก token ใหม่ให้ " + currentMeterId + " ?\ntoken เดิมจะใช้ไม่ได้ทันที ต้องตั้งค่า token ใหม่ในอุปกรณ์")) return;
+    const res = await api("device-config/" + encodeURIComponent(currentMeterId) + "/device-token", { method: "POST" });
+    if (res.status === 201) {
+      const d = await res.json();
+      await loadDeviceToken(currentMeterId);
+      $("dt-token").value = d.token;
+      $("dt-issued").classList.add("show");
+      dtMsg("ออก token แล้ว", false);
+    } else if (res.status === 404) {
+      dtMsg("ต้องกดบันทึกตารางเวลาของมิเตอร์นี้ก่อน", true);
+    } else if (res.status === 403) {
+      dtMsg("ออก token ได้เฉพาะ super admin", true);
+    } else {
+      dtMsg("ออก token ไม่สำเร็จ (" + res.status + ")", true);
+    }
+  });
+
+  $("dt-copy-btn").addEventListener("click", async () => {
+    const v = $("dt-token").value;
+    try { await navigator.clipboard.writeText(v); dtMsg("คัดลอกแล้ว", false); }
+    catch (e) { $("dt-token").select(); document.execCommand("copy"); dtMsg("คัดลอกแล้ว", false); }
+  });
+
+  $("dt-revoke-btn").addEventListener("click", async () => {
+    if (!currentMeterId) return;
+    if (!confirm("เพิกถอน token ของ " + currentMeterId + " ?\nอุปกรณ์ที่ใช้ token นี้จะส่งข้อมูลไม่ได้ทันที")) return;
+    const res = await api("device-config/" + encodeURIComponent(currentMeterId) + "/device-token", { method: "DELETE" });
+    if (res.status === 204) { await loadDeviceToken(currentMeterId); dtMsg("เพิกถอนแล้ว", false); }
+    else dtMsg("เพิกถอนไม่สำเร็จ (" + res.status + ")", true);
+  });
 
   $("mobile-back-btn").addEventListener("click", () => {
     $("config-view").classList.remove("mobile-detail-open");

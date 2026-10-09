@@ -1194,3 +1194,21 @@ ALTER TABLE esp32_upload_log ADD CONSTRAINT esp32_upload_log_meter_id_fkey FOREI
 -- จุดนั้น) — ดู comment ของคอลัมน์ job_id ในนิยาม CREATE TABLE images เอง
 ALTER TABLE images DROP CONSTRAINT IF EXISTS images_job_id_fkey;
 ALTER TABLE images ADD CONSTRAINT images_job_id_fkey FOREIGN KEY (job_id) REFERENCES ocr_jobs(id);
+
+
+-- ---------------------------------------------------------------------------
+-- device_tokens: token ของอุปกรณ์รายเครื่อง (1 มิเตอร์ = 1 token)
+--   - เก็บเฉพาะค่าแฮช SHA-256 ของ token ไม่เก็บตัวจริง (token สุ่มยาว 32 ไบต์
+--     จึงใช้ SHA-256 ได้ ไม่ต้องใช้ bcrypt และค้นหาด้วย index ได้ทันที)
+--   - token_prefix เก็บ 8 ตัวอักษรแรกไว้แสดงในหน้าจอเพื่อให้ผู้ดูแลแยกได้ว่าเป็น token ไหน
+--   - อุปกรณ์ที่ใช้ token นี้อัปโหลดภาพ / ขอตารางเวลาได้เฉพาะ meter_id ของตัวเอง
+--   - รันซ้ำได้
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS device_tokens (
+    meter_id      TEXT        PRIMARY KEY REFERENCES device_config(meter_id) ON DELETE CASCADE,
+    token_hash    TEXT        NOT NULL UNIQUE,
+    token_prefix  TEXT        NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    rotated_at    TIMESTAMPTZ,
+    last_used_at  TIMESTAMPTZ
+);
