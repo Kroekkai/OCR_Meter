@@ -217,6 +217,8 @@ class OcrMeterEntry(BaseModel):
     capture_date: dt.date
     capture_time: dt.time
     ocr_reading: float | None
+    # ข้อความที่ระบบ OCR ส่งมาตามจริง ก่อนเซิร์ฟเวอร์เติมจุดทศนิยม (เก็บไว้เป็นสถิติ)
+    ocr_reading_raw: str | None = None
     error_type: OcrErrorType
     image: str | None
     """

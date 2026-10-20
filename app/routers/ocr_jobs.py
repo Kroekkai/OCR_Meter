@@ -1,12 +1,14 @@
 import datetime as dt
 import logging
 
+import decimal
+
 import asyncpg
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, status
 
 from app.auth import CurrentUser, get_admin_or_service, get_ocr_client
 from app.config import get_settings
-from app.db import pool
+from app.db import pool, utility_type_for_meter_id
 from app.external_push import (
     ExternalRefCollisionError,
     fire_and_forget,
@@ -95,9 +97,56 @@ async def admin_claim_ocr_job(job_id: int, _: CurrentUser = Depends(get_ocr_clie
     return OcrClaimResponse(job=_job_out(updated), image_file_urls=urls)
 
 
+def _reading_decimals_for(meter_id: str) -> int:
+    """จำนวนหลักทศนิยมบนหน้าปัดตามประเภทมิเตอร์ (ตั้งได้ใน config)"""
+    settings = get_settings()
+    return {
+        "electric": settings.reading_decimals_electric,
+        "gas": settings.reading_decimals_gas,
+        "water": settings.reading_decimals_water,
+    }.get(utility_type_for_meter_id(meter_id), 0)
+
+
+def _parse_reading(raw: str | None) -> decimal.Decimal | None:
+    """
+    แปลงข้อความค่าที่ OCR ส่งมาเป็นตัวเลข — ปฏิเสธ NaN / inf / ข้อความที่ไม่ใช่ตัวเลข
+    (ถ้ารับไว้ ค่า NaN จะทำให้ API แสดงรายการผลลัพธ์ตอบ 500)
+    """
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = decimal.Decimal(raw.strip())
+    except decimal.InvalidOperation:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"ocr_reading must be a number — got {raw!r}",
+        ) from None
+    if not value.is_finite():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"ocr_reading must be a finite number — got {raw!r}",
+        )
+    return value
+
+
+def _apply_decimal_point(raw: str, value: decimal.Decimal, meter_id: str) -> decimal.Decimal:
+    """
+    ถ้า OCR ส่งค่ามาโดยไม่มีจุดทศนิยม ("53864") เติมจุดตามจำนวนหลักทศนิยมของ
+    ประเภทมิเตอร์ (ไฟฟ้า 1 → 5386.4, แก๊ส/น้ำ 3) — ตัดสินจากข้อความ ไม่ใช่จาก
+    ค่าตัวเลข เพราะ "5386.0" กับ "5386" มีค่าเท่ากันแต่ความหมายต่างกัน:
+    อันแรก OCR ใส่จุดมาแล้ว อันหลังยังไม่ได้ใส่
+    """
+    if "." in raw:
+        return value
+    decimals = _reading_decimals_for(meter_id)
+    if decimals <= 0:
+        return value
+    return value.scaleb(-decimals)
+
+
 async def _submit_ocr_result(
     job_id: int,
-    ocr_reading: float | None,
+    ocr_reading_raw: str | None,
     error_type: int,
     ocr_engine: int,
     confidence: float | None,
@@ -140,6 +189,9 @@ async def _submit_ocr_result(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"error_type must be 0, 1, 2, or 3 — got {error_type!r}",
         )
+    parsed_reading = _parse_reading(ocr_reading_raw)
+    ocr_reading_raw = ocr_reading_raw.strip() if parsed_reading is not None else None
+    ocr_reading = float(parsed_reading) if parsed_reading is not None else None
     if error_type in HAS_READING_CODES and ocr_reading is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -196,6 +248,8 @@ async def _submit_ocr_result(
                     ),
                 )
 
+            if parsed_reading is not None:
+                ocr_reading = float(_apply_decimal_point(ocr_reading_raw, parsed_reading, job["meter_id"]))
             capture_date, capture_time = capture_date_time_from_device_timestamp(job["device_timestamp"])
 
             # No file write at all — just reference the anchor's filename,
@@ -232,8 +286,8 @@ async def _submit_ocr_result(
                 return await conn.fetchrow(
                     f"""
                     INSERT INTO {target_table}
-                        (meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine, confidence, external_ref)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        (meter_id, capture_date, capture_time, ocr_reading, error_type, image, ocr_engine, confidence, external_ref, ocr_reading_raw)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     RETURNING *
                     """,
                     job["meter_id"],
@@ -245,6 +299,7 @@ async def _submit_ocr_result(
                     ocr_engine,
                     confidence,
                     ref,
+                    ocr_reading_raw,
                 )
 
             try:
@@ -295,7 +350,7 @@ async def _submit_ocr_result(
 @router.post("/{job_id}/result", response_model=OcrMeterEntry, summary="Admin Submit Ocr Result")
 async def admin_submit_ocr_result(
     job_id: int,
-    ocr_reading: float | None = Form(
+    ocr_reading: str | None = Form(
         default=None,
         description="Required when error_type is 0 or 3. Must be omitted for error_type 1 or 2 — there is no reading to report.",
     ),
@@ -400,7 +455,7 @@ async def admin_submit_ocr_result(
 @router.post("/{job_id}/result-test", response_model=OcrMeterEntry, summary="Admin Submit Ocr Test Result")
 async def admin_submit_ocr_result_test(
     job_id: int,
-    ocr_reading: float | None = Form(
+    ocr_reading: str | None = Form(
         default=None,
         description="Required when error_type is 0 or 3. Must be omitted for error_type 1 or 2 — there is no reading to report.",
     ),

@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     #   false = ทุกชุดเข้าคิว OCR และถูกส่งไป CFO Platform ตามปกติ
     # ตั้งผ่าน env: DAILY_GROUP_LIMIT_ENABLED=false
     daily_group_limit_enabled: bool = True
+    # จำนวนหลักทศนิยมบนหน้าปัดของมิเตอร์แต่ละประเภท — ถ้าระบบ OCR ส่งค่ามา
+    # โดยไม่มีจุดทศนิยม (เช่น "53864") เซิร์ฟเวอร์จะเติมจุดให้ตามจำนวนนี้
+    # (ไฟฟ้า 1 → 5386.4) ถ้าส่งมามีจุดอยู่แล้วจะใช้ตามเดิม ไม่แตะ
+    reading_decimals_electric: int = 1
+    reading_decimals_gas: int = 3
+    reading_decimals_water: int = 3
     # How often the background sweep checks for expired groups to
     # finalize. Independent of the window above — this is just the poll
     # interval, not the wait time itself.

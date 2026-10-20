@@ -1212,3 +1212,12 @@ CREATE TABLE IF NOT EXISTS device_tokens (
     rotated_at    TIMESTAMPTZ,
     last_used_at  TIMESTAMPTZ
 );
+
+
+-- ---------------------------------------------------------------------------
+-- ocr_reading_raw: ข้อความค่าที่ระบบ OCR ส่งมาตามจริง (ก่อนเซิร์ฟเวอร์เติมจุดทศนิยม)
+-- เก็บไว้เป็นสถิติปรับปรุง OCR — ocr_reading คือค่าที่ใช้งานจริง (หลังเติมจุด)
+-- รันซ้ำได้
+-- ---------------------------------------------------------------------------
+ALTER TABLE ocr_meter      ADD COLUMN IF NOT EXISTS ocr_reading_raw TEXT;
+ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS ocr_reading_raw TEXT;
