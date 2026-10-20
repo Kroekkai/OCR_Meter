@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # middleware is a no-op on any path that doesn't start with this
     # prefix. Set to "" if not behind a proxy with a base path at all.
     base_path_prefix: str = "/iot"
-    port: int = 3005
+    port: int = 3003
 
     # --- Auth: JWT ---------------------------------------------------------
     # Must match meter-dashboard's JWT_SECRET exactly — both services
@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     # ocr_jobs row — whatever arrived by then, not necessarily all of
     # them. See app/grouping.py.
     image_group_window_seconds: int = 60
+    # จำกัดภาพจริง (ไม่ใช่ภาพทดสอบ) ไว้วันละ 1 ชุดต่อมิเตอร์หรือไม่
+    #   true  = ชุดที่ 2 ของวันเดียวกันถูกตั้งเป็น dropped (ค่าเดิม)
+    #   false = ทุกชุดเข้าคิว OCR และถูกส่งไป CFO Platform ตามปกติ
+    # ตั้งผ่าน env: DAILY_GROUP_LIMIT_ENABLED=false
+    daily_group_limit_enabled: bool = True
     # How often the background sweep checks for expired groups to
     # finalize. Independent of the window above — this is just the poll
     # interval, not the wait time itself.

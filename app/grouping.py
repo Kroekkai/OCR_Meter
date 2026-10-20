@@ -51,6 +51,11 @@ async def has_normal_group_today(conn: asyncpg.Connection, meter_id: str) -> boo
     mirrors is_test_filename() exactly (case-insensitive "_test" right
     before .jpg/.jpeg) — keep the two in sync if either changes.
     """
+    # ปิดกฎวันละ 1 ชุดได้ด้วย DAILY_GROUP_LIMIT_ENABLED=false —
+    # ตอบ False เสมอ ทั้งสองจุดที่เรียกใช้ (images.py ตอนกลุ่มครบ และ
+    # group sweep ตอนหมดเวลารอ) จึงไม่ drop โดยไม่ต้องแก้ที่อื่น
+    if not get_settings().daily_group_limit_enabled:
+        return False
     today_midnight_bangkok = dt.datetime.now(BANGKOK_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     row = await conn.fetchval(
         """
