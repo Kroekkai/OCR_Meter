@@ -9,6 +9,7 @@ services:
     env_file:
       - .env
     environment:
+      - DAILY_GROUP_LIMIT_ENABLED=false
       - TZ=Asia/Bangkok
       - DB_HOST=timescaledb
       - DB_PORT=5432
