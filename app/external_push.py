@@ -361,8 +361,10 @@ def build_meter_reading_payload(
 
 
 def _format_ai_value(value) -> str:
-    """aiValue per spec 4.1: number ≥0, ≤2 decimal places, '.' as the decimal point, never exponent notation."""
-    d = decimal.Decimal(str(value)).quantize(decimal.Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
+    """aiValue per spec 4.1: number ≥0, ≤2 decimal places, '.' as the decimal point, never exponent notation.
+    ตัดทศนิยมเกิน 2 ตำแหน่งทิ้ง (ROUND_DOWN) ไม่ปัดขึ้น — เลขสะสมบนหน้าปัดยังไม่ถึงค่าที่ปัดขึ้นจริง
+    เช่น แก๊ส 2875.335 → 2875.33 (ไม่ใช่ 2875.34)"""
+    d = decimal.Decimal(str(value)).quantize(decimal.Decimal("0.01"), rounding=decimal.ROUND_DOWN)
     if d < 0:
         # Already rejected at ingest (ocr_jobs.py) — re-checked here so a bad
         # row can never go out as a negative value (spec: "number ≥0").
