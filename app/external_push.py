@@ -893,6 +893,41 @@ async def attempt_push_for_row(conn, row: dict, table: str, api_key: str, base_u
         return "failed_retryable"
 
 
+
+BANGKOK = dt.timezone(dt.timedelta(hours=7))
+SKIPPED_BEFORE_KEY = "skipped_before_key"
+
+
+def captured_before_key(row: dict, key_created_at: dt.datetime | None) -> bool:
+    """
+    ส่งไป CFO Platform เฉพาะค่าที่ถ่าย "หลัง" บันทึก API Key ครั้งแรกของมิเตอร์
+    (external_api_keys.created_at — ไม่เปลี่ยนเมื่อเปลี่ยน key ภายหลัง)
+    ค่าที่ถ่ายก่อนหน้านั้นเป็นข้อมูลช่วงทดลอง จะไม่ถูกส่งอัตโนมัติ — ผู้ดูแลยังสั่ง
+    ส่งเองทีละรายการได้ผ่าน POST /admin/meters/ocr-meter/{id}/push-external
+    เทียบด้วยเวลาที่ถ่าย (capture_date + capture_time ตามเวลาไทย) ไม่ใช่เวลาที่บันทึก
+    แถว — ภาพที่อุปกรณ์ถ่ายก่อนตั้ง key แต่ส่งมาทีหลัง (เช่น ออฟไลน์อยู่) ก็ไม่ถูกส่ง
+    """
+    if key_created_at is None or row.get("capture_date") is None or row.get("capture_time") is None:
+        return False
+    captured = dt.datetime.combine(row["capture_date"], row["capture_time"]).replace(tzinfo=BANGKOK)
+    return captured < key_created_at
+
+
+async def mark_skipped_before_key(conn, table: str, row_id: int, key_created_at: dt.datetime) -> None:
+    await conn.execute(
+        f"""
+        UPDATE {table}
+        SET push_status = '{SKIPPED_BEFORE_KEY}',
+            push_last_response = $1,
+            push_next_retry_at = NULL
+        WHERE id = $2 AND push_status = 'not_pushed'
+        """,
+        json.dumps({"note": "captured before the CFO API key was first saved — not sent automatically",
+                    "key_created_at": key_created_at.isoformat()}),
+        row_id,
+    )
+
+
 async def process_due_pushes(conn, base_url: str, max_batch: int = 50) -> dict[str, int]:
     """
     Confirmed request (ข้อ 19) — finds every ocr_meter row (never
@@ -925,12 +960,13 @@ async def process_due_pushes(conn, base_url: str, max_batch: int = 50) -> dict[s
         "skipped_no_key": 0,
         "skipped_auth_blocked": 0,
         "skipped_key_error": 0,
+        "skipped_before_key": 0,
     }
 
     for table in (PUSHABLE_TABLE,):
         rows = await conn.fetch(
             f"""
-            SELECT m.*, k.api_key_encrypted, k.auth_failed_at
+            SELECT m.*, k.api_key_encrypted, k.auth_failed_at, k.created_at AS key_created_at
             FROM {table} m
             LEFT JOIN external_api_keys k ON k.meter_id = m.meter_id AND k.is_active = true
             WHERE m.push_status IN ('not_pushed', 'failed_retryable', 'blocked_auth')
@@ -946,6 +982,10 @@ async def process_due_pushes(conn, base_url: str, max_batch: int = 50) -> dict[s
             row = dict(row)
             if row["api_key_encrypted"] is None:
                 summary["skipped_no_key"] += 1
+                continue
+            if row["push_status"] == "not_pushed" and captured_before_key(row, row["key_created_at"]):
+                await mark_skipped_before_key(conn, table, row["id"], row["key_created_at"])
+                summary["skipped_before_key"] += 1
                 continue
             if row["auth_failed_at"] is not None or row["meter_id"] in blocked_this_batch:
                 # Spec 4.3 (401: หยุดส่ง) — key is known-bad, don't keep
@@ -1075,7 +1115,7 @@ async def push_immediately_if_configured(meter_id: str, table: str, row_id: int,
             if row is None or row["external_ref"] is None:
                 return  # confirmed: should not normally happen — see attempt_push_for_row's own note on this
             key_row = await conn.fetchrow(
-                "SELECT api_key_encrypted, auth_failed_at FROM external_api_keys WHERE meter_id = $1 AND is_active = true",
+                "SELECT api_key_encrypted, auth_failed_at, created_at FROM external_api_keys WHERE meter_id = $1 AND is_active = true",
                 meter_id,
             )
             if key_row is None:
@@ -1083,6 +1123,9 @@ async def push_immediately_if_configured(meter_id: str, table: str, row_id: int,
             if key_row["auth_failed_at"] is not None:
                 # Key is paused after a 401/403 (spec 4.3: หยุดส่ง) — leave the
                 # row queued; the sweep sends it once the key is fixed.
+                return
+            if row["push_status"] == "not_pushed" and captured_before_key(dict(row), key_row["created_at"]):
+                await mark_skipped_before_key(conn, table, row_id, key_row["created_at"])
                 return
             api_key = decrypt_api_key(key_row["api_key_encrypted"])
             await attempt_push_for_row(conn, dict(row), table, api_key, base_url)

@@ -772,6 +772,7 @@
     if (status === "failed_retryable") return "กำลัง retry อยู่";
     if (status === "pending") return "ส่งแล้ว รอตรวจสอบ";
     if (status === "not_pushed") return "ยังไม่ได้ส่ง";
+    if (status === "skipped_before_key") return "ไม่ส่ง (ถ่ายก่อนตั้งค่า API Key)";
     return status;
   }
 
