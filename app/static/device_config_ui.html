@@ -985,6 +985,19 @@
     } catch (e) { /* handled in api() */ }
   }
 
+  // ---------- แสดงค่าที่อ่านได้ตามจำนวนหลักทศนิยมบนหน้าปัด ----------
+  // ไฟฟ้า 1 หลัก แก๊ส 3 หลัก น้ำ 3 หลัก (ตรงกับค่าตั้งค่า reading_decimals_* ฝั่งเซิร์ฟเวอร์)
+  // ใช้แค่ตอนแสดงผล — JavaScript ตัด ".0" ท้ายทิ้งเอง 5391.0 จึงเคยแสดงเป็น 5391
+  const READING_DECIMALS = { ELE: 1, GAS: 3, WAT: 3 };
+  function formatReading(meterId, value) {
+    if (value === null || value === undefined || value === "") return "—";
+    const n = Number(value);
+    if (!Number.isFinite(n)) return String(value);
+    const prefix = String(meterId || "").split("-")[0].toUpperCase();
+    const d = READING_DECIMALS[prefix];
+    return d === undefined ? String(n) : n.toFixed(d);
+  }
+
   // ---------- token ของอุปกรณ์รายเครื่อง ----------
   function dtMsg(text, isErr) { const el = $("dt-msg"); el.textContent = text; el.className = isErr ? "err" : "ok"; }
   function hideIssued() { $("dt-issued").classList.remove("show"); $("dt-token").value = ""; }
@@ -1375,7 +1388,7 @@
 
     const reading = document.createElement("div");
     reading.className = "tr-reading";
-    reading.textContent = entry.ocr_reading !== null ? entry.ocr_reading : "—";
+    reading.textContent = formatReading(entry.meter_id || currentMeterId, entry.ocr_reading);
     meta.appendChild(reading);
 
     const label = ERROR_TYPE_LABEL[entry.error_type] || { text: "ไม่ทราบ", cls: "err" };
@@ -1453,7 +1466,7 @@
 
     const reading = document.createElement("div");
     reading.className = "tr-reading";
-    reading.textContent = entry.ocr_reading !== null ? entry.ocr_reading : "—";
+    reading.textContent = formatReading(entry.meter_id || currentMeterId, entry.ocr_reading);
     meta.appendChild(reading);
 
     const label = ERROR_TYPE_LABEL[entry.error_type] || { text: "ไม่ทราบ", cls: "err" };
