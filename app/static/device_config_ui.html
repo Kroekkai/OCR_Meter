@@ -317,8 +317,7 @@
   #pw-msg.err { color: #ff7a75; }
   #pw-msg.ok { color: var(--accent); }
   #manage-users-btn { display: none; }
-  #auto-refresh { font-size: 12px; color: var(--text-muted); display: inline-flex; align-items: center; gap: 6px; cursor: pointer; white-space: nowrap; }
-  #auto-refresh input { width: auto; margin: 0; }
+  #auto-refresh { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
   @media (max-width: 720px) { #auto-refresh-time { display: none; } }
 
   /* token ของอุปกรณ์ */
@@ -464,9 +463,7 @@
   <header>
     <h1>Meter config <span>— ตารางถ่ายภาพ ESP32</span></h1>
     <div id="whoami">
-      <label id="auto-refresh" title="อัปเดตรายการมิเตอร์ ผลลัพธ์ และ Push Issues ทุก 15 วินาที (ไม่แตะช่องที่กำลังแก้)">
-        <input type="checkbox" id="auto-refresh-toggle" checked> อัปเดตอัตโนมัติ <span id="auto-refresh-time"></span>
-      </label>
+      <span id="auto-refresh" title="อัปเดตรายการมิเตอร์ ผลลัพธ์ และ Push Issues อัตโนมัติทุก 15 วินาที"><span id="auto-refresh-time"></span></span>
       <button id="push-issues-btn" type="button">⚠ Push Issues<span class="badge-count" id="push-issues-count" style="display:none"></span></button>
       <button id="manage-users-btn" type="button">จัดการผู้ดูแล</button>
       <span id="whoami-name"></span>
@@ -998,7 +995,6 @@
   // ผลลัพธ์จะวาดใหม่เฉพาะเมื่อข้อมูลเปลี่ยน (ไม่โหลดภาพย่อซ้ำทุกรอบ)
   // หยุดเองเมื่อสลับไปแท็บอื่น และอัปเดตทันทีเมื่อกลับมา
   const AUTO_REFRESH_MS = 15000;
-  const AUTO_REFRESH_KEY = "meter_config_auto_refresh";
   let autoRefreshTimer = null;
   let autoRefreshBusy = false;
   const lastSig = { real: null, test: null };
@@ -1030,7 +1026,6 @@
 
   async function autoRefreshTick() {
     if (autoRefreshBusy || document.hidden || !token() || anyOverlayOpen()) return;
-    if (!$("auto-refresh-toggle").checked) return;
     autoRefreshBusy = true;
     try {
       await loadList();
@@ -1040,7 +1035,7 @@
         // ไม่รีเฟรช token ขณะที่ token ใหม่ยังแสดงให้คัดลอกอยู่
         if (!$("dt-issued").classList.contains("show")) loadDeviceToken(currentMeterId);
       }
-      $("auto-refresh-time").textContent = "· " + new Date().toLocaleTimeString("th-TH");
+      $("auto-refresh-time").textContent = "อัปเดตล่าสุด " + new Date().toLocaleTimeString("th-TH");
     } catch (e) { /* handled in api() */ }
     finally { autoRefreshBusy = false; }
   }
@@ -1050,12 +1045,6 @@
     autoRefreshTimer = setInterval(autoRefreshTick, AUTO_REFRESH_MS);
   }
 
-  try { $("auto-refresh-toggle").checked = localStorage.getItem(AUTO_REFRESH_KEY) !== "off"; } catch (e) {}
-  $("auto-refresh-toggle").addEventListener("change", () => {
-    const on = $("auto-refresh-toggle").checked;
-    try { localStorage.setItem(AUTO_REFRESH_KEY, on ? "on" : "off"); } catch (e) {}
-    if (on) autoRefreshTick(); else $("auto-refresh-time").textContent = "";
-  });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) autoRefreshTick(); });
   startAutoRefresh();
 
