@@ -1,7 +1,8 @@
+import re
 import datetime as dt
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 MeterType = Literal["electric", "water", "gas"]
 OcrStatus = Literal["pending", "done", "failed", "dropped"]
@@ -383,7 +384,7 @@ class PushExternalResult(BaseModel):
 # --------------------------------------------------------------------------
 class DeviceConfigOut(BaseModel):
     meter_id: str
-    schedule_mode: int  # 0 = program/daily mode, 1 = fix-date mode
+    schedule_mode: int  # 0 Daily, 1 Fix date, 2 ทุก N นาที, 3 ตามรายการเวลา (2, 3 เฉพาะ always_on)
     date1: list[int]  # [Day, Month, Year, Hour, Minute] — primary schedule
     date2: list[int]  # same shape — secondary schedule, [0,0,0,0,0] if unused
     photo_count: int
@@ -394,6 +395,14 @@ class DeviceConfigOut(BaseModel):
     # ว่า "กำลังโชว์ค่า default" กับ "มีการตั้งค่าเองแล้ว" — ESP32 ไม่สนใจ
     # field นี้เลย (แค่ไม่ได้ใช้ ไม่ทำให้ parse พัง)
     is_default: bool = False
+    power_mode: str | None = None  # 'battery' / 'always_on' / None = ยังไม่เคยส่งรูป
+    power_mode_seen_at: dt.datetime | None = None
+    fw_version: str | None = None
+    interval_minutes: int | None = None
+    times: list[str] | None = None
+
+
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
 class DeviceConfigSetRequest(BaseModel):
@@ -402,11 +411,33 @@ class DeviceConfigSetRequest(BaseModel):
     describes ESP32 reading its config, never how one gets set in the
     first place. See app/routers/device_config.py's docstring.
     """
-    schedule_mode: int = Field(ge=0, le=1)
+    schedule_mode: int = Field(ge=0, le=3)
     date1: list[int] = Field(min_length=5, max_length=5)
     date2: list[int] = Field(min_length=5, max_length=5)
     photo_count: int = Field(ge=1, le=10)
-    photo_delay: int = Field(ge=1, le=60)
+    photo_delay: int = Field(ge=0, le=3600)
+    interval_minutes: int | None = Field(default=None, ge=1, le=1440)
+    times: list[str] | None = Field(default=None, max_length=8)
+
+    @model_validator(mode="after")
+    def _check(self):
+        # [D, M, Y, H, M] — วันที่ 0-28 (0 = ค่าพิเศษ: date1 = วันที่ 26, date2 = ไม่มีรอบที่สอง)
+        # จำกัด 28 เพราะ Carbon ตั้ง alarm ตามวันที่ตรง ๆ วันที่ 29-31 บางเดือนไม่มี จะไม่ถ่ายเลย
+        for name, d in (("date1", self.date1), ("date2", self.date2)):
+            if not (0 <= d[0] <= 28):
+                raise ValueError(f"{name}: day must be 0-28")
+            if not (0 <= d[3] <= 23 and 0 <= d[4] <= 59):
+                raise ValueError(f"{name}: hour must be 0-23 and minute 0-59")
+        if self.schedule_mode == 2 and self.interval_minutes is None:
+            raise ValueError("interval_minutes is required when schedule_mode = 2")
+        if self.schedule_mode == 3:
+            if not self.times:
+                raise ValueError("times needs at least 1 entry when schedule_mode = 3")
+        if self.times is not None:
+            bad = [t for t in self.times if not _TIME_RE.match(t)]
+            if bad:
+                raise ValueError(f"times must be HH:MM (00:00-23:59) — got {bad}")
+        return self
 
 
 # --------------------------------------------------------------------------

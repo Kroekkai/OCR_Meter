@@ -62,7 +62,70 @@ def _config_out(row) -> DeviceConfigOut:
         photo_count=row["photo_count"],
         photo_delay=row["photo_delay"],
         is_default=row["is_default"],
+        power_mode=row["power_mode"],
+        power_mode_seen_at=row["power_mode_seen_at"],
+        fw_version=row["fw_version"],
+        interval_minutes=row["interval_minutes"],
+        times=list(row["capture_times"]) if row["capture_times"] else None,
     )
+
+
+POWER_MODES = ("battery", "always_on")
+ALWAYS_ON_ONLY_MODES = (2, 3)
+
+
+async def record_power_mode(conn, meter_id: str, power_mode: str | None, fw_version: str | None) -> None:
+    """
+    บันทึกประเภทเครื่องและเวอร์ชันเฟิร์มแวร์ทุกครั้งที่เครื่องส่งรูป (สเปก AlwaysOn)
+    ไม่มี power_mode มา = Carbon รุ่นเก่าที่ยังไม่อัปเดต ถือเป็น battery
+    ค่าที่ไม่รู้จักไม่บันทึก (ไม่ทับค่าเดิม)
+    """
+    pm = (power_mode or "battery").strip().lower()
+    if pm not in POWER_MODES:
+        return
+    await conn.execute(
+        """
+        UPDATE device_config
+        SET power_mode = $2,
+            power_mode_seen_at = now(),
+            fw_version = COALESCE($3, fw_version)
+        WHERE meter_id = $1
+        """,
+        meter_id,
+        pm,
+        (fw_version or "").strip()[:64] or None,
+    )
+
+
+def device_config_payload(row) -> dict:
+    """
+    คำตอบของ GET /devices/config ตามประเภทเครื่องที่บันทึกไว้ตอนส่งรูป
+
+    battery / ยังไม่ทราบ: รูปแบบเดิมทุกอย่าง (เครื่อง Carbon ไม่ต้องแก้อะไร)
+    always_on: ใส่ "power_mode": "always_on" — ถ้าไม่มีฟิลด์นี้ เครื่อง AlwaysOn จะรับเฉพาะ
+               photo_count, photo_delay แล้วใช้รอบถ่ายของเฟิร์มแวร์เอง
+               ส่งฟิลด์ของทุกโหมดที่มีค่าไปด้วย (เครื่องเก็บไว้ ใช้เฉพาะของโหมดที่เลือก)
+    """
+    base = {
+        "meter_id": row["meter_id"],
+        "schedule_mode": row["schedule_mode"],
+        "date1": list(row["date1"]),
+        "date2": list(row["date2"]),
+        "photo_count": row["photo_count"],
+        "photo_delay": row["photo_delay"],
+        "is_default": row["is_default"],
+    }
+    if row["power_mode"] != "always_on":
+        if base["schedule_mode"] in ALWAYS_ON_ONLY_MODES:
+            # กันไว้อีกชั้น — หน้าเว็บ/API ไม่ให้บันทึกโหมด 2, 3 ให้เครื่อง battery อยู่แล้ว
+            base["schedule_mode"] = 0
+        return base
+    out = {"meter_id": row["meter_id"], "power_mode": "always_on", **{k: v for k, v in base.items() if k != "meter_id"}}
+    if row["interval_minutes"] is not None:
+        out["interval_minutes"] = row["interval_minutes"]
+    if row["capture_times"]:
+        out["times"] = list(row["capture_times"])
+    return out
 
 
 async def get_or_create_device_config(conn, meter_id: str):
@@ -112,7 +175,7 @@ async def get_or_create_device_config(conn, meter_id: str):
     return await conn.fetchrow("SELECT * FROM device_config WHERE meter_id = $1", meter_id)
 
 
-@router.get("/devices/config", response_model=DeviceConfigOut, summary="Get Device Config")
+@router.get("/devices/config", summary="Get Device Config")
 async def get_device_config(
     meter_id: str = Query(..., max_length=16),
     device: CurrentUser = Depends(get_uploader),
@@ -149,7 +212,7 @@ async def get_device_config(
     enforce_device_meter(device, meter_id)
     async with pool().acquire() as conn:
         row = await get_or_create_device_config(conn, meter_id)
-    return _config_out(row)
+    return device_config_payload(row)
 
 
 @router.get(
@@ -237,16 +300,26 @@ async def admin_set_device_config(
     function's own docstring and is_default's comment in db/init.sql.
     """
     meter_id = meter_id.strip().upper()
+    if body.schedule_mode in ALWAYS_ON_ONLY_MODES:
+        pm = await pool().fetchval("SELECT power_mode FROM device_config WHERE meter_id = $1", meter_id)
+        if pm != "always_on":
+            # เฟิร์มแวร์ Carbon ไม่ได้กันโหมด 2, 3 — ถ้าส่งไปจะทำงานผิด
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="schedule_mode 2 and 3 are only for always_on devices",
+            )
     row = await pool().fetchrow(
         """
-        INSERT INTO device_config (meter_id, schedule_mode, date1, date2, photo_count, photo_delay, is_default)
-        VALUES ($1, $2, $3, $4, $5, $6, false)
+        INSERT INTO device_config (meter_id, schedule_mode, date1, date2, photo_count, photo_delay, is_default, interval_minutes, capture_times)
+        VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8)
         ON CONFLICT (meter_id) DO UPDATE SET
             schedule_mode = EXCLUDED.schedule_mode,
             date1 = EXCLUDED.date1,
             date2 = EXCLUDED.date2,
             photo_count = EXCLUDED.photo_count,
             photo_delay = EXCLUDED.photo_delay,
+            interval_minutes = EXCLUDED.interval_minutes,
+            capture_times = EXCLUDED.capture_times,
             is_default = false
         RETURNING *
         """,
@@ -256,6 +329,8 @@ async def admin_set_device_config(
         body.date2,
         body.photo_count,
         body.photo_delay,
+        body.interval_minutes,
+        body.times,
     )
     return _config_out(row)
 

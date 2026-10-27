@@ -39,11 +39,24 @@ class FilenameParseError(ValueError):
     pass
 
 
+# รูปที่ถ่ายก่อนเครื่องซิงก์เวลาได้ (AlwaysOn): {meter_id}_NOTIME_{ms}_{seq}.jpg
+# ms = มิลลิวินาทีนับจากเปิดเครื่อง (ไม่ใช่เวลาจริง) — ใช้เวลาที่เซิร์ฟเวอร์ได้รับแทน
+_NOTIME_FILENAME_RE = re.compile(
+    r"^(?P<meter_id>[A-Za-z][A-Za-z0-9-]*)_NOTIME_(?P<ms>\d+)_(?P<seq>\d+)\.jpe?g$",
+    re.IGNORECASE,
+)
+
+
 def parse_upload_filename(filename: str | None) -> tuple[str, dt.datetime]:
     """Returns (meter_id, device_timestamp). Raises FilenameParseError on any
     mismatch — caller is responsible for turning that into an HTTP 400."""
     if not filename:
         raise FilenameParseError("No filename provided")
+
+    notime = _NOTIME_FILENAME_RE.match(filename.strip())
+    if notime:
+        received = dt.datetime.now(BANGKOK_TZ).replace(microsecond=0)
+        return notime.group("meter_id").upper(), received
 
     match = _FILENAME_RE.match(filename.strip())
     if not match:

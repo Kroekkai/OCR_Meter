@@ -925,7 +925,7 @@ CREATE TABLE IF NOT EXISTS device_config (
 -- เพิ่มไปแล้วบางส่วน) no-op บน fresh install เพราะ CREATE TABLE ด้านบน
 -- มี constraint ครบตั้งแต่ต้นอยู่แล้ว
 ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_schedule_mode_check;
-ALTER TABLE device_config ADD CONSTRAINT device_config_schedule_mode_check CHECK (schedule_mode IN (0, 1));
+ALTER TABLE device_config ADD CONSTRAINT device_config_schedule_mode_check CHECK (schedule_mode IN (0, 1, 2, 3));
 ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_date1_check;
 ALTER TABLE device_config ADD CONSTRAINT device_config_date1_check CHECK (array_length(date1, 1) = 5);
 ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_date2_check;
@@ -933,7 +933,7 @@ ALTER TABLE device_config ADD CONSTRAINT device_config_date2_check CHECK (array_
 ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_photo_count_check;
 ALTER TABLE device_config ADD CONSTRAINT device_config_photo_count_check CHECK (photo_count BETWEEN 1 AND 10);
 ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_photo_delay_check;
-ALTER TABLE device_config ADD CONSTRAINT device_config_photo_delay_check CHECK (photo_delay BETWEEN 1 AND 60);
+ALTER TABLE device_config ADD CONSTRAINT device_config_photo_delay_check CHECK (photo_delay BETWEEN 0 AND 3600);
 -- เผื่อ DB นี้เคยผ่านสถานะ "มี is_default" มาก่อน (ไม่ว่าจะจากรอบ FK
 -- เดิม หรือยังไม่เคยมีเลย) ADD COLUMN IF NOT EXISTS ครอบคลุมทั้ง 2 กรณี
 -- ให้ผลเหมือนกัน — no-op บน fresh install เพราะ CREATE TABLE มีคอลัมน์
@@ -1221,3 +1221,31 @@ CREATE TABLE IF NOT EXISTS device_tokens (
 -- ---------------------------------------------------------------------------
 ALTER TABLE ocr_meter      ADD COLUMN IF NOT EXISTS ocr_reading_raw TEXT;
 ALTER TABLE ocr_meter_test ADD COLUMN IF NOT EXISTS ocr_reading_raw TEXT;
+
+
+-- ---------------------------------------------------------------------------
+-- ประเภทเครื่อง (power_mode) + โหมดถ่ายภาพของ AlwaysOn — ตามสเปก Server: รองรับมิเตอร์ AlwaysOn
+--   power_mode       : 'battery' (Carbon) | 'always_on' (AlwaysOn) — เครื่องส่งมากับรูปทุกครั้ง
+--                      NULL = ยังไม่เคยส่งรูป (ถือเป็น battery)
+--   fw_version       : เวอร์ชันเฟิร์มแวร์ล่าสุดที่เครื่องรายงาน
+--   schedule_mode    : 0 Daily, 1 Fix date, 2 ทุก N นาที (AlwaysOn), 3 ตามรายการเวลา (AlwaysOn)
+--   interval_minutes : โหมด 2
+--   capture_times    : โหมด 3 — "HH:MM" สูงสุด 8 เวลา
+--   photo_delay      : 0-3600 วินาที (เดิม 1-60)
+-- รันซ้ำได้
+-- ---------------------------------------------------------------------------
+ALTER TABLE device_config ADD COLUMN IF NOT EXISTS power_mode TEXT;
+ALTER TABLE device_config ADD COLUMN IF NOT EXISTS power_mode_seen_at TIMESTAMPTZ;
+ALTER TABLE device_config ADD COLUMN IF NOT EXISTS fw_version TEXT;
+ALTER TABLE device_config ADD COLUMN IF NOT EXISTS interval_minutes INTEGER;
+ALTER TABLE device_config ADD COLUMN IF NOT EXISTS capture_times TEXT[];
+ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_power_mode_check;
+ALTER TABLE device_config ADD CONSTRAINT device_config_power_mode_check CHECK (power_mode IS NULL OR power_mode IN ('battery', 'always_on'));
+ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_interval_minutes_check;
+ALTER TABLE device_config ADD CONSTRAINT device_config_interval_minutes_check CHECK (interval_minutes IS NULL OR interval_minutes BETWEEN 1 AND 1440);
+ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_capture_times_check;
+ALTER TABLE device_config ADD CONSTRAINT device_config_capture_times_check CHECK (capture_times IS NULL OR array_length(capture_times, 1) BETWEEN 1 AND 8);
+ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_schedule_mode_check;
+ALTER TABLE device_config ADD CONSTRAINT device_config_schedule_mode_check CHECK (schedule_mode IN (0, 1, 2, 3));
+ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_photo_delay_check;
+ALTER TABLE device_config ADD CONSTRAINT device_config_photo_delay_check CHECK (photo_delay BETWEEN 0 AND 3600);

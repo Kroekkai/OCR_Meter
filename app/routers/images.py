@@ -18,8 +18,12 @@ from app.external_push import (
 from app.filename import BANGKOK_TZ, FilenameParseError, capture_date_time_from_device_timestamp, is_test_filename, parse_upload_filename
 from app.grouping import finalize_group, has_normal_group_today, mark_group_dropped
 from app.repo import get_image_row, image_out
-from app.routers.device_config import get_or_create_device_config
+from app.routers.device_config import get_or_create_device_config, record_power_mode
 from app.schemas import ImageOut, ImageUploadResponse, MeterType, OcrManualEditRequest, OcrStatus
+
+# wakeup_reason ที่นับเป็นภาพจริง (ตามรอบเวลา): Carbon = timer, AlwaysOn = interval
+# นอกนั้น (manual, boot, ไม่ส่งมา) เป็นภาพทดสอบ
+REAL_WAKEUP_REASONS = ("timer", "interval")
 from app import storage
 
 logger = logging.getLogger("ocr_meter_store.images")
@@ -120,6 +124,11 @@ async def upload_image(
     carrier: str | None = Query(
         default=None, description='Carrier name on 4G, or "-" on WiFi — logged only, no behavior tied to it.'
     ),
+    power_mode: str | None = Query(
+        default=None,
+        description='"battery" (Carbon) หรือ "always_on" (AlwaysOn) — ไม่ส่ง = Carbon รุ่นเก่า ถือเป็น battery',
+    ),
+    fw_version: str | None = Query(default=None, description="เวอร์ชันเฟิร์มแวร์ เช่น 1.12, 2.3-AlwaysOn"),
     wakeup_reason: str | None = Query(
         default=None,
         description=(
@@ -211,6 +220,7 @@ async def upload_image(
             # keeps an accurate record. Same transaction as the INSERT
             # below, so both commit or roll back together.
             await get_or_create_device_config(conn, meter_id)
+            await record_power_mode(conn, meter_id, power_mode, fw_version)
 
             # FOR UPDATE here is what makes this race-safe against the
             # background sweep finalizing this exact group at the same
@@ -296,7 +306,7 @@ async def upload_image(
                 # "manual" -> test, "timer" -> real, anything else
                 # (including absent, from firmware that hasn't been
                 # updated yet) -> test, deliberately the safer default.
-                is_test = wakeup_reason != "timer"
+                is_test = wakeup_reason not in REAL_WAKEUP_REASONS
                 stored_filename = _stored_filename(file.filename, is_test)
                 dataset_id = await _insert_dataset_row(conn, stored_filename)
                 image_row = await conn.fetchrow(

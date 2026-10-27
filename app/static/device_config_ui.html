@@ -227,8 +227,8 @@
 
   fieldset { border: none; padding: 0; margin: 0 0 22px; }
   legend { font-size: 13px; color: var(--text-muted); margin-bottom: 10px; padding: 0; }
-  .mode-toggle { display: flex; gap: 8px; }
-  .mode-toggle button { flex: 1; }
+  .mode-toggle { display: flex; gap: 8px; flex-wrap: wrap; }
+  .mode-toggle button { flex: 1; min-width: 140px; }
   .mode-toggle button.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
 
   .row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
@@ -317,6 +317,13 @@
   #pw-msg.err { color: #ff7a75; }
   #pw-msg.ok { color: var(--accent); }
   #manage-users-btn { display: none; }
+  .powermode { font-size: 12px; color: var(--text-muted); margin: -4px 0 6px; }
+  .powermode b { color: var(--text); font-weight: 500; }
+  .hint.warn { color: #ffb347; }
+  .hint.warn:empty { display: none; }
+  .time-row { display: flex; gap: 8px; margin-bottom: 6px; }
+  .time-row input { flex: 1; }
+  .time-row button { flex: 0 0 auto; }
   #auto-refresh { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
   @media (max-width: 720px) { #auto-refresh-time { display: none; } }
 
@@ -528,6 +535,7 @@
           <h2 id="d-meter-id"></h2>
           <span class="badge" id="d-badge"></span>
         </div>
+        <div id="d-powermode" class="powermode"></div>
         <div id="detail-sub"></div>
 
         <fieldset>
@@ -535,7 +543,24 @@
           <div class="mode-toggle">
             <button type="button" id="mode-0">ถ่ายทุกวัน (Daily)</button>
             <button type="button" id="mode-1">ถ่ายวันที่กำหนด (Fix date)</button>
+            <button type="button" id="mode-2" class="aon-only">ทุก N นาที</button>
+            <button type="button" id="mode-3" class="aon-only">ตามรายการเวลา</button>
           </div>
+        </fieldset>
+
+        <fieldset id="interval-fieldset" style="display:none">
+          <legend>ถ่ายทุก ๆ</legend>
+          <div class="field">
+            <select id="f-interval"></select>
+          </div>
+          <div class="hint">นับจากเที่ยงคืน เช่น ทุก 180 นาที ถ่ายที่ 00:00, 03:00, 06:00 … 21:00 ทุกวัน</div>
+          <div class="hint warn" id="interval-warn"></div>
+        </fieldset>
+
+        <fieldset id="times-fieldset" style="display:none">
+          <legend>เวลาถ่าย (สูงสุด 8 เวลา)</legend>
+          <div id="times-list"></div>
+          <button type="button" id="times-add">+ เพิ่มเวลา</button>
         </fieldset>
 
         <fieldset>
@@ -543,7 +568,7 @@
           <div class="date-block" id="date1-block">
             <div class="row3" id="d1-row">
               <div class="field" id="d1-day-field">
-                <label>วัน (1-31)</label>
+                <label>วัน (1-28)</label>
                 <select id="d1-day"></select>
               </div>
               <div class="field">
@@ -574,7 +599,7 @@
           <div class="date-block disabled" id="date2-block">
             <div class="row3" id="d2-row">
               <div class="field" id="d2-day-field">
-                <label>วัน (1-31)</label>
+                <label>วัน (1-28)</label>
                 <select id="d2-day"></select>
               </div>
               <div class="field">
@@ -1133,7 +1158,18 @@
       ? "มิเตอร์นี้ยังไม่เคยตั้งค่าเอง — ค่าด้านล่างเป็นค่า default ปรับแล้วกด บันทึก เพื่อสร้างค่าเฉพาะมิเตอร์นี้"
       : "แก้ไขแล้วกด บันทึก เพื่ออัปเดต";
 
-    setMode(cfg.schedule_mode);
+    currentPowerMode = cfg.power_mode === "always_on" ? "always_on" : "battery";
+    const fw = cfg.fw_version ? " · เฟิร์มแวร์ " + cfg.fw_version : "";
+    $("d-powermode").innerHTML = cfg.power_mode === "always_on"
+      ? "ประเภทเครื่อง: <b>เปิดตลอด</b>" + fw
+      : cfg.power_mode === "battery"
+        ? "ประเภทเครื่อง: <b>แบตเตอรี่</b>" + fw
+        : "ประเภทเครื่อง: <b>ไม่ทราบ</b> (ยังไม่เคยส่งรูป ถือเป็นแบตเตอรี่)";
+    document.querySelectorAll(".aon-only").forEach((b) => { b.style.display = currentPowerMode === "always_on" ? "" : "none"; });
+    $("f-interval").value = String(cfg.interval_minutes || 15);
+    if (!$("f-interval").value) $("f-interval").value = "15";
+    renderTimes(cfg.times && cfg.times.length ? cfg.times : ["08:00"]);
+    setMode(currentPowerMode === "always_on" || cfg.schedule_mode < 2 ? cfg.schedule_mode : 0);
     fillDate("d1", cfg.date1);
     const hasSecond = cfg.date2.some((v) => v !== 0);
     $("d2-enable").checked = hasSecond;
@@ -1141,6 +1177,11 @@
     fillDate("d2", cfg.date2[0] ? cfg.date2 : [1, 0, 0, 0, 0]);
 
     $("f-photo-count").textContent = cfg.photo_count;
+    // ค่าที่ตั้งผ่าน API ได้เกิน 60 วินาที — เพิ่มตัวเลือกให้ถ้ายังไม่มี จะได้ไม่หายตอนบันทึก
+    if (![...$("f-photo-delay").options].some((o) => +o.value === cfg.photo_delay)) {
+      const opt = document.createElement("option"); opt.value = cfg.photo_delay; opt.textContent = String(cfg.photo_delay);
+      $("f-photo-delay").appendChild(opt);
+    }
     $("f-photo-delay").value = cfg.photo_delay;
     $("save-msg").textContent = "";
   }
@@ -1171,10 +1212,55 @@
     ];
   }
 
+  // ---------- โหมด 2, 3 (เฉพาะเครื่องเปิดตลอด) ----------
+  let currentPowerMode = "battery";
+  const INTERVAL_CHOICES = [5, 10, 15, 30, 60, 120, 180, 360, 720];   // หาร 1440 ลงตัว
+  $("f-interval").innerHTML = INTERVAL_CHOICES.map((m) =>
+    `<option value="${m}">${m >= 60 ? (m / 60) + " ชั่วโมง (" + m + " นาที)" : m + " นาที"}</option>`).join("");
+
+  function renderTimes(list) {
+    const box = $("times-list");
+    box.innerHTML = "";
+    list.forEach((t) => {
+      const row = document.createElement("div");
+      row.className = "time-row";
+      row.innerHTML = `<input type="time" value="${t}" step="60"><button type="button" class="danger">ลบ</button>`;
+      row.querySelector("button").addEventListener("click", () => {
+        if ($("times-list").children.length > 1) { row.remove(); updateTimesAdd(); }
+      });
+      box.appendChild(row);
+    });
+    updateTimesAdd();
+  }
+  function readTimes() {
+    return [...$("times-list").querySelectorAll("input")].map((i) => i.value).filter((v) => /^\d{2}:\d{2}$/.test(v));
+  }
+  function updateTimesAdd() { $("times-add").disabled = $("times-list").children.length >= 8; }
+  $("times-add").addEventListener("click", () => {
+    const cur = readTimes();
+    if (cur.length < 8) renderTimes([...cur, "12:00"]);
+  });
+
+  // ระยะเวลาถ่ายทั้งชุดควรน้อยกว่ารอบถ่ายมาก
+  function checkIntervalWarn() {
+    const minutes = parseInt($("f-interval").value, 10);
+    const count = parseInt($("f-photo-count").textContent, 10) || 1;
+    const delay = parseInt($("f-photo-delay").value, 10) || 0;
+    const burst = delay * (count - 1);
+    $("interval-warn").textContent = burst >= minutes * 60 / 2
+      ? `ถ่ายครบ ${count} ภาพใช้เวลา ${burst} วินาที ใกล้เคียงกับรอบถ่ายเกินไป ควรลดระยะห่างระหว่างภาพ`
+      : "";
+  }
+  $("f-interval").addEventListener("change", checkIntervalWarn);
+  $("f-photo-delay").addEventListener("change", checkIntervalWarn);
+
   function setMode(mode) {
     scheduleMode = mode;
-    $("mode-0").classList.toggle("selected", mode === 0);
-    $("mode-1").classList.toggle("selected", mode === 1);
+    [0, 1, 2, 3].forEach((m) => $("mode-" + m).classList.toggle("selected", mode === m));
+    $("interval-fieldset").style.display = mode === 2 ? "block" : "none";
+    $("times-fieldset").style.display = mode === 3 ? "block" : "none";
+    $("date1-block").closest("fieldset").style.display = mode >= 2 ? "none" : "block";
+    if (mode >= 2) { $("second-round-fieldset").style.display = "none"; checkIntervalWarn(); return; }
     // schedule_mode=0 (daily): only the Time matters for a "same time
     // every day" schedule — the Day is meaningless, and so is a second
     // daily round (a single time already fires every day; a "second
@@ -1190,6 +1276,8 @@
   }
   $("mode-0").addEventListener("click", () => setMode(0));
   $("mode-1").addEventListener("click", () => setMode(1));
+  $("mode-2").addEventListener("click", () => setMode(2));
+  $("mode-3").addEventListener("click", () => setMode(3));
 
   function toggleDate2(on) {
     $("date2-block").classList.toggle("disabled", !on);
@@ -1203,8 +1291,8 @@
       showSaveMsg("จำนวนภาพต้องอยู่ระหว่าง 1-10", true);
       return;
     }
-    if (!(photoDelay >= 1 && photoDelay <= 60)) {
-      showSaveMsg("ระยะห่างต้องอยู่ระหว่าง 1-60 วินาที", true);
+    if (!(photoDelay >= 0 && photoDelay <= 3600)) {
+      showSaveMsg("ระยะห่างต้องอยู่ระหว่าง 0-3600 วินาที", true);
       return;
     }
     const date1 = readDate("d1");
@@ -1224,6 +1312,16 @@
       photo_count: photoCount,
       photo_delay: photoDelay,
     };
+    if (currentPowerMode === "always_on") {
+      // ส่งค่าของโหมด 2, 3 ไปด้วยเสมอ (เครื่องเก็บไว้ ใช้เฉพาะของโหมดที่เลือก)
+      body.interval_minutes = parseInt($("f-interval").value, 10);
+      const times = readTimes();
+      if (scheduleMode === 3 && times.length === 0) {
+        showSaveMsg("โหมดตามรายการเวลาต้องมีอย่างน้อย 1 เวลา", true);
+        return;
+      }
+      if (times.length) body.times = [...new Set(times)].sort();
+    }
     try {
       const res = await api("device-config/" + encodeURIComponent(currentMeterId), {
         method: "PUT",
@@ -1334,13 +1432,13 @@
     }
   }
   function initSelects() {
-    fillSelect("d1-day", 1, 31);
+    fillSelect("d1-day", 1, 28);
     fillSelect("d1-hour", 0, 23);
     fillSelect("d1-minute", 0, 59);
-    fillSelect("d2-day", 1, 31);
+    fillSelect("d2-day", 1, 28);
     fillSelect("d2-hour", 0, 23);
     fillSelect("d2-minute", 0, 59);
-    fillSelect("f-photo-delay", 1, 60);
+    fillSelect("f-photo-delay", 0, 60);   // สเปกรับ 0-3600 วินาที — หน้าเว็บให้เลือก 0-60
   }
   initSelects();
 
