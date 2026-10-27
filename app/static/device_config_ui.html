@@ -305,6 +305,21 @@
     z-index: 110; align-items: flex-start; justify-content: center; padding: 60px 20px;
   }
   #pw-overlay.open { display: flex; }
+  #newm-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    z-index: 110; align-items: flex-start; justify-content: center; padding: 60px 20px;
+  }
+  #newm-overlay.open { display: flex; }
+  #newm-panel {
+    background: var(--surface); color: var(--text); border: 1px solid var(--border);
+    border-radius: 10px; width: 100%; max-width: 420px; padding: 20px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+  }
+  #newm-panel h2 { font-size: 16px; font-weight: 500; margin: 0 0 14px; }
+  #newm-panel label { display: block; font-size: 12px; color: var(--text-muted); margin: 10px 0 4px; }
+  #newm-msg { font-size: 13px; margin-top: 10px; min-height: 18px; color: #ff7a75; }
+  #power-tabs { margin-top: -4px; }
+  .meter-row .pm { margin-left: auto; font-size: 11px; color: var(--text-muted); }
   #pw-panel {
     background: var(--surface); color: var(--text); border: 1px solid var(--border);
     border-radius: 10px; width: 100%; max-width: 380px; padding: 20px;
@@ -479,6 +494,25 @@
     </div>
   </header>
 
+  <div id="newm-overlay">
+    <div id="newm-panel">
+      <h2>เพิ่มมิเตอร์ใหม่</h2>
+      <label for="newm-id">รหัสมิเตอร์</label>
+      <input type="text" id="newm-id" placeholder="เช่น ELE-000003, WAT-000001, GAS-000002" autocomplete="off">
+      <label>ประเภทเครื่อง</label>
+      <div class="mode-toggle" id="newm-power">
+        <button type="button" data-power="battery" class="selected">แบตเตอรี่ (Carbon)</button>
+        <button type="button" data-power="always_on">เปิดตลอด (AlwaysOn)</button>
+      </div>
+      <div class="hint">เพิ่มมิเตอร์แล้วออก token ให้ทีมอุปกรณ์ใส่ในเฟิร์มแวร์ได้ทันที — เมื่อเครื่องส่งรูปครั้งแรก ระบบจะใช้ประเภทที่เครื่องรายงานมา</div>
+      <div id="newm-msg"></div>
+      <div class="pw-actions">
+        <button type="button" id="newm-cancel">ยกเลิก</button>
+        <button type="button" class="primary" id="newm-save">เพิ่มมิเตอร์</button>
+      </div>
+    </div>
+  </div>
+
   <div id="pw-overlay">
     <div id="pw-panel">
       <h2>เปลี่ยนรหัสผ่าน</h2>
@@ -520,6 +554,11 @@
         <button type="button" class="tab" data-type="E">ไฟฟ้า</button>
         <button type="button" class="tab" data-type="W">น้ำ</button>
         <button type="button" class="tab" data-type="G">แก๊ส</button>
+      </div>
+      <div class="type-tabs" id="power-tabs">
+        <button type="button" class="tab selected" data-power="all">ทุกเครื่อง</button>
+        <button type="button" class="tab" data-power="battery">แบตเตอรี่</button>
+        <button type="button" class="tab" data-power="always_on">เปิดตลอด</button>
       </div>
       <input type="text" id="search-box" placeholder="ค้นหา meter ID...">
       <div id="list-body"></div>
@@ -923,6 +962,7 @@
 
   let allConfigs = [];
   let activeType = "all";
+  let activePower = "all";   // ไม่ทราบประเภท (ยังไม่เคยส่งรูป) นับเป็นแบตเตอรี่ตามสเปก
 
   async function loadList() {
     try {
@@ -938,6 +978,9 @@
     let items = allConfigs;
     if (activeType !== "all") {
       items = items.filter((c) => c.meter_id.charAt(0).toUpperCase() === activeType);
+    }
+    if (activePower !== "all") {
+      items = items.filter((c) => (c.power_mode === "always_on" ? "always_on" : "battery") === activePower);
     }
     if (query) {
       items = items.filter((c) => c.meter_id.toUpperCase().includes(query));
@@ -962,7 +1005,10 @@
       const label = document.createElement("span");
       label.className = "mid";
       label.textContent = cfg.meter_id;
-      row.append(dot, label);
+      const pm = document.createElement("span");
+      pm.className = "pm";
+      pm.textContent = cfg.power_mode === "always_on" ? "เปิดตลอด" : cfg.power_mode === "battery" ? "แบต" : "";
+      row.append(dot, label, pm);
       row.addEventListener("click", () => selectMeter(cfg.meter_id));
       body.appendChild(row);
     });
@@ -976,6 +1022,13 @@
       renderList();
     });
   });
+  document.querySelectorAll("#power-tabs .tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      activePower = btn.dataset.power;
+      document.querySelectorAll("#power-tabs .tab").forEach((b) => b.classList.toggle("selected", b === btn));
+      renderList();
+    });
+  });
   $("search-box").addEventListener("input", renderList);
 
   function highlightActive() {
@@ -984,10 +1037,34 @@
     });
   }
 
+  // ---------- เพิ่มมิเตอร์ใหม่ (เลือกประเภทเครื่องตอนสร้าง) ----------
+  let newPower = "battery";
+  function newmMsg(t) { $("newm-msg").textContent = t || ""; }
+  function closeNewm() { $("newm-overlay").classList.remove("open"); newmMsg(""); }
   $("new-btn").addEventListener("click", () => {
-    const meterId = prompt("รหัสมิเตอร์ที่จะตั้งค่า เช่น ELE-000001, WAT-000001, GAS-000001");
-    if (!meterId) return;
-    selectMeter(meterId.trim().toUpperCase());
+    $("newm-id").value = ""; newmMsg("");
+    $("newm-overlay").classList.add("open"); $("newm-id").focus();
+  });
+  document.querySelectorAll("#newm-power button").forEach((b) => b.addEventListener("click", () => {
+    newPower = b.dataset.power;
+    document.querySelectorAll("#newm-power button").forEach((x) => x.classList.toggle("selected", x === b));
+  }));
+  $("newm-cancel").addEventListener("click", closeNewm);
+  $("newm-overlay").addEventListener("click", (e) => { if (e.target === $("newm-overlay")) closeNewm(); });
+  $("newm-save").addEventListener("click", async () => {
+    const meterId = $("newm-id").value.trim().toUpperCase();
+    if (!/^(ELE|WAT|GAS)-\d{6}$/.test(meterId)) return newmMsg("รหัสต้องเป็นรูปแบบ ELE-000001, WAT-000001 หรือ GAS-000001");
+    const res = await api("device-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ meter_id: meterId, power_mode: newPower }),
+    });
+    if (res.status === 201) { closeNewm(); await loadList(); selectMeter(meterId); return; }
+    if (res.status === 409) {
+      newmMsg("มีมิเตอร์ " + meterId + " อยู่แล้ว — เปิดดูจากรายการแทน");
+      return;
+    }
+    newmMsg("เพิ่มมิเตอร์ไม่สำเร็จ (" + res.status + ")");
   });
 
   // ---------- detail ----------
@@ -1046,6 +1123,7 @@
   function anyOverlayOpen() {
     return $("lightbox").classList.contains("open")
       || $("pw-overlay").classList.contains("open")
+      || $("newm-overlay").classList.contains("open")
       || $("push-issues-overlay").classList.contains("open");
   }
 
@@ -1161,9 +1239,9 @@
     currentPowerMode = cfg.power_mode === "always_on" ? "always_on" : "battery";
     const fw = cfg.fw_version ? " · เฟิร์มแวร์ " + cfg.fw_version : "";
     $("d-powermode").innerHTML = cfg.power_mode === "always_on"
-      ? "ประเภทเครื่อง: <b>เปิดตลอด</b>" + fw
+      ? "ประเภทเครื่อง: <b>เปิดตลอด</b>" + (cfg.power_mode_seen_at ? fw : " (ตั้งตอนเพิ่มมิเตอร์ เครื่องยังไม่เคยส่งรูป)")
       : cfg.power_mode === "battery"
-        ? "ประเภทเครื่อง: <b>แบตเตอรี่</b>" + fw
+        ? "ประเภทเครื่อง: <b>แบตเตอรี่</b>" + (cfg.power_mode_seen_at ? fw : " (ตั้งตอนเพิ่มมิเตอร์ เครื่องยังไม่เคยส่งรูป)")
         : "ประเภทเครื่อง: <b>ไม่ทราบ</b> (ยังไม่เคยส่งรูป ถือเป็นแบตเตอรี่)";
     document.querySelectorAll(".aon-only").forEach((b) => { b.style.display = currentPowerMode === "always_on" ? "" : "none"; });
     $("f-interval").value = String(cfg.interval_minutes || 15);

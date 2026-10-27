@@ -9,6 +9,7 @@ from app.crypto import decrypt_api_key, encrypt_api_key
 from app.db import pool
 from app.external_push import ExternalPushClientError, ExternalPushServerError, verify_device
 from app.schemas import (
+    DeviceConfigCreateRequest,
     DeviceConfigOut,
     DeviceConfigSetRequest,
     ExternalApiKeySetRequest,
@@ -688,3 +689,31 @@ async def admin_revoke_device_token(meter_id: str, _: CurrentUser = Depends(get_
     deleted = await pool().fetchval("DELETE FROM device_tokens WHERE meter_id = $1 RETURNING 1", meter_id)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No device token for this meter")
+
+
+@router.post(
+    "/admin/device-config",
+    response_model=DeviceConfigOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Admin Create Meter",
+)
+async def admin_create_meter(body: DeviceConfigCreateRequest, _: CurrentUser = Depends(get_current_admin)):
+    """
+    เพิ่มมิเตอร์ใหม่พร้อมประเภทเครื่อง (battery / always_on) ก่อนที่เครื่องจะเคยส่งรูป
+    ใช้ตอนเตรียมติดตั้ง: สร้างมิเตอร์ → ออก token → ส่งให้ทีมอุปกรณ์ใส่ในเฟิร์มแวร์
+    ตารางเวลาเป็นค่าเริ่มต้น (แก้ได้ภายหลัง) — power_mode_seen_at ว่างไว้ แปลว่าผู้ดูแลตั้ง
+    ไม่ใช่เครื่องรายงาน; เมื่อเครื่องส่งรูปครั้งแรก ค่าที่เครื่องส่งมาจะแทนที่ค่านี้
+    """
+    meter_id = body.meter_id.strip().upper()
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            exists = await conn.fetchval("SELECT 1 FROM device_config WHERE meter_id = $1 FOR UPDATE", meter_id)
+            if exists:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Meter {meter_id} already exists")
+            await get_or_create_device_config(conn, meter_id)
+            row = await conn.fetchrow(
+                "UPDATE device_config SET power_mode = $2 WHERE meter_id = $1 RETURNING *",
+                meter_id,
+                body.power_mode,
+            )
+    return _config_out(row)

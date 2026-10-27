@@ -530,3 +530,9 @@ class DeviceTokenIssued(BaseModel):
     token_prefix: str
     created_at: dt.datetime
     rotated_at: dt.datetime | None = None
+
+
+class DeviceConfigCreateRequest(BaseModel):
+    """เพิ่มมิเตอร์ใหม่จากหน้าเว็บ — ใช้ก่อนออก token ให้ทีมอุปกรณ์ใส่ในเฟิร์มแวร์"""
+    meter_id: str = Field(pattern=r"^(ELE|WAT|GAS)-\d{6}$", description="เช่น ELE-000003")
+    power_mode: Literal["battery", "always_on"]
