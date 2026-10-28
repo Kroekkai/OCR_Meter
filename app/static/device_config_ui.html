@@ -6,19 +6,19 @@
 <title>Meter config</title>
 <style>
   :root {
-    --bg: #14161a;
-    --surface: #1c1f26;
-    --surface-hover: #242832;
-    --border: #2a2e38;
-    --text: #e8e6e0;
-    --text-muted: #8b8980;
-    --accent: #4fb8a8;
-    --accent-dim: #2d6b62;
-    --electric: #e8b339;
-    --water: #4a9eda;
-    --gas: #d9714f;
-    --danger: #d9534f;
-    --danger-dim: #5c2b29;
+    --bg: #fff8dc;
+    --surface: #ffffff;
+    --surface-hover: #fff3c4;
+    --border: #d9d9d9;
+    --text: #1f1f1f;
+    --text-muted: #6b6b6b;
+    --accent: #e9bf1f;
+    --accent-dim: #f7d547;
+    --electric: #d9a21b;
+    --water: #2f80c9;
+    --gas: #d0602f;
+    --danger: #c0392b;
+    --danger-dim: #fbe4e1;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
@@ -58,9 +58,9 @@
     transition: background 0.12s, border-color 0.12s;
   }
   button:hover { background: var(--surface-hover); border-color: var(--accent-dim); }
-  button.primary { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
-  button.primary:hover { background: var(--accent); color: #0d1f1c; }
-  button.danger { color: #f5b8b5; }
+  button.primary { background: var(--accent-dim); border-color: var(--accent); color: #1f1f1f; }
+  button.primary:hover { background: var(--accent); color: #1f1f1f; }
+  button.danger { color: #c0392b; }
   button.danger:hover { background: var(--danger-dim); border-color: var(--danger); }
   button:disabled { opacity: 0.4; cursor: default; }
   input, select {
@@ -117,7 +117,7 @@
     font-size: 12px;
     text-align: center;
   }
-  .type-tabs .tab.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
+  .type-tabs .tab.selected { background: var(--accent-dim); border-color: var(--accent); color: #1f1f1f; }
   #search-box { margin-bottom: 12px; font-size: 13px; padding: 7px 10px; }
   .meter-row {
     display: flex;
@@ -229,7 +229,7 @@
   legend { font-size: 13px; color: var(--text-muted); margin-bottom: 10px; padding: 0; }
   .mode-toggle { display: flex; gap: 8px; flex-wrap: wrap; }
   .mode-toggle button { flex: 1; min-width: 140px; }
-  .mode-toggle button.selected { background: var(--accent-dim); border-color: var(--accent); color: #e6fbf6; }
+  .mode-toggle button.selected { background: var(--accent-dim); border-color: var(--accent); color: #1f1f1f; }
 
   .row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
   .row3.daily-mode { grid-template-columns: repeat(2, 1fr); }
@@ -317,7 +317,7 @@
   }
   #newm-panel h2 { font-size: 16px; font-weight: 500; margin: 0 0 14px; }
   #newm-panel label { display: block; font-size: 12px; color: var(--text-muted); margin: 10px 0 4px; }
-  #newm-msg { font-size: 13px; margin-top: 10px; min-height: 18px; color: #ff7a75; }
+  #newm-msg { font-size: 13px; margin-top: 10px; min-height: 18px; color: #c0392b; }
   #power-tabs { margin-top: -4px; }
   .meter-row .pm { margin-left: auto; font-size: 11px; color: var(--text-muted); }
   #pw-panel {
@@ -329,12 +329,12 @@
   #pw-panel label { display: block; font-size: 12px; color: var(--text-muted); margin: 10px 0 4px; }
   #pw-panel .pw-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
   #pw-msg { font-size: 13px; margin-top: 10px; min-height: 18px; }
-  #pw-msg.err { color: #ff7a75; }
+  #pw-msg.err { color: #c0392b; }
   #pw-msg.ok { color: var(--accent); }
   #manage-users-btn { display: none; }
   .powermode { font-size: 12px; color: var(--text-muted); margin: -4px 0 6px; }
   .powermode b { color: var(--text); font-weight: 500; }
-  .hint.warn { color: #ffb347; }
+  .hint.warn { color: #a86500; }
   .hint.warn:empty { display: none; }
   .time-row { display: flex; gap: 8px; margin-bottom: 6px; }
   .time-row input { flex: 1; }
@@ -345,7 +345,7 @@
   /* token ของอุปกรณ์ */
   .dt-issued { display: none; margin-bottom: 10px; }
   .dt-issued.show { display: block; }
-  .dt-issued label { display: block; font-size: 12px; color: #ffb347; margin-bottom: 4px; }
+  .dt-issued label { display: block; font-size: 12px; color: #a86500; margin-bottom: 4px; }
   .dt-row { display: flex; gap: 8px; }
   .dt-row input { flex: 1; font-family: var(--mono); font-size: 13px; }
   #dt-revoke-btn { display: none; }
@@ -381,10 +381,10 @@
   }
   .push-issue-row { background: var(--bg); color: var(--text); }
   .push-issue-row > div:first-child { font-family: var(--mono); font-weight: 600; }
-  .push-issue-row .status-failed_permanent { color: #ff7a75; font-weight: 600; }
-  .push-issue-row .status-blocked_auth { color: #ffb347; font-weight: 600; }
+  .push-issue-row .status-failed_permanent { color: #c0392b; font-weight: 600; }
+  .push-issue-row .status-blocked_auth { color: #a86500; font-weight: 600; }
   .push-issue-row .status-pending { color: var(--text-muted); }
-  .push-issue-row .not-matched { color: #ff7a75; font-weight: 600; }
+  .push-issue-row .not-matched { color: #c0392b; font-weight: 600; }
 
   /* ---------- mobile back button (list <-> detail on phones) ----------
      ซ่อนไว้เป็นค่าเริ่มต้นเสมอ (จอกว้าง) โชว์เฉพาะใน media query มือถือ
@@ -463,6 +463,34 @@
        มันอีกต่อไป (tr-section ที่ตามมายังมีเส้นคั่นจาก rr-section ตามปกติ) */
     #detail-form-side #rr-section { margin-top: 0; padding-top: 0; border-top: none; }
   }
+
+  /* ---------- โทนสีเหลือง-ขาว (ตามแบบหน้าเข้าสู่ระบบขององค์กร) ---------- */
+  body { background: var(--bg); }
+  header { background: #f7d547; border-bottom: none; }
+  header h1, header h1 span, #whoami { color: #1f1f1f; }
+  header button { background: #ffffff; border-color: #ffffff; }
+  header button:hover { background: #fff3c4; border-color: #fff3c4; }
+  button { border-radius: 999px; padding: 7px 16px; }
+  button.primary { background: linear-gradient(90deg, #f6cf3e, #f9e27a); border-color: #f2c94c; color: #1f1f1f; font-weight: 500; }
+  button.primary:hover { background: #f2c94c; color: #1f1f1f; }
+  input, select { background: #ffffff; border-color: #bdbdbd; border-radius: 999px; padding: 9px 16px; }
+  input:focus, select:focus, button:focus-visible { border-color: #e9bf1f; box-shadow: 0 0 0 3px rgba(247,213,71,0.45); }
+  .lightbox { background: rgba(0,0,0,0.85); }
+
+  #list-pane { background: #ffffff; }
+  .meter-row.active { background: #f7d547; color: #1f1f1f; }
+  .meter-row.active .pm { color: #1f1f1f; }
+  .type-tabs .tab { border-radius: 999px; }
+  .type-tabs .tab.selected, .mode-toggle button.selected { background: #f7d547; border-color: #e9bf1f; color: #1f1f1f; font-weight: 500; }
+  .tr-card { background: #ffffff; }
+  .tr-badge.ok { background: #e3f5ec; color: #1e7b4f; }
+  .tr-badge.err { background: #fbe4e1; color: #b03a2e; }
+  .tr-badge.warn { background: #fff1c7; color: #8a5a00; }
+  .badge { border-radius: 999px; }
+  #push-issues-btn { background: #ffffff; border-color: #ffffff; color: #1f1f1f; border-radius: 999px; }
+  #login-screen { max-width: 400px; margin: 72px auto; padding: 36px 32px; background: #ffffff; border-radius: 24px; box-shadow: 0 8px 30px rgba(180,140,0,0.18); border: 3px solid #f7d547; }
+  #login-screen h2 { text-align: center; font-size: 20px; font-weight: 600; }
+  #login-screen button { width: 100%; padding: 11px 16px; font-size: 15px; }
 </style>
 </head>
 <body>
