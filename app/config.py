@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     #   false = ทุกชุดเข้าคิว OCR และถูกส่งไป CFO Platform ตามปกติ
     # ตั้งผ่าน env: DAILY_GROUP_LIMIT_ENABLED=false
     daily_group_limit_enabled: bool = True
+    # ประวัติที่ส่งให้ Rule Base ของระบบ OCR (GET /admin/meters/{id}/ocr-readings?only_successful=true)
+    #   true  = ค่าล่าสุดที่มีตัวเลขจริง (> 0) ทั้งที่ "อ่านสำเร็จ" และ "ค่าผิดปกติ"
+    #           — ค่าที่อ่านถูกแต่ถูกตีผิดปกติจะถูกนับเป็นประวัติด้วย ฐานเทียบจึงไม่ค้างที่ค่าที่อ่านผิด
+    #   false = เฉพาะ "อ่านสำเร็จ" (error_type 0) แบบเดิม
+    # ตั้งผ่าน env: OCR_HISTORY_INCLUDE_ANOMALIES=false
+    ocr_history_include_anomalies: bool = True
     # จำนวนหลักทศนิยมบนหน้าปัดของมิเตอร์แต่ละประเภท — ถ้าระบบ OCR ส่งค่ามา
     # โดยไม่มีจุดทศนิยม (เช่น "53864") เซิร์ฟเวอร์จะเติมจุดให้ตามจำนวนนี้
     # (ไฟฟ้า 1 → 5386.4) ถ้าส่งมามีจุดอยู่แล้วจะใช้ตามเดิม ไม่แตะ

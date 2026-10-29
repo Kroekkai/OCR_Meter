@@ -188,7 +188,12 @@ async def admin_get_meter_ocr_readings(
 
     clauses, params = ["meter_id = $1"], [meter_id]
     if only_successful:
-        clauses.append("error_type = 0")
+        if get_settings().ocr_history_include_anomalies:
+            # ค่าล่าสุดที่มีตัวเลขจริง ไม่สนว่า Rule Base เคยตีว่าผิดปกติหรือไม่
+            # ตัดค่า 0 / ว่าง (อ่านไม่ได้) ออก เพราะไม่ใช่ค่าบนหน้าปัด
+            clauses.append("error_type IN (0, 3) AND ocr_reading IS NOT NULL AND ocr_reading > 0")
+        else:
+            clauses.append("error_type = 0")
     where = " AND ".join(clauses)
     params.extend([limit, offset])
 
