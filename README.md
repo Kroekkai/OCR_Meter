@@ -1,1287 +1,560 @@
-# OCR Meter Store
+# OCR Meter Store — เซิร์ฟเวอร์เก็บข้อมูลมิเตอร์ด้วย IoT และ AI
 
-Python (FastAPI + asyncpg) implementation of the OCR Meter Store API —
-hardware image capture + OCR job queue for electric/water/gas meters.
-Schema is `db/init.sql` (unchanged from what you provided).
+เซิร์ฟเวอร์กลางของระบบอ่านค่ามิเตอร์ไฟฟ้า น้ำประปา และแก๊สอัตโนมัติ
+รับภาพหน้าปัดจากอุปกรณ์ ESP32 → จัดคิวให้ระบบ OCR อ่านค่า → เก็บผล → ส่งต่อไปยัง CFO Platform
+พร้อมหน้าเว็บสำหรับผู้ดูแลระบบ
 
-## Status — confirmed vs. still open
+> เอกสารนี้เขียนให้ผู้ที่จะมาดูแลหรือพัฒนาต่อ อ่านตั้งแต่ต้นจนจบครั้งหนึ่งก่อนแก้โค้ด
+> ส่วนที่สำคัญที่สุดคือ [ขั้นตอน deploy](#10-การอัปเดตเวอร์ชันบนเซิร์ฟเวอร์-deploy) และ [ปัญหาที่พบบ่อย](#12-ปัญหาที่พบบ่อยและวิธีแก้)
 
-This is being built against a real, already-deployed system, matched
-piece by piece against docs/config as they come in. Tracking here so
-nothing gets silently re-guessed or re-flipped:
+---
 
-**Confirmed, implemented:**
-- `error_type` is a plain integer 0/1/2/3 (not free-form text) — meanings live in the `error_type` lookup table (`db/init.sql`), server owns the definitions, OCR client just reports the code. Case 3 ("read a value, but anomalous") replaces the old `reading_decreased`/`usage_anomaly` text values as one combined case — still client-computed, server doesn't run this check. `error_detail` column removed from `ocr_meter`. `capture_date`/`capture_time` derived server-side from the job's `device_timestamp` now, never client-supplied. **No file upload on `/result` at all anymore** — it's plain form fields, not multipart; the old `result_image` field is gone (see "ocr_meter" below for why — it was a real risk, not just unnecessary). `ocr_meter.ocr_image_filename` was renamed to `image_error` (populated only on error), then renamed again to `image` (confirmed request — populated on EVERY row now, success or error alike, see "`image`" below), and its value is the FULL disk path (e.g. `/data/images/E101_..._01.jpg`, not just the bare filename) to the job's own `original_filename` (the anchor's already-stored file), not a separately uploaded one. `GET /admin/images/{item_id}/ocr-result-file` (original spec) removed accordingly — use `/file` instead. `meter_id` stored uppercase everywhere (was lowercase). `ocr_jobs.last_error`/`admin_reason` columns removed (not persisted anywhere now — `/fail`'s error message only reaches the server log). `group_id` is now the E1/W3/G12-style text code directly (the old numeric `group_id`/self-reference anchor mechanism and the separate `group_label` column from an earlier revision are both gone — merged into one `group_id` column, with a new `is_anchor` boolean replacing the self-reference trick), on `images`/`ocr_jobs`. A group also now finalizes into `ocr_jobs` immediately once it reaches `IMAGE_GROUP_SIZE` (3) images, not just on the 60s window fallback. **`ocr_meter` does NOT carry `group_id`** — briefly did in an intermediate revision, confirmed removed: `ocr_meter` is exactly 6 fields (`meter_id`, `capture_date`, `capture_time`, `ocr_reading`, `error_type`, `image`), nothing else, group tracking is an `images`/`ocr_jobs`-internal concern only. See "ocr_meter", "group_id", and "Burst upload grouping" sections below.
-- `DB_HOST=timescaledb` (container name on `innovation_net`), **not** the host's own IP `192.168.248.199` — connecting via the host's external IP timed out from inside the container (self-referential/hairpin routing back to its own host), confirmed via `docker network inspect innovation_net` while debugging the actual deploy. `timescaledb` and `ocr-meter-store` are both already on that network, so Docker's internal DNS resolves it directly — no IP needed at all.
-- **`is_test_filename()`/`ocr_meter_test`** — every new group is tagged by ESP32's own `wakeup_reason` query param on upload (`"timer"` → real, anything else including absent → test, a later Project Carbon firmware update — replaced an earlier server-side comparison against `device_config`'s schedule, `app/schedule_match.py`, since deleted) and, for a test capture, has `_Test` appended to its *stored* filename (both disk and DB) — there is no separate `is_test` column anywhere (tried, then removed); `is_test_filename(original_filename)` is the sole source of truth end to end. Results for test jobs go to the new `ocr_meter_test` table instead of `ocr_meter`. At most one normal (non-test) group per meter per Bangkok calendar day may be *queued* — a same-day duplicate gets `ocr_status='dropped'` set on its `images` rows and creates **no `ocr_jobs` row at all** (confirmed design — dropped status is visible only in `images`, never in `ocr_jobs`); test groups are exempt from this limit entirely. See "Real vs. test captures" below.
-- **`esp32_upload_log`** — a new observability-only table (Project Carbon, confirmed), one row per group, logging the `net_mode`/`carrier`/`wakeup_reason` query params ESP32 now sends alongside every upload — `carrier` gets normalized from a raw PLMN code to a human-readable name first (`_normalize_carrier()`), and `log_time` (added later, confirmed) sits alongside `log_date` for full timestamp resolution. No bearing on grouping/OCR/results. Confirmed request, added later: readable via `GET /admin/meters/esp32-upload-log` — and, per a later confirmed request, its 3 fields also ride along on `GET /admin/meters/ocr-meter-test` (via a second LEFT JOIN, see `app/routers/meters.py`) so the dashboard's per-meter test-results cards can show them directly under each anchor image instead of needing a separate table. See "Real vs. test captures" below.
-- **`ocr_engine`** — Worker team spec, gone through 3 rounds. Round 1: a lookup table (like `error_type`), `ocr_meter`/`ocr_meter_test` gained an `ocr_engine INT REFERENCES ocr_engine(code)` column (1=LOCAL, 2=GEMINI), optional, default 1. Round 2: removed from `.../result`'s input and from the plain `GET /admin/meters/ocr-meter`/`.../result` response shape entirely (kept only on `.../result-test`/`ocr-meter-test`). **Round 3 (confirmed, current): the Worker switched to a summation score system** (YOLO box-detection miss +1000, local CNN read failure +100, Gemini fallback +20 success/+10 failure — e.g. `0`=clean read, `120`/`1120`=auto-approved via Gemini recovery, `110`/`1110`=needs human review) — the lookup table is gone (`DROP TABLE`), the column is a plain `INT NOT NULL` with no FK, and it's **required again on both `.../result` and `.../result-test`**, shown on both `GET /admin/meters/ocr-meter` and `.../ocr-meter-test` — no longer just incidental stats, it's core routing information for the Worker's own dashboard workflow now. See "`ocr_engine`" below for the full history.
-- **`dataset`** — a new table (confirmed request, from a hand-drawn diagram), consolidating every image's file path into one place. `images` gained a `dataset_id BIGINT REFERENCES dataset(id)` column — every new upload gets its own 1:1 `dataset` row now (existing rows from before this column existed are left alone, never backfilled). See "`dataset`" below.
-- **`images_electric`/`water`/`gas` merged into one `images` table, confirmed request** — distinguished by meter type now via `meter_id`'s own first letter (`E`/`W`/`G`) instead of which table a row lives in. Fixes a real extensibility problem the 3-table design had: adding a brand-new meter type used to mean a new table + sequence + FK set + index set + updating every place that looped over all 3 tables; now it's one new entry in `app/db.py::UTILITY_TYPES`. A stored `utility_type` column existed briefly (confirmed request, round 1) then was removed again (confirmed request, round 2) — 100% derivable from `meter_id` with zero risk of drift, so a redundant stored copy added nothing; see "`images` — merged table" below for the full story. A `job_id BIGINT REFERENCES ocr_jobs(id)` column was added at the same time as the table merge (also confirmed request) — nullable, since images always arrive before their `ocr_jobs` row can exist; backfilled once `app/grouping.py::finalize_group()` actually creates that row, stays `NULL` forever for a dropped group.
-- `ocr_jobs` is one shared table across meter types (per `db/init.sql`) — not split into `ocr_jobs_electric/water/gas`.
-- Upload filename convention: `{meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg`, meter_id/device_timestamp parsed from it (Thailand local time, UTC+7), invalid meter_id prefix → HTTP 400.
-- Auth is fixed-secret-per-deployment: `DEVICE_API_KEY`/`DEVICE_API_KEY_USERNAME` and `OCR_CLIENT_KEY`/`OCR_CLIENT_KEY_USERNAME`, each an *optional shortcut* alongside real JWT login (blank pair = login required). See `app/auth.py`.
-- `JWT_SECRET`/`JWT_EXPIRE_MINUTES` — shared with `meter-dashboard`, same env var names.
-- `BASE_PATH_PREFIX=/iot` stripped by app-level ASGI middleware (`app/prefix_middleware.py`), not FastAPI `root_path`.
-- `DB_USER`/`DB_PASSWORD`/`DB_NAME`, `MAX_UPLOAD_MB` — renamed to match your real `.env` exactly (previously `POSTGRES_*`, corrected per your last message).
-- Production `DB_NAME=cfo_iot` (confirmed) — **not** `imagestore`. Note: the pgweb screenshots and sample rows used earlier in this build (the `esp32`/`ocr-service`/`dashboard-service` users, the `ocr_jobs` attempts-storm data) came from a database named `imagestore`, which is a *different* database from production `cfo_iot`. Schema should be identical (same `init.sql`), but treat any specific row-level data from those screenshots as reference/staging data, not necessarily what's live in `cfo_iot` right now.
-- On-disk filenames use the original uploaded filename directly (e.g. `e101_20260824_140000_01.jpg`), no `image_id` prefix — confirmed acceptable since meter_id+HHMMSS+seq is treated as guaranteed unique by convention. If that ever isn't true in practice, two uploads with the same filename will silently overwrite each other's file on disk (DB rows stay separate either way). See `app/storage.py`.
-- `meter_id` is normalized to lowercase at parse time (`app/filename.py`) — `E101` and `e101` always store as `e101`, so the same physical meter's history never fragments across two casings.
-- **Burst upload grouping** — server waits `IMAGE_GROUP_WINDOW_SECONDS` (60s, both local and production) after a burst's first image, one `ocr_jobs` row per group (not per image), OCR picks a single winning image per group. Confirmed via 3 explicit answers — see "Burst upload grouping" section below for the full design.
-- **New `ocr_meter` table** (replaces the old "ocr_jobs only" results model) — a clean, standalone results table with no FK back to `images_*`/`ocr_jobs`, meant to be handed off to the external Store system. `ocr_jobs` stays exactly as before as the *internal* job queue (state machine, `attempts` cap, retry-storm guard) — the two are deliberately decoupled. Confirmed via 3 explicit answers:
-  - Queue (`ocr_jobs`) and results (`ocr_meter`) are two separate tables, not one.
-  - The OCR client computes the month-over-month "reading decreased" comparison itself (pulls history via the new `GET /admin/meters/{meter_id}/ocr-readings` endpoint), not the server.
-  - `capture_date`/`capture_time` are two separate DB columns (`DATE` + `TIME`), not one combined timestamp.
-  - See `db/init.sql` and `app/routers/ocr_jobs.py`'s `/result` endpoint for the full design. (Previously shipped as a standalone `db/add-ocr-meter.sql` migration — merged into `init.sql` itself now, which is safe to (re-)run against any DB state: fresh, pre-`ocr_meter`, or already up to date.)
+## สารบัญ
 
-**Still open — not confirmed from what you've shared:**
-- `get_admin_or_service()` (the combined admin-JWT-or-service-key dependency on the read-mostly `/admin/images*`/`/admin/meters/*` routes) is my own addition — I don't have confirmation this exists in your real code, or what it actually requires.
-- Whether the JWT-login path for `/images/upload` and `/admin/images/ocr/*` also requires `is_device`/`is_admin` on the logged-in user, or accepts any authenticated account.
-- `GET /admin/meters/{meter_id}/ocr-readings` is a brand new endpoint, not part of the original confirmed Swagger list — added specifically to support the OCR client's month-over-month comparison. Flag if it should be named/shaped differently, or if it should require `OCR_CLIENT_KEY` specifically rather than any admin-or-service credential.
+1. [ภาพรวมของระบบ](#1-ภาพรวมของระบบ)
+2. [เทคโนโลยีที่ใช้](#2-เทคโนโลยีที่ใช้)
+3. [โครงสร้างไฟล์](#3-โครงสร้างไฟล์)
+4. [การติดตั้งครั้งแรก](#4-การติดตั้งครั้งแรก)
+5. [ค่าตั้งค่า (ตัวแปรสภาพแวดล้อม)](#5-ค่าตั้งค่า-ตัวแปรสภาพแวดล้อม)
+6. [ผู้ใช้ สิทธิ์ และการยืนยันตัวตน](#6-ผู้ใช้-สิทธิ์-และการยืนยันตัวตน)
+7. [การทำงานหลักทีละขั้น](#7-การทำงานหลักทีละขั้น)
+8. [ฐานข้อมูล](#8-ฐานข้อมูล)
+9. [รายการ API](#9-รายการ-api)
+10. [การอัปเดตเวอร์ชันบนเซิร์ฟเวอร์ (deploy)](#10-การอัปเดตเวอร์ชันบนเซิร์ฟเวอร์-deploy)
+11. [คำสั่งที่ใช้บ่อย](#11-คำสั่งที่ใช้บ่อย)
+12. [ปัญหาที่พบบ่อยและวิธีแก้](#12-ปัญหาที่พบบ่อยและวิธีแก้)
+13. [งานค้างและข้อจำกัดที่รู้อยู่แล้ว](#13-งานค้างและข้อจำกัดที่รู้อยู่แล้ว)
+14. [ความปลอดภัย](#14-ความปลอดภัย)
 
-## Endpoints implemented
+---
 
-Matches the OpenAPI list from the Swagger screenshots (minus one removal
-and plus one addition, both marked below):
+## 1. ภาพรวมของระบบ
 
 ```
-GET    /health
-POST   /register                                    [admin JWT]     (confirmed security fix — was open to anyone, see "POST /register" below)
-POST   /login
-GET    /admin/users                              [admin JWT]
-POST   /admin/users                               [admin JWT]
-POST   /images/upload                              [X-Device-Key]  (+ net_mode/carrier/wakeup_reason query params — NEW, see below)
-GET    /admin/images
-GET    /admin/images/ocr
-POST   /admin/images/ocr/{job_id}/claim            [X-OCR-Key]
-POST   /admin/images/ocr/{job_id}/result           [X-OCR-Key]   (plain form fields, not multipart — ocr_engine required again, see "ocr_engine" below)
-POST   /admin/images/ocr/{job_id}/result-test      [X-OCR-Key]   (NEW — mirror of /result, writes ocr_meter_test instead, see below)
-POST   /admin/images/ocr/{job_id}/fail             [X-OCR-Key]
-POST   /admin/images/{item_id}/reprocess           [admin JWT]
-GET    /admin/images/{item_id}
-DELETE /admin/images/{item_id}                    [admin JWT]
-GET    /admin/meters/{meter_id}/history
-GET    /admin/meters/{meter_id}/ocr-readings                     (NEW — not in original spec, see below)
-GET    /admin/meters/ocr-meter                                   (NEW — not in original spec, see below)
-GET    /admin/meters/ocr-meter-test                               (NEW — not in original spec, see below)
-GET    /admin/meters/esp32-upload-log                             (NEW — not in original spec, see below)
-GET    /admin/images/{item_id}/file
-GET    /admin/images-by-filename/{filename}/file                 (NEW — dashboard test-results view only, see below)
-PUT    /admin/images/{item_id}/ocr-manual         [admin JWT]
-GET    /devices/config                                           (NEW — separate spec doc, see "device_config" below)
-GET    /admin/device-config                                      (NEW — not in that spec doc either, see below)
-GET    /admin/device-config/{meter_id}                           (NEW — not in that spec doc either, see below)
-GET    /admin/device-config-ui                                   (NEW — standalone dashboard, see below)
-PUT    /admin/device-config/{meter_id}            [admin JWT]     (NEW — not in that spec doc either, see below)
-DELETE /admin/device-config/{meter_id}            [admin JWT]     (NEW — not in that spec doc either, see below)
+ ┌──────────────┐  1. ส่งภาพ 3 ภาพ/รอบ      ┌────────────────────┐   3. จองงาน / ดึงภาพ   ┌─────────────┐
+ │ ESP32 + กล้อง │ ───────────────────────▶ │                    │ ◀──────────────────── │  ระบบ OCR   │
+ │ (แบต/เปิดตลอด)│ ◀─────────────────────── │  OCR Meter Store   │ ────────────────────▶ │ YOLO + CNN  │
+ └──────────────┘  2. ขอตารางเวลาถ่ายภาพ     │  (FastAPI)         │   4. ส่งผลการอ่านค่า   │  + Gemini   │
+                                            │                    │                       └─────────────┘
+ ┌──────────────┐  หน้าเว็บผู้ดูแล            │                    │   5. ส่งค่าที่อ่านได้   ┌─────────────┐
+ │  ผู้ดูแลระบบ   │ ◀──────────────────────▶ │                    │ ────────────────────▶ │ CFO Platform│
+ └──────────────┘                           └─────────┬──────────┘                       └─────────────┘
+                                                      │
+                                            ┌─────────▼──────────┐
+                                            │ PostgreSQL /       │  + โฟลเดอร์ภาพ (Docker volume)
+                                            │ TimescaleDB        │
+                                            └────────────────────┘
 ```
 
-`GET /admin/images/{item_id}/ocr-result-file` (in the original spec) was
-**removed** — there's no separate "OCR result" file anymore (see
-"ocr_meter" below for why). Use the same `/file` endpoint for an
-error/anomaly row's referenced image too.
+ลำดับการทำงานของภาพ 1 ชุด:
 
-## Auth design
+1. **อุปกรณ์ถ่ายภาพ** 3 ภาพติดกัน (ค่าเริ่มต้น) แล้วอัปโหลดทีละภาพผ่าน `POST /iot/images/upload`
+2. **เซิร์ฟเวอร์จัดกลุ่ม** ภาพที่มาจากมิเตอร์เดียวกันภายใน 60 วินาทีเป็น 1 กลุ่ม (เช่น `E12`)
+3. **เมื่อกลุ่มครบ** (หรือหมดเวลารอ) สร้าง**งาน OCR** 1 งานในคิว
+4. **ระบบ OCR** (โปรแกรมแยก รันอยู่อีกคอนเทนเนอร์) จองงาน ดึงภาพ ดึงค่าย้อนหลังไปตรวจความผิดปกติ แล้วส่งผลกลับ
+5. **เซิร์ฟเวอร์บันทึกผล** ลงตาราง `ocr_meter` (ภาพจริง) หรือ `ocr_meter_test` (ภาพทดสอบ)
+6. **ถ้ามิเตอร์มี CFO API Key** ส่งค่าไป CFO Platform ทันที ถ้าส่งไม่สำเร็จ งานเบื้องหลังจะส่งซ้ำตามรอบ
+7. **อุปกรณ์ขอตารางเวลา** (`GET /iot/devices/config`) หลังส่งภาพทุกครั้ง ผู้ดูแลแก้ตารางเวลาในหน้าเว็บได้ มีผลตั้งแต่รอบถัดไป
 
-The Swagger screenshots show a padlock icon on only 4 routes
-(`GET/POST /admin/users`, `DELETE /admin/images/{id}`,
-`PUT .../ocr-manual`) — those use a declared JWT bearer security scheme;
-everything else uses a plain custom header (FastAPI/Swagger doesn't
-auto-flag those as "security", so no padlock even though they're
-authenticated).
+สิ่งที่ระบบนี้**ไม่ได้ทำเอง**:
+- **อ่านตัวเลขจากภาพ:** เป็นหน้าที่ของระบบ OCR (repo แยก)
+- **ถ่ายภาพ/ตั้งเวลาปลุก:** เป็นหน้าที่ของเฟิร์มแวร์ ESP32 (repo แยก: Carbon และ Carbon-AlwaysOn)
+- **ตรวจยืนยันค่ากับเจ้าหน้าที่:** ทำบน CFO Platform
 
-- **Admin JWT** (`Authorization: Bearer <token>`, from `POST /login`,
-  requires `is_admin = true`) — user management and the two
-  destructive/override actions. `JWT_SECRET` must match
-  `meter-dashboard`'s exactly — both services decode the same tokens,
-  and this service is the only one with a `users` table.
-- **`X-Device-Key: <DEVICE_API_KEY>`** on `POST /images/upload` — a
-  single fixed key for the whole deployment (not per-device). On match,
-  the upload is attributed to the existing user named by
-  `DEVICE_API_KEY_USERNAME` (e.g. `esp32`). This is an *optional
-  shortcut*: leave `DEVICE_API_KEY`/`DEVICE_API_KEY_USERNAME` blank and
-  uploads require a real JWT login instead.
-- **`X-OCR-Key: <OCR_CLIENT_KEY>`** on `/admin/images/ocr/*` — same
-  mechanism, attributed to `OCR_CLIENT_KEY_USERNAME`, which must be an
-  existing **admin** account (e.g. `ocr-service`). Same
-  blank-to-disable behavior, falling back to a real admin JWT login.
-- The read-mostly `/admin/images*`/`/admin/meters/*` routes accept an
-  admin JWT **or** either static key — this combined dependency
-  (`get_admin_or_service()`) is my own addition, not confirmed from
-  your code (see "Still open" above).
+---
 
-`DEVICE_API_KEY_USERNAME`/`OCR_CLIENT_KEY_USERNAME` must already exist
-as real rows in `users` — the key only maps to an identity, it doesn't
-create the account. Bootstrap them with `scripts/create_user.py`
-(their `--password` value is never actually checked on the key path,
-since that path doesn't touch `password_hash` at all — but the column
-is `NOT NULL`, so pass something):
+## 2. เทคโนโลยีที่ใช้
 
-```bash
-python -m scripts.create_user --username esp32 --password '<throwaway>' --device
-python -m scripts.create_user --username ocr-service --password '<throwaway>' --admin --device
-```
-
-Also use `scripts/create_user.py` to create the very first human admin
-account (chicken-and-egg: `POST /admin/users` itself requires an
-existing admin).
-
-## `POST /register` — confirmed security incident, now admin-only
-
-**This endpoint had NO auth at all until this fix — anyone who found
-the URL could self-register a working account.** Confirmed exploited
-in practice: a batch of bot-registered accounts with random-looking
-usernames (`artexops1`, `artexops9`, `artex7667`, `artx7`, `ocruser01`,
-`artxuser1`) turned up in the `users` table, spread across several
-days — discovered by the admin directly in the DB, not created by
-them. The pattern (meaningless usernames, no relation to any real
-person, spaced-out timestamps) points at automated scanning + registration
-abuse, not a targeted attack on this system specifically — the kind of
-thing that finds any open, unauthenticated POST endpoint on the public
-internet sooner or later.
-
-**Made worse by a second bug found at the same time, now also fixed:**
-`get_uploader()` and `get_admin_or_service()` — the dependencies behind
-`POST /images/upload`, `GET /devices/config`, and every read-mostly
-`/admin/images*`/`/admin/meters/*` route — accepted **any** valid JWT
-on the fallback path, regardless of the account's `is_admin`/`is_device`
-flags, despite both functions' own docstrings always describing the
-intent as "a real device/admin account", never "any registered user
-whatsoever". Combined with the open `/register`, this meant a
-self-registered account (`is_admin=false`, `is_device=false`) could
-have uploaded fake images or read admin-only listings — not just held
-a dormant, harmless login. Both dependencies now explicitly check the
-account's role and reject with `403` if it doesn't qualify.
-
-**`POST /register` itself is now admin-only** (`Depends(get_current_admin)`,
-same as every other `/admin/*` write) — confirmed request: kept the
-endpoint (rather than removing it in favor of only
-`scripts/create_user.py`) since an admin may want to create accounts
-from the dashboard without shell access to the server; just no longer
-reachable by an anonymous caller.
-
-**Cleanup this requires that isn't a code change:** the bot-registered
-rows above are still sitting in the `users` table on whatever
-environment this was found in — this fix stops new ones, it doesn't
-retroactively remove the existing ones. Delete them directly:
-```sql
-DELETE FROM users WHERE username IN
-  ('artexops1', 'artexops9', 'artex7667', 'artx7', 'ocruser01', 'artxuser1');
-```
-Check first whether any of those accounts' JWTs were actually used
-against `/images/upload` or the admin-read routes while the second bug
-above was still live (worth a quick look at server logs for those
-usernames, or for `images`/`ocr_jobs` rows with a suspicious source)
-before assuming no actual damage was done beyond the registration
-itself.
-
-## The stuck-retry bug (`OCR_API_URL is not configured`, attempts > 2500)
-
-Looking at your `ocr_jobs` data: jobs 12–16 sit at `status = 'failed'`
-with `attempts` in the thousands. That combination — already terminal,
-yet still climbing — means whatever was calling
-`/admin/images/ocr/{job_id}/fail` was doing so **repeatedly on a job
-that was already failed**, and nothing on the API side rejected that.
-
-This implementation adds a state-machine guard on the job's `status`
-column (no schema change needed):
-
-```
-queued --[claim]--> processing --[result]--> done
-                                --[fail]-----> failed   (terminal)
-```
-
-`/claim`, `/result`, and `/fail` now check the job's *current* status
-before acting, and return **409 Conflict** if it's not in the expected
-state — e.g. `/fail` on a job that's already `'failed'` is rejected
-instead of silently bumping `attempts` again. That stops the counter
-from growing unbounded and gives the caller an actual error to notice,
-instead of a quiet 200 OK.
-
-The only way to give a failed job a fresh attempt is
-`POST /admin/images/{item_id}/reprocess`, which — per your own comment
-in `init.sql` — creates a **new** `ocr_jobs` row (`attempts = 0`)
-rather than resetting the old one, so history isn't lost.
-
-**This fixes the symptom on the API side, not necessarily the root
-cause.** The actual retry loop lives in the external OCR client (the
-box in your architecture diagram that polls → claims → processes) —
-if it's the one calling `/fail` on jobs it doesn't own or has already
-been told are terminal, that code needs the same fix. `OCR_API_URL not
-configured` specifically means the *OCR client's own* `.env` is missing
-that variable — that's config on the client side, not something this
-service can fix from here.
-
-## `ocr_meter` — clean results table, separate from the job queue
-
-`ocr_jobs` and `ocr_meter` are deliberately two different tables with
-two different jobs:
-
-- **`ocr_jobs`** — internal only. Just the claim/retry state machine
-  (`queued`/`processing`/`done`/`failed`, `attempts`, the 409 guard from
-  the section above). Nothing outside this service should read it.
-- **`ocr_meter`** — the real output. One row per *finished* OCR attempt,
-  written by `/result`. No FK to `images` or `ocr_jobs` at all — it's
-  meant to be hand-off-ready for the external Store system without that
-  system needing to know anything about our internal job queue.
-
-**`error_type` is now a plain integer (0/1/2/3), not free-form text** —
-the full meaning of each code lives in the `error_type` lookup table in
-`db/init.sql` (single source of truth), not scattered across comments:
-
-| code | meaning | `ocr_reading` |
-|---|---|---|
-| `0` | read successfully | required |
-| `1` | found the meter but couldn't read the digits | must be omitted |
-| `2` | couldn't find any digits/meter in the image at all | must be omitted |
-| `3` | read a value, but it's anomalous (decreased from last time, or usage spike) | required |
-
-Case 3 covers what used to be two separate string values
-(`reading_decreased`/`usage_anomaly`) — the OCR client is still the one
-that pulls history and decides (server doesn't compute this), it just
-reports one combined code now instead of two.
-
-`POST /admin/images/ocr/{job_id}/result` (or its test counterpart,
-`/result-test` — see "Scheduled vs. test captures" below) covers both a
-successful read AND all 3 error/anomaly outcomes — as opposed to
-`/fail`, which is only for a transient/technical failure where OCR
-never got far enough to reach any outcome at all (network error,
-`OCR_API_URL` missing, etc.).
-**No file upload at all anymore** — plain form fields, not
-multipart/form-data:
-
-| field | required | notes |
-|---|---|---|
-| `ocr_reading` | codes 0, 3 only | must be omitted for codes 1, 2 |
-| `error_type` | always | integer 0/1/2/3 — see table above |
-
-**`capture_date`/`capture_time` are no longer sent by the client at
-all** — the server derives them itself from the job's own
-`device_timestamp` (when the ESP32 captured the photo), not from
-whenever OCR happened to run. **`error_detail` is gone too** — human-
-readable descriptions live once, in the `error_type` lookup table, not
-repeated per-row.
-
-**No `result_image` upload either** — the OCR client never attaches an
-image to this endpoint. `ocr_meter.image` (confirmed request, renamed
-from `image_error` — see "`image`" below for the full story) is now the
-full disk path (via `storage.original_path()`) to the job's own
-`original_filename` on EVERY row, success or error alike — e.g.
-`/data/images/E101_..._01.jpg` — the same file the group's anchor image
-was already stored under at upload time, nothing written twice. An
-earlier version of this endpoint accepted a re-uploaded copy via a
-`result_image` field —
-removed: it added nothing (the OCR client can only legitimately attach
-one of the group's own already-stored photos anyway), and it was
-actively risky — the save path was always computed from the *anchor's*
-filename regardless of which photo's bytes were actually attached, so a
-client attaching a different image in the group (say, image 2 of 3)
-would silently overwrite image 1's file on disk with image 2's content.
-
-```bash
-# success
-curl -X POST http://localhost:3003/admin/images/ocr/1/result \
-    -H 'X-OCR-Key: dev-ocr-key-not-for-production' \
-    -F 'ocr_reading=12345' -F 'error_type=0'
-
-# case 1: found the meter, couldn't read the digits
-curl -X POST http://localhost:3003/admin/images/ocr/2/result \
-    -H 'X-OCR-Key: dev-ocr-key-not-for-production' \
-    -F 'error_type=1'
-
-# case 2: no digits/meter found in the image at all
-curl -X POST http://localhost:3003/admin/images/ocr/3/result \
-    -H 'X-OCR-Key: dev-ocr-key-not-for-production' \
-    -F 'error_type=2'
-
-# case 3: read a value, but it's anomalous (client-computed against history)
-curl -X POST http://localhost:3003/admin/images/ocr/4/result \
-    -H 'X-OCR-Key: dev-ocr-key-not-for-production' \
-    -F 'ocr_reading=1510' -F 'error_type=3'
-```
-
-The OCR client is still responsible for deciding case 3 itself — pull
-this meter's recent *successful* history first (`only_successful=true`
-excludes every error/anomaly row, including old case-3 ones, so a
-flagged reading never pollutes the "normal" baseline), compute the
-deltas/average/threshold, and report `error_type=3` if it decides the
-new reading qualifies. The server only ever serves the history; it
-never computes this comparison itself:
-
-```bash
-curl -s "http://localhost:3003/admin/meters/e101/ocr-readings?limit=3&only_successful=true" \
-    -H 'X-OCR-Key: dev-ocr-key-not-for-production'
-# -> last 3 successful readings, most recent first — e.g. [1310, 1250, 1200]
-# client computes: deltas [60, 50] -> avg 55 -> threshold 55*3=165
-# if (new_reading - 1310) > 165 -> submit /result with error_type=3
-```
-
-### `ocr_engine` — Worker's scoring system (round 4, confirmed current)
-
-Not in either original spec doc — a later addition from the Worker
-team, gone through four full rounds now. Worth recording the arc, since
-a future change might reasonably revisit it again:
-
-1. **Round 1**: a lookup table, same pattern as `error_type` —
-   `db/init.sql`'s `ocr_engine` table (`1, 'LOCAL (YOLO+CNN)'` /
-   `2, 'GEMINI (Cloud Fallback)'`), with `ocr_meter`/`ocr_meter_test`
-   each carrying an `ocr_engine INT REFERENCES ocr_engine(code)`
-   column, optional at the API level (defaulted to `1` when the Worker
-   omitted it), matching the DB column's own `DEFAULT 1`.
-2. **Round 2**: removed from `POST .../result`'s input entirely (that
-   endpoint's caller didn't have the information to report at the
-   time), and correspondingly dropped from the plain `OcrMeterEntry`
-   response shape (`GET /admin/meters/ocr-meter` and `.../result`'s own
-   response) — kept only on `.../result-test`/`GET .../ocr-meter-test`,
-   via a separate `OcrMeterEntryWithEngine` class.
-3. **Round 3**: the Worker switched to a genuinely different concept —
-   a summation score, not a small enumerable lookup. Built additively
-   from three independent checks: YOLO box detection (`+1000` if the
-   digit box is incomplete/missing), the local CNN reading it (`+100`
-   if that failed), and a Gemini cloud fallback (`+20` if it recovered
-   a reading, `+10` if it didn't). At the time, other combinations the
-   formula allows (`10`, `20`, `100`, `1000`, `1010`, `1020`, `1100`,
-   ...) were assumed to be equally valid alongside the 5 the Worker
-   team had named — so the column and the API were both made a plain,
-   unconstrained `int`, the `ocr_engine` lookup table was dropped
-   entirely, and `ocr_engine`/`ocr_engine_test` both required it again
-   with no validation beyond "it's an integer".
-4. **Round 4 (confirmed, current) — the Worker team confirmed a second
-   time, explicitly, that only 5 values are EVER actually sent: `0`,
-   `120`, `1120` (auto-approve), `110`, `1110` (send for human review —
-   `1110` specifically flagged as "box incomplete too", worth a second
-   look for a damaged meter or a reshoot). Round 3's assumption that
-   other additive combinations might show up in practice was wrong —
-   validation and the FK are both back, now that the fixed set is
-   confirmed genuinely fixed.**
-
-**Where round 4 landed, concretely:**
-- **`ocr_meter`/`ocr_meter_test`'s `ocr_engine` column is `INT NOT NULL
-  REFERENCES ocr_engine_meaning(code)`** — a real FK again, this time
-  pointing at `ocr_engine_meaning` (see below) instead of round 1's old
-  `ocr_engine` table. Migrated via `DROP CONSTRAINT` → `DROP DEFAULT` →
-  backfill any row whose value isn't one of the 5 confirmed codes
-  (`NULL`, or a leftover `1`/`2` from round 1) to `0` → `SET NOT NULL`
-  → `ADD CONSTRAINT` the new FK — in that order, so the constraint
-  never gets added before the data actually satisfies it.
-- **Validated by hand again** in `app/routers/ocr_jobs.py`'s
-  `_submit_ocr_result()`, against `VALID_OCR_ENGINE_CODES` /
-  `OcrEngineType` (`app/schemas.py`, now `Literal[0, 110, 120, 1110, 1120]`)
-  — same reasoning as `error_type`'s own hand-written check: a `Literal`
-  type directly on a `Form(...)` field doesn't reliably coerce the
-  string multipart/form-data always sends, so validating in the
-  function body gives a clearer 422 than letting a typo trip the DB's
-  FK constraint instead.
-- **Still required on both `POST .../result` and `.../result-test`**
-  (unchanged since round 3), still shown on both `GET /admin/meters/ocr-meter`
-  and `.../ocr-meter-test` (unchanged since round 3 merged
-  `OcrMeterEntryWithEngine` back into plain `OcrMeterEntry`).
-
-**No longer "purely observational"** — per the Worker team's own
-message confirming this round, the score is meant to drive their
-dashboard/workflow directly: `0`/`120`/`1120` auto-approve into their
-system immediately, `110` queues for a human to key in the reading,
-`1110` gets flagged for a possible damaged meter or reshoot. Still has
-zero bearing on this server's own logic, though — grouping, `is_test`,
-retries, `error_type`'s own validation are all untouched by whatever
-value `ocr_engine` carries.
-
-**`ocr_engine_meaning` — confirmed request, added the same round as the
-score system's round 3 (before the FK came back in round 4).** A
-reference table mirroring `error_type`'s shape (`code` + a single
-description column) so the 5 confirmed score meanings above have a
-queryable home — just `code`, `meaning`. Originally had
-`result_status`/`next_action` as separate columns too — confirmed
-request, removed again shortly after (unused) and folded into `meaning`
-as one combined description instead (`DROP COLUMN IF EXISTS` for both,
-`db/init.sql` — no-op on a fresh install that never had them). **Now IS
-the FK target for `ocr_meter`/`ocr_meter_test`.ocr_engine** (round 4,
-confirmed — round 3 had it deliberately NOT be one, back when the value
-set wasn't confirmed fixed yet). Exposed read-only via
-`GET /admin/meters/ocr-engine-meaning` (`app/routers/meters.py`) —
-small static list, no pagination, not auto-joined into `.../ocr-meter`'s
-or `.../ocr-meter-test`'s own response (whoever displays a result is
-expected to look the meaning up separately, e.g. the dashboard, rather
-than this being baked into the result payload itself).
-
-### `dataset` — one central place to look up any image's file path
-
-Not in either original spec doc — confirmed request, from a hand-drawn
-diagram. Before this, an image's disk location was only computable by
-calling `storage.original_path()` on its row's `original_filename`.
-`dataset` gives it a home independent of that:
-
-```sql
-CREATE TABLE dataset (
-    id   BIGSERIAL PRIMARY KEY,
-    path TEXT      NOT NULL
-);
-```
-
-`images` gained a `dataset_id BIGINT REFERENCES dataset(id)` column —
-confirmed **1:1, not shared**: every single image upload creates its
-own new `dataset` row, not one row per group/burst (unlike
-`esp32_upload_log` above, which *is* one-per-group — these two tables
-intentionally have different granularity, since a `dataset` row
-represents one specific file, while the ESP32 metadata is identical
-across an entire burst).
-
-**Populated in `app/routers/images.py`'s `_insert_dataset_row()`,
-called from both branches of the upload handler** (opening a new group
-and joining an existing one) — right before the `images` INSERT, so
-`dataset_id` can be included in that same INSERT rather than needing a
-second `UPDATE` afterward. This works because the path is fully
-determined by the filename alone (`storage.original_path()` only ever
-falls back to using the image's numeric id when `original_filename` is
-`None`, which can't happen this far into the upload handler) — so
-`dataset_id` is knowable *before* the `images` row (and its real
-auto-generated id) even exists yet.
-
-**A real bug caught and fixed while `images_electric`/`water`/`gas`
-were still three separate tables (now merged, see below — recording it
-here as a cautionary note for future `LIKE ... INCLUDING ALL` use
-elsewhere):** `images_water`/`images_gas` used to be created via
-`CREATE TABLE ... (LIKE images_electric INCLUDING ALL)`. Despite the
-name, **`INCLUDING ALL` does NOT copy foreign key constraints** —
-confirmed against Postgres's own documentation (only indexes,
-`PRIMARY KEY`/`UNIQUE`/`EXCLUDE` constraints, `CHECK` constraints, and
-a handful of other properties are listed as copied; `REFERENCES` isn't
-among them, and this is a known, actively-discussed documentation gap
-upstream). So the two `LIKE`-created tables got the `dataset_id`
-*column* automatically but **not** the FK pointing it at `dataset(id)`
-— relying on `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` alone for the
-FK would have silently skipped adding it forever (the column already
-existing makes the whole statement a no-op). Fixed at the time by
-giving all 3 tables their own explicit, named `DROP CONSTRAINT IF
-EXISTS` + `ADD CONSTRAINT ... FOREIGN KEY` pair — same idempotent
-pattern used for `ocr_meter`'s `error_type` FK (and, at the time this
-was written, `ocr_engine`'s too — that one's gone now, see "`ocr_engine`"
-above). Moot now
-that there's only one `images` table, but the underlying gotcha
-(`LIKE ... INCLUDING ALL` silently dropping FKs) is worth remembering
-if this pattern gets reused anywhere else.
-
-**Not yet decided / worth flagging:**
-- No endpoint reads `dataset` yet — it's populated on every upload but
-  nothing serves it back out. `GET /admin/images-by-filename/{filename}/file`
-  (used by the dashboard's test-results section) still works purely off
-  `original_filename`/computed paths, doesn't touch this table at all.
-  Flag if you want `dataset` actually exposed somewhere.
-- Existing rows (from before this migration) have `dataset_id = NULL` —
-  confirmed not backfilled. If historical images ever need a `dataset`
-  row too, that's a separate one-time migration, not something
-  `init.sql` does automatically on every run.
-
-### `images` — merged table, confirmed request (was `images_electric`/`water`/`gas`)
-
-Originally three separate, identically-shaped tables — one per meter
-type, distinguished by which table a row lived in. Confirmed request:
-merged into one `images` table. A stored `utility_type` TEXT column
-(`'electric'`/`'water'`/`'gas'`, `CHECK`-constrained) did that job at
-first — removed again shortly after (confirmed request, round 2 — see
-"Round 2: `utility_type` removed" below).
-
-**The problem this solves, confirmed as the actual motivation:** adding
-a genuinely new meter type (e.g. a future "steam") used to mean a new
-table + a new per-type group-id sequence + a new FK set (to `dataset`,
-to `device_config`) + a new index set + finding and updating every
-place in the codebase that looped over all three tables by name
-(`app/db.py::METER_TABLES`, the background sweep, the `ocr-meter-test`
-JOIN, etc.) — a genuine multi-file change for something conceptually
-tiny. Now it's one new entry in `app/db.py::UTILITY_TYPES` — nothing
-else in the codebase needs to change at all.
-
-**`job_id` — a second confirmed request, added in the same migration.**
-`images.job_id BIGINT REFERENCES ocr_jobs(id)`, nullable. Before this,
-an image's relationship to its `ocr_jobs` row was only ever
-discoverable by matching `group_id` values — not a real FK target
-(not unique; a group has several images) and not database-enforced.
-Deliberately nullable and NOT set at insert time: an image always
-arrives before the `ocr_jobs` row for its group can possibly exist
-(the job only gets created once the group is finalized — either
-immediately, once the group reaches its target photo count, or later
-by the background sweep) — trying to require it at insert time would
-make a group's very first image un-insertable. Backfilled by
-`app/grouping.py::finalize_group()`, in the same transaction as the
-`ocr_jobs` INSERT itself: `UPDATE images SET job_id = $1 WHERE
-group_id = $2`, applied to every image sharing that `group_id`, not
-just the anchor. A group that gets dropped instead
-(`mark_group_dropped()` — see "Real vs. test captures" below) never
-calls `finalize_group()` at all, so its images' `job_id` stays `NULL`
-forever — confirmed correct, not a bug: there genuinely is no
-`ocr_jobs` row for a dropped group to point at.
-
-**A real ordering gotcha worth knowing about, hit while migrating:**
-`images.job_id`'s `FOREIGN KEY (job_id) REFERENCES ocr_jobs(id)` had to
-be added as a separate `ALTER TABLE` statement at the very end of
-`db/init.sql`, not inline in `CREATE TABLE images`. `ocr_jobs` isn't
-created until later in the file — a forward reference right there
-would fail immediately with "relation ocr_jobs does not exist". Same
-pattern already used for `device_config`'s FKs (see that section
-further down) — `images.job_id BIGINT` with no `REFERENCES` at
-`CREATE TABLE` time, the actual FK constraint added at the bottom of
-the file once every table it could possibly need already exists.
-
-**Migration (for any DB from before this merge):** every row from the
-three old tables is copied into `images` with `id` preserved exactly
-(safe — all three old tables already shared one `images_id_seq`, so
-their `id` values never overlapped to begin with), then the three old
-tables are dropped. `app/db.py`'s old `table_for_meter_id()`/
-`table_for_group_id()` (returned a table name) became
-`utility_type_for_meter_id()`/`utility_type_for_group_id()` (returns
-`'electric'`/`'water'`/`'gas'` instead) — every caller across
-`app/routers/images.py`, `app/routers/ocr_jobs.py`,
-`app/routers/meters.py`, `app/grouping.py`, and `app/repo.py` updated
-to match; `app/repo.py`'s helpers in particular got simpler, not just
-renamed — they used to search across three tables for a given image
-id, now it's a direct lookup in one.
-
-### Round 2: `utility_type` removed — confirmed request
-
-The stored `utility_type` column above lasted only until the next
-round. Confirmed observation that triggered this: `utility_type` is
-**100% derivable from `meter_id`** — its own first letter (`E`/`W`/`G`)
-determines it permanently, via the exact same `UTILITY_TYPES` mapping
-that decided it at insert time in the first place. There's no scenario
-where a stored copy could ever legitimately disagree with what
-`meter_id` itself says — the redundant column added nothing beyond
-what deriving it on demand couldn't already give.
-
-**Where each former use of the column landed instead:**
-- **The `open_anchor` query's `WHERE utility_type = $3`
-  (`app/routers/images.py`)** — deleted outright, not replaced with a
-  derivation. It was always redundant *even with the column present*:
-  `meter_id = $1` alone already pins a query to exactly one utility
-  type (a given `meter_id` can only ever belong to one), so filtering
-  by both never actually narrowed anything further than `meter_id`
-  did by itself.
-- **`app/repo.py::image_out()`'s `ImageOut.meter_type` field** — now
-  computed via `utility_type_for_meter_id(row["meter_id"])` at
-  response-build time instead of read off a stored column.
-- **`GET /admin/images`'s `meter_type` query-param filter** — the one
-  place that genuinely needed a translation, not just a lookup: turning
-  `?meter_type=electric` into a WHERE clause now goes through
-  `app/db.py::PREFIX_FOR_UTILITY_TYPE` (`UTILITY_TYPES`'s reverse — 
-  `"electric"` → `"E"`) and filters on `LEFT(meter_id, 1) = $N` instead
-  of `utility_type = ANY(...)`.
-
-**Schema-wise:** `db/init.sql`'s `CREATE TABLE images` no longer
-declares the column at all; a migration block (`ALTER TABLE images
-DROP CONSTRAINT IF EXISTS images_utility_type_check` +
-`DROP COLUMN IF EXISTS utility_type`, plus `DROP INDEX IF EXISTS
-idx_images_utility_type`) removes it from any DB that still has it from
-round 1 — no-op on a fresh install, which never declares the column to
-begin with now.
-
-## `group_id` — human-readable group codes (E1, W3, G12, ...)
-
-**Changed again — `group_id` is now the E1/W3/G12-style text code
-directly, not a separate `group_label` alongside a numeric anchor.**
-Earlier revision had two columns: `group_id` (`BIGINT`, self-referencing
-the anchor image's own `id` — jumps around unpredictably since every
-utility type shares one `images_id_seq`) plus `group_label` (`TEXT`,
-the human-readable code) as a separate addition. Confirmed
-simplification: drop the numeric one, rename `group_label` to just
-`group_id` — one column, one name, in `images` and `ocr_jobs`.
-**Not in `ocr_meter`** — briefly was, in an intermediate revision, but
-confirmed removed: `ocr_meter` is exactly 6 fields and group tracking
-isn't one of them (see "ocr_meter" section above).
-
-Assigned once per meter type from its own dedicated sequence
-(`electric_group_seq`/`water_group_seq`/`gas_group_seq`) the moment a
-brand-new group opens (the first image of a burst, in
-`POST /images/upload`). Every other image joining that same group
-copies the anchor's existing `group_id` rather than pulling a new one.
-It then flows through unchanged: `images_*.group_id` →
-`ocr_jobs.group_id` (copied when the group finalizes — see below) — so
-either table can be read on its own and still show a sensible `E1`,
-`E2`, `E3`, ... sequence for that meter type, without a join.
-
-**`is_anchor` (`BOOLEAN`) replaces the old self-reference trick.**
-Since `group_id` is no longer a `BIGINT` that can equal a row's own
-`id`, there needs to be an explicit flag marking which row in a group is
-the "anchor" (the one whose `meter_id`/`original_filename`/
-`device_timestamp` get copied into `ocr_jobs` when the group finalizes,
-and the one the claim/sweep race-safety locks against) — `true` for the
-first image that opened the group, `false` for every image that joined
-it afterward.
-
-## Burst upload grouping — multiple photos per reading, one job
-
-ESP32 sends more than one photo per meter reading (a "burst" — e.g. 3
-shots a few seconds apart). Confirmed design:
-
-- **The server** decides when a group is "complete", not the OCR client.
-- **Two paths to "complete", whichever comes first:**
-  - **Count-based (fast path)**: the moment a group reaches its target
-    count, that upload request finalizes the group into `ocr_jobs`
-    immediately, synchronously, in the same request — no waiting at
-    all. **Target count is per-meter now** — `device_config.photo_count`
-    for that specific `meter_id` if it's been configured (via
-    `PUT /admin/device-config/{meter_id}` or the dashboard), falling
-    back to the system-wide `IMAGE_GROUP_SIZE` setting (3) only for a
-    meter that's never been configured — the same fallback
-    `GET /devices/config` itself uses via `DEFAULT_CONFIG`. Two meters
-    can have different burst sizes this way — one set to `photo_count=5`
-    finalizes its groups at 5 images, unaffected by another meter still
-    on the default of 3.
-  - **Time-based (fallback)**: for a group that never reaches its
-    target count (e.g. only 1-2 images ever arrive), the server waits
-    `IMAGE_GROUP_WINDOW_SECONDS` (60, both local and production) after
-    the *first* image, then finalizes with whatever showed up — it does
-    not wait forever for a straggler.
-- **OCR picks one winner**: the OCR client tries every image in the
-  group and submits a single result for the whole group, referencing
-  whichever one image it judged best — not an aggregate of all three.
-
-**How it works:**
-
-1. `POST /images/upload` looks for a still-open group for that
-   `meter_id` (an anchor image — `images_*.is_anchor = true` — received
-   within the window, with no `ocr_jobs` row yet) and joins it, or
-   starts a new group if none is open. After the insert, it counts how
-   many images now share that `group_id`, looks up this `meter_id`'s
-   own `device_config.photo_count` (falling back to `IMAGE_GROUP_SIZE`
-   if unconfigured), and compares; if the count has reached that
-   target, it finalizes the group into `ocr_jobs` right then and there,
-   and `ocr_job_id` in the response is non-null on exactly that
-   request. Otherwise `ocr_job_id` stays `null` — the group isn't done
-   yet, and it'll either get more images or eventually get picked up by
-   the fallback below.
-2. A background task (`app/grouping.py`, started in `app/main.py`'s
-   lifespan — not tied to any HTTP request) checks every
-   `GROUP_SWEEP_INTERVAL_SECONDS` (default 5) for groups whose window has
-   closed *and that don't already have an `ocr_jobs` row* — i.e. only
-   the ones the fast path above never got to. Groups that already hit
-   their target count and got finalized immediately never show up in
-   this sweep at all — the sweep itself doesn't check `photo_count` at
-   all, since it only ever runs for groups that *didn't* reach it.
-   Both paths funnel through the same `finalize_group()` helper in
-   `app/grouping.py`, so the actual `INSERT INTO ocr_jobs` only exists
-   in one place.
-3. `POST /admin/images/ocr/{job_id}/claim` returns `image_file_urls`
-   (plural — a list, one URL per image sharing the job's `group_id`).
-4. `POST /admin/images/ocr/{job_id}/result` — see the `ocr_meter` section
-   above for the full current shape (`error_type` 0-3,
-   `capture_date`/`capture_time` no longer client-supplied, `error_detail`
-   gone). Internally, every image in the group gets `ocr_status` updated
-   together (not just the anchor).
-
-**Schema**: `images` (merged from `images_electric/water/gas`, see
-"`images` — merged table" above) gained columns beyond the original
-spec — `group_id TEXT NOT NULL` (the E1/W3/G12 code, shared by
-every image in the burst — see the `group_id` section above),
-`is_anchor BOOLEAN NOT NULL` (marks the one row per group whose data
-gets copied into `ocr_jobs`), and `received_at TIMESTAMPTZ NOT NULL`
-(server receive time — used for the window check; deliberately separate
-from `device_timestamp`, which is
-client-supplied and can't be trusted to measure server-side elapsed
-time). `meter_id` is also always stored **uppercase** now (normalized
-once in `app/filename.py` at upload time, regardless of what case the
-device sent) — was lowercase in an earlier version of this doc; flag if
-anything downstream (meter-dashboard, External Store) still expects
-lowercase. See `db/init.sql` — it's a single file, safe to (re-)run
-against any DB state (fresh, an older schema, or already up to date).
-
-**Concurrency**: both the upload path and the background sweep lock the
-anchor row with `SELECT ... FOR UPDATE` before deciding — this is what
-prevents a group from being finalized into a job at the exact moment a
-new image is trying to join it (the image would otherwise silently join
-a group that's already been queued and never get processed).
-
-**Known rough edge**: deleting a group's anchor image
-(`DELETE /admin/images/{item_id}`) does not cascade to or re-anchor its
-still-present siblings — see that endpoint's docstring in
-`app/routers/images.py`. Flag if you want that hardened.
-
-## Real vs. test captures (`is_test_filename()`, `ocr_meter_test`, `esp32_upload_log`)
-
-**Not in either original spec doc — a later addition, confirmed design
-across a few rounds, including two full mechanism changes (see
-below).** Every new group is treated as either a normal capture or a
-one-off test — the two are kept completely separate all the way
-through to two different result tables.
-
-**How it's decided now — confirmed: ESP32's own `wakeup_reason` query
-param, a later Project Carbon firmware update, replacing an earlier
-server-side schedule comparison entirely:**
-```
-wakeup_reason == "timer"  -> real capture
-anything else (including absent - older firmware)  -> test capture
-```
-Sent as a URL query param on `POST /images/upload` alongside two other
-new params, `net_mode` and `carrier` (both logged only, see
-`esp32_upload_log` below — neither affects `is_test`). Read once per
-group, at the moment its anchor image is inserted
-(`app/routers/images.py::upload_image()`) — later images joining the
-same group don't re-check their own `wakeup_reason` even if it
-differs, they inherit the anchor's already-decided filename instead
-(see below). **Confirmed: this is a one-way trust of whatever the
-device claims** — the server does not cross-check it against anything.
-**Confirmed default for missing/unrecognized values: test**, the
-deliberately safer side to fail on — `ocr_meter_test` is exactly the
-right home for "not confidently real" data, `ocr_meter` is meant to be
-trustworthy. This means a device running firmware from before this
-update (sends none of the 3 new params at all) has every capture land
-in `ocr_meter_test` until it's updated.
-
-**What this replaced — a full mechanism change, confirmed:** an
-earlier version instead compared `device_timestamp` against that
-meter's `device_config` schedule server-side
-(`app/schedule_match.py::is_on_schedule()`, within
-`SCHEDULE_MATCH_TOLERANCE_MINUTES`) — deleted entirely now, file and
-config setting both gone. `device_config`'s own
-`schedule_mode`/`date1`/`date2` fields are **untouched** and still
-serve their original purpose (telling the ESP32 when to wake up via
-`GET /devices/config`) — only the *server re-verifying* that timing
-after the fact is gone, replaced by trusting the device's own
-`wakeup_reason` claim directly instead.
-
-**No separate `is_test` column exists anywhere — tried once, removed
-(confirmed).** `images_*`/`ocr_jobs` briefly had an `is_test BOOLEAN`
-column and `OcrJobOut` briefly had an `is_test` field; all three are
-gone. Instead, the moment `wakeup_reason` is read, that result is baked
-straight into the **stored filename** —
-`app/routers/images.py::_stored_filename()` appends `_Test` right
-before the extension for a test capture, e.g.
-`E101_20260901_130000_1.jpg` → `E101_20260901_130000_1_Test.jpg` —
-applied identically to the actual file on disk and to
-`images_*.original_filename`/`ocr_jobs.original_filename`, so all three
-(disk, DB, and whatever the OCR client sees) can never disagree. Every
-image in a test group gets this, not just the anchor — an image joining
-an existing group re-derives whether it's a test group from the
-anchor's *already-decided filename*
-(`app/filename.py::is_test_filename()`), never its own `wakeup_reason`,
-so a single burst is always entirely normal or entirely test, never a
-mix even if later images in the same burst somehow report a different
-`wakeup_reason` than the anchor did.
-
-**`is_test_filename()` is still the single source of truth, everywhere,
-confirmed — this part is unchanged by the mechanism swap above:**
-```
-app/filename.py::is_test_filename(filename) -> bool
-```
-Matches a case-insensitive `_Test` immediately before `.jpg`/`.jpeg` at
-the end of the string — not "test" appearing anywhere else (a meter_id
-containing those letters won't false-positive). Every place that used
-to check the `is_test` column, and later `wakeup_reason` directly, goes
-through this instead, against `original_filename`: the daily-limit
-check, the `/result` table routing, and the OCR client itself if it
-wants to tell test jobs apart (the API response doesn't tell it
-directly — it has to look at `original_filename` the same way).
-
-**`esp32_upload_log`** — a pure observability log, no bearing on
-grouping/OCR/results, confirmed. One row per **group** (not per image —
-every image in a burst shares the same wake-up event, so `net_mode`/
-`carrier`/`wakeup_reason` would be identical across all of them;
-logging per-image would just be 3x redundant rows), inserted in the
-same "open new group" branch that decides `is_test`. Columns, in this
-exact order (confirmed, DB-enforced — see the reorder migration in
-`db/init.sql` if this table was created before either change below):
-`id`, `log_date`/`log_time` (the group's `device_timestamp`, split into
-Bangkok-local date and time-of-day — `log_time` added later, confirmed
-request, sitting directly after `log_date` — not `received_at`,
-matching how `capture_date`/`capture_time` are derived everywhere
-else), `meter_id`, and `net_mode`/`carrier`/`wakeup_reason` (confirmed
-column names — an earlier version briefly used `data1`/`data2`/`data3`
-instead, renamed — all `TEXT`, all nullable for pre-update firmware).
-
-**`carrier` normalization — confirmed request, added later.**
-ESP32 sends `carrier` as a raw PLMN code (MCC+MNC, e.g. `"52003"`), not
-a ready-to-read carrier name — `app/routers/images.py::_normalize_carrier()`
-maps it against a small lookup table before it's ever written to
-`carrier`:
-
-| PLMN code(s) | Stored as |
+| ส่วน | เทคโนโลยี |
 |---|---|
-| `52003`, `52001` | `AIS (AWN)` |
-| `52000`, `52004`, `52099` | `TrueMove H / my by NT` |
-| `52005`, `52018` | `dtac (TriNet)` |
-| `52015` | `NT Mobile (TOT)` |
+| ภาษา / เฟรมเวิร์ก | Python 3.12, FastAPI, Uvicorn |
+| ฐานข้อมูล | PostgreSQL (TimescaleDB) ผ่าน `asyncpg` (ไม่ใช้ ORM เขียน SQL ตรง) |
+| ยืนยันตัวตน | JWT (PyJWT), bcrypt สำหรับรหัสผ่าน, SHA-256 สำหรับ token อุปกรณ์ |
+| เข้ารหัสกุญแจ CFO | `cryptography` (Fernet) |
+| เรียก API ภายนอก | `httpx` |
+| ปรับขนาดภาพก่อนส่ง CFO | Pillow |
+| หน้าเว็บผู้ดูแล | HTML + JavaScript ล้วน ไฟล์เดียว (`app/static/*.html`) ไม่มีขั้นตอน build |
+| รันระบบ | Docker + Docker Compose |
+| Reverse proxy | Nginx Proxy Manager ขององค์กร (ไม่อยู่ใน repo นี้) |
 
-`"-"` (the documented value on WiFi — no cellular network at all),
-`None` (older firmware that doesn't send this param), and any PLMN
-code not yet in this table all pass through **unchanged** — an
-unrecognized code stays visible in the log for someone to notice and
-add, rather than being silently dropped or blanked out.
+---
 
-**One normal group per meter per (Bangkok) calendar day — confirmed
-rule, applies only to non-test groups:**
+## 3. โครงสร้างไฟล์
+
 ```
-app/grouping.py::has_normal_group_today(table, meter_id)
+.
+├── app/
+│   ├── main.py                 # สร้างแอป FastAPI, ผูก router, เริ่มงานเบื้องหลัง (จัดกลุ่ม, ส่ง CFO)
+│   ├── config.py               # ค่าตั้งค่าทั้งหมด (อ่านจาก .env / environment)
+│   ├── db.py                   # connection pool, ตารางแปลงตัวอักษรนำหน้ารหัสมิเตอร์ → ประเภท
+│   ├── auth.py                 # JWT, กุญแจอุปกรณ์, token รายเครื่อง, กุญแจระบบ OCR, ตรวจสิทธิ์
+│   ├── filename.py             # แยกรหัสมิเตอร์และเวลาถ่ายจากชื่อไฟล์, ตัดสินภาพทดสอบ (_Test)
+│   ├── grouping.py             # จัดกลุ่มภาพ, ปิดกลุ่มเมื่อหมดเวลา, กฎภาพจริงวันละ 1 ชุด
+│   ├── storage.py              # เขียน/อ่านไฟล์ภาพใน UPLOAD_DIR
+│   ├── external_push.py        # ส่งผลไป CFO Platform, ส่งซ้ำ, จัดการสถานะ push
+│   ├── crypto.py               # เข้ารหัส/ถอดรหัส CFO API Key (Fernet)
+│   ├── repo.py                 # ฟังก์ชันอ่านข้อมูลภาพที่ใช้ร่วมกัน
+│   ├── schemas.py              # รูปแบบข้อมูลขาเข้า/ขาออก (Pydantic) และการตรวจค่า
+│   ├── prefix_middleware.py    # รองรับ prefix /iot หลัง reverse proxy
+│   ├── routers/
+│   │   ├── auth_routes.py      # /login, /me, เปลี่ยนรหัสผ่าน
+│   │   ├── admin_users.py      # จัดการบัญชีผู้ดูแล (เฉพาะ super admin) + หน้า /admin/users-ui
+│   │   ├── images.py           # อัปโหลดภาพ, ดู/ลบภาพ, ประมวลผลใหม่, แก้ค่าด้วยมือ
+│   │   ├── ocr_jobs.py         # คิว OCR: จองงาน, ส่งผล, เติมจุดทศนิยม
+│   │   ├── meters.py           # ผลลัพธ์จริง/ทดสอบ, ค่าย้อนหลังให้ Rule Base, Push Issues
+│   │   ├── device_config.py    # ตารางเวลาถ่ายภาพ, CFO API Key, token รายเครื่อง, เพิ่มมิเตอร์ + หน้าเว็บหลัก
+│   │   └── health.py           # /health
+│   └── static/
+│       ├── device_config_ui.html   # หน้าเว็บหลักของผู้ดูแล (Meter config)
+│       └── users_ui.html           # หน้าจัดการผู้ดูแล (super admin)
+├── db/
+│   └── init.sql                # สร้างตารางทั้งหมด + ALTER สำหรับเวอร์ชันใหม่ (รันซ้ำได้)
+├── scripts/
+│   └── create_user.py          # สร้างบัญชีผู้ใช้จาก command line
+├── Dockerfile
+├── docker-compose.yml          # ใช้บนเซิร์ฟเวอร์จริง
+├── docker-compose.local.yml    # ใช้ทดสอบในเครื่อง
+└── requirements.txt
 ```
-If a meter's burst times out and re-splits into two separate groups the
-same day (e.g. images 1-2 group into `E1` and finalize via the sweep
-before image 3 arrives, so image 3 opens a fresh `E2`) — only the
-*first* group of the day to be **queued** is kept. Any later normal
-group for that same `meter_id` the same day is **dropped instead**:
-`app/grouping.py::mark_group_dropped()` sets `ocr_status='dropped'` on
-every image sharing that group's `group_id` (same pattern
-`POST .../result` already uses to mark a whole group `'done'`, not just
-the anchor) and creates **no `ocr_jobs` row at all** — confirmed
-design: dropped status is visible only in `images_*`, never in
-`ocr_jobs` (an earlier version put a `status='dropped'` row in
-`ocr_jobs` instead — replaced with this after confirming the OCR
-client shouldn't see dropped groups cluttering that list at all).
-`ocr_job_id` in the upload response stays `null` for a dropped group —
-nothing meaningful to hand back, it's never going to be processed.
-**Confirmed: the dropped group's `images_*` rows are never deleted** —
-`is_anchor` stays `true`, only `ocr_status` changes. The limit resets
-at Bangkok midnight (`00:00` local), computed fresh on every check —
-not a stored "last reset" timestamp anywhere. The is-test check itself
-is a Postgres regex (`original_filename !~* '_test\.jpe?g$'`) mirroring
-`is_test_filename()` exactly — keep the two in sync if either ever
-changes.
 
-**Why every "is this group still open/a candidate" query now also
-filters `ocr_status = 'pending'`, not just checks for an `ocr_jobs`
-row — a real bug this closes (confirmed, found in production, twice):**
+---
 
-*First version*: skipped creating any `ocr_jobs` row at all for a
-dropped group, and didn't touch `images_*` either. That group's anchor
-kept satisfying the sweep's
-`NOT EXISTS (SELECT 1 FROM ocr_jobs WHERE group_id = ...)` check
-forever — so the very next Bangkok midnight, once
-`has_normal_group_today()` stopped counting yesterday's winner, the
-sweep would silently queue the previously-dropped group a full day
-late, with a `capture_date` from the day before.
+## 4. การติดตั้งครั้งแรก
 
-*Second version* (the immediately preceding one): fixed that by giving
-dropped groups their own `ocr_jobs` row with `status='dropped'` —
-correct, but put dropped status somewhere it wasn't wanted (confirmed:
-should be `images_*`-only). Moving the marker to `images_*.ocr_status`
-and dropping the `ocr_jobs` row entirely reopens the exact first bug
-*unless* every place that used to rely on `NOT EXISTS(ocr_jobs...)`
-alone to mean "still open" also excludes `ocr_status != 'pending'` now
-— since a dropped group has no `ocr_jobs` row, `NOT EXISTS` alone is
-permanently true for it again. Both the sweep's candidate query
-(`app/grouping.py`) and the open-group-to-join query
-(`app/routers/images.py`) now filter `ocr_status = 'pending'`
-explicitly for exactly this reason — confirmed as the two places this
-matters (a third: the fast path's own re-finalization guard also now
-checks the anchor's `ocr_status` alongside `already_has_job`, for the
-narrow race where a concurrent transaction already dropped this exact
-group moments earlier).
+### 4.1 สิ่งที่ต้องมี
+- Docker และ Docker Compose
+- ฐานข้อมูล PostgreSQL/TimescaleDB ที่รันอยู่ (บนเซิร์ฟเวอร์จริงเป็นคอนเทนเนอร์ชื่อ `timescaledb` บนเครือข่าย Docker เดียวกัน)
+- เครือข่าย Docker ที่กำหนดใน `docker-compose.yml` (ต้องสร้างไว้ก่อน เพราะประกาศเป็น `external`)
 
-**Test groups are completely exempt from this daily limit** — a meter
-can produce any number of test groups/jobs in a single day, confirmed.
-Checked identically in both finalization paths (the upload handler's
-fast path and `app/grouping.py`'s sweep), via the same
-`has_normal_group_today()` helper — one place the rule lives, not
-duplicated.
+### 4.2 สร้างไฟล์ `.env`
+คัดลอกจาก `.env.example` แล้วใส่ค่าจริง **ห้าม commit ไฟล์ `.env` ขึ้น git**
 
-**`ocr_meter_test`** — a table structurally identical to `ocr_meter`
-(same 6 columns, own sequence, own index), confirmed to hold *only*
-results from off-schedule jobs, completely separate from normal
-`ocr_meter` data.
-
-**Writing them — two explicitly separate endpoints too, confirmed
-(a later change; there was briefly one shared endpoint that picked the
-table for you — replaced with this):**
+ค่าที่ต้องตั้งอย่างน้อย:
+```env
+DB_USER=...
+DB_PASSWORD=...
+DB_NAME=cfo_iot
+JWT_SECRET=<สุ่มยาวอย่างน้อย 32 ตัวอักษร>
+DEVICE_API_KEY=<กุญแจกลางของอุปกรณ์ (ช่วงเปลี่ยนผ่าน)>
+DEVICE_API_KEY_USERNAME=esp32
+OCR_CLIENT_KEY=<กุญแจของระบบ OCR>
+OCR_CLIENT_KEY_USERNAME=ocr-service
+EXTERNAL_API_BASE_URL=https://<โดเมน CFO Platform>/engineer-api
+EXTERNAL_KEY_ENCRYPTION_KEY=<กุญแจ Fernet>
 ```
-POST /admin/images/ocr/{job_id}/result        -> ocr_meter only
-POST /admin/images/ocr/{job_id}/result-test   -> ocr_meter_test only
+สร้างกุญแจ Fernet:
+```bash
+python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
-Both share one implementation, `_submit_ocr_result()`
-(`app/routers/ocr_jobs.py`) — identical request shape, identical
-validation, identical response shape (`OcrMeterEntry`); the only
-difference is which table each writes to and which jobs each accepts.
-**Each endpoint checks the job's actual type against which one was
-called** — `is_test_filename(job["original_filename"])` — and rejects
-with `409` (naming the other endpoint to use instead) on a mismatch,
-rather than silently writing to whichever table the filename implies
-regardless of which URL was hit. This is what makes the split more
-than cosmetic: calling `/result` for a test job (or `/result-test` for
-a normal one) is a hard error, not a silent misroute.
+> ⚠️ ถ้าเปลี่ยน `EXTERNAL_KEY_ENCRYPTION_KEY` ภายหลัง CFO API Key ที่บันทึกไว้ทั้งหมดจะถอดรหัสไม่ได้ ต้องใส่ key ของทุกมิเตอร์ใหม่
 
-**Reading them back — two explicitly separate endpoints, confirmed
-request:**
+### 4.3 สร้างตารางในฐานข้อมูล
+`db/init.sql` เขียนให้**รันซ้ำได้** (ใช้ `IF NOT EXISTS` และ `DROP CONSTRAINT IF EXISTS` ทั้งหมด) รันครั้งแรกบนฐานข้อมูลว่าง:
+```bash
+psql -h <host> -U <user> -d <dbname> -v ON_ERROR_STOP=1 -f db/init.sql
 ```
-GET /admin/meters/ocr-meter        -> ocr_meter only
-GET /admin/meters/ocr-meter-test   -> ocr_meter_test only
+
+### 4.4 รันระบบ
+```bash
+sudo docker compose up -d --build
+curl -s http://localhost:<พอร์ต>/iot/health      # ต้องได้ {"status":"ok","db":true}
 ```
-Both list across *every* meter by default (unlike
-`.../{meter_id}/ocr-readings`, which is scoped to one) — an optional
-`meter_id` query param narrows either down to a single meter, same
-`limit`/`offset` pagination as everywhere else. Neither query joins the
-two tables together at all — a meter's test results and its real
-results can never mix in a single response from either endpoint.
 
-**`OcrMeterTestEntry.anchor_image_path` — no schema change on
-`ocr_meter_test` for this, confirmed request (an earlier version added
-a stored column there — reverted).** `GET /admin/meters/ocr-meter-test`
-computes it at query time instead: `_list_ocr_meter_test_rows()`
-(`app/routers/meters.py`) `LEFT JOIN`s a `UNION ALL` of every
-`images_*` table's `is_anchor = true` rows onto `ocr_meter_test`,
-matched on `meter_id` + `device_timestamp` — reconstructed from that
-row's own `capture_date`/`capture_time` via Postgres's
-`(date + time) AT TIME ZONE 'Asia/Bangkok'` (the exact reverse of how
-`device_timestamp` became `capture_date`/`capture_time` in the first
-place — see `_capture_date_time_from_device_timestamp()` in
-`app/routers/ocr_jobs.py`). A `LEFT` (not inner) join so a row without
-a matching image still comes back with `anchor_image_path: null`
-instead of vanishing from the list. `group_id` (confirmed request —
-lets the dashboard show which burst a card came from) rides along on
-the exact same join, same `null`-on-miss behavior — no second query.
-`OcrMeterTestEntry` (`app/schemas.py`) is `OcrMeterEntry` plus these two
-optional fields — used only by this one listing endpoint;
-`POST .../result-test` itself still returns a plain `OcrMeterEntry`,
-same as `POST .../result`, and `ocr_meter`/`ocr_meter_test`'s actual
-table shapes remain identical to each other and untouched.
+### 4.5 สร้างบัญชีผู้ใช้
+```bash
+# super admin คนแรก (จัดการบัญชีอื่นได้)
+sudo docker compose exec ocr-meter-store python -m scripts.create_user --username superadmin --password '<รหัสผ่าน>' --super-admin
 
-**`GET /admin/images-by-filename/{filename}/file`** — a second
-image-serving endpoint alongside the existing `GET
-/admin/images/{item_id}/file`, added because the dashboard's test-results
-tab only has `anchor_image_path` (a disk path string, computed as above)
-to work with, not an `images_*.id` — the page extracts the filename
-client-side and calls this instead. `filename` is checked for `/`, `\`,
-and `..` before ever touching the filesystem (confirmed necessary —
-this is the one file-serving path that takes a caller-supplied string
-straight from the URL rather than a filename already validated at
-upload time). Requires the browser to actually load the bytes with an
-`Authorization` header attached — a plain `<img src="...">` can't do
-that, so the page `fetch()`s each thumbnail and hands the `<img>` a
-`URL.createObjectURL()` result instead.
+# บัญชีของอุปกรณ์และระบบ OCR (ชื่อต้องตรงกับ DEVICE_API_KEY_USERNAME / OCR_CLIENT_KEY_USERNAME)
+sudo docker compose exec ocr-meter-store python -m scripts.create_user --username esp32 --password '<สุ่ม>' --device
+sudo docker compose exec ocr-meter-store python -m scripts.create_user --username ocr-service --password '<สุ่ม>' --admin --device
+```
+ผู้ดูแลคนอื่นสร้างจากหน้าเว็บ "จัดการผู้ดูแล" ได้เลย
 
-**Not yet decided / worth flagging:**
-- Whether `GET /admin/meters/{meter_id}/ocr-readings` (the endpoint the
-  OCR client polls for anomaly-detection history) should read from
-  `ocr_meter_test` too when a meter's `only_successful` history is
-  entirely test data, or stay `ocr_meter`-only as it is now.
-- No admin endpoint lists/inspects dropped groups specifically — a
-  dropped group looks identical (from the API's view) to one still
-  mid-burst, since both just have `ocr_job_id: null` forever. Flag if
-  you want a way to tell these apart (e.g. a `GET .../images?dropped=true`
-  filter, or surfacing `has_normal_group_today` on `ImageOut`).
+### 4.6 ทดสอบในเครื่อง (ไม่ต้องใช้ฐานข้อมูลจริง)
+ใช้ `docker-compose.local.yml` ซึ่งมีฐานข้อมูลของตัวเอง แล้วใช้ Postman collection ในโฟลเดอร์เอกสารของโครงงาน หรือ Swagger ที่ `http://localhost:<พอร์ต>/iot/docs`
 
-## Running locally
+---
+
+## 5. ค่าตั้งค่า (ตัวแปรสภาพแวดล้อม)
+
+ทุกค่าอยู่ใน `app/config.py` ตั้งผ่าน `.env` หรือ `environment:` ใน `docker-compose.yml` (ชื่อตัวแปรเป็นตัวพิมพ์ใหญ่) เปลี่ยนแล้วต้อง `sudo docker compose up -d --build`
+
+| ตัวแปร | ค่าเริ่มต้น | ความหมาย |
+|---|---|---|
+| `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | `timescaledb`, 5432, -, -, `cfo_iot` | การเชื่อมต่อฐานข้อมูล |
+| `BASE_PATH_PREFIX` | `/iot` | prefix ของทุก path (หลัง reverse proxy) |
+| `JWT_SECRET` | - | กุญแจเซ็น token ผู้ดูแล **ต้องเปลี่ยน** |
+| `JWT_EXPIRE_MINUTES` | 60 | อายุ token ผู้ดูแล (นาที) หมดแล้วหน้าเว็บเด้งไป login |
+| `DEVICE_API_KEY` / `DEVICE_API_KEY_USERNAME` | ว่าง | กุญแจกลางของอุปกรณ์ (ใช้ได้กับทุกมิเตอร์) ลบทิ้งเมื่อทุกเครื่องใช้ token รายเครื่องแล้ว |
+| `OCR_CLIENT_KEY` / `OCR_CLIENT_KEY_USERNAME` | ว่าง | กุญแจของระบบ OCR |
+| `UPLOAD_DIR` | `/data/images` | โฟลเดอร์เก็บภาพในคอนเทนเนอร์ (ผูกกับ Docker volume) |
+| `MAX_UPLOAD_MB` | 15 | ขนาดไฟล์ภาพสูงสุด |
+| `IMAGE_GROUP_WINDOW_SECONDS` | 60 | ภาพที่มาห่างกันไม่เกินนี้นับเป็นกลุ่มเดียว |
+| `IMAGE_GROUP_SIZE` | 3 | จำนวนภาพต่อกลุ่มเมื่อมิเตอร์ไม่ได้ตั้ง `photo_count` |
+| `GROUP_SWEEP_INTERVAL_SECONDS` | 5 | รอบตรวจกลุ่มที่หมดเวลารอ |
+| `DAILY_GROUP_LIMIT_ENABLED` | `true` | `true` = ภาพจริงเข้าคิว OCR ได้วันละ 1 ชุดต่อมิเตอร์ ชุดถัดไปถูก drop / `false` = ทุกชุดเข้าคิว |
+| `MAX_OCR_ATTEMPTS` | 5 | จำนวนครั้งที่ระบบ OCR ลองงานเดียวได้ก่อนเป็น failed |
+| `READING_DECIMALS_ELECTRIC` / `_GAS` / `_WATER` | 1 / 3 / 3 | จำนวนหลักทศนิยมที่เติมให้ เมื่อระบบ OCR ส่งค่ามาโดยไม่มีจุด |
+| `OCR_HISTORY_INCLUDE_ANOMALIES` | `true` | ค่าย้อนหลังที่ส่งให้ Rule Base รวมค่าผิดปกติด้วย (ดู 7.3) |
+| `EXTERNAL_API_BASE_URL` | ว่าง | URL ของ CFO Platform (ต้องเป็น `https://`) |
+| `EXTERNAL_KEY_ENCRYPTION_KEY` | ว่าง | กุญแจ Fernet ที่ใช้เข้ารหัส CFO API Key |
+| `EXTERNAL_PUSH_SWEEP_INTERVAL_SECONDS` | 30 | รอบของงานเบื้องหลังที่ส่งค่าค้างไป CFO |
+
+---
+
+## 6. ผู้ใช้ สิทธิ์ และการยืนยันตัวตน
+
+### 6.1 ระดับสิทธิ์
+
+| ระดับ | ใช้ทำอะไร | ยืนยันตัวตนด้วย |
+|---|---|---|
+| **super admin** | ทุกอย่างของผู้ดูแล + จัดการบัญชีผู้ดูแล + ออก/เพิกถอน token อุปกรณ์ | JWT (login) |
+| **ผู้ดูแล (admin)** | หน้าเว็บ, ตารางเวลา, CFO API Key, ดูผลลัพธ์ | JWT (login) |
+| **อุปกรณ์** | อัปโหลดภาพ, ขอตารางเวลา **ของมิเตอร์ตัวเองเท่านั้น** | token รายเครื่อง `dt_...` หรือกุญแจกลาง |
+| **ระบบ OCR** | จองงาน, ดึงภาพ, ดึงค่าย้อนหลัง, ส่งผล | `X-OCR-Key` |
+
+กฎสำคัญ:
+- ลบบัญชีตัวเองไม่ได้ (403), ลบ super admin คนสุดท้ายไม่ได้ (409), ลบบัญชีอุปกรณ์จากหน้าเว็บไม่ได้
+- เปลี่ยนรหัสผ่านต้องใส่รหัสเดิม ยกเว้น super admin รีเซ็ตให้คนอื่น
+- ลบบัญชีแล้ว token ที่ออกไปใช้ไม่ได้ทันที (ระบบโหลดผู้ใช้จากฐานข้อมูลทุกคำขอ) แต่**เปลี่ยนรหัสผ่านไม่ได้ทำให้ token เดิมหมดอายุ**
+
+### 6.2 การส่งกุญแจ
+- **ผู้ดูแล:** `Authorization: Bearer <JWT>`
+- **อุปกรณ์:** `X-Device-Key: <dt_... หรือกุญแจกลาง>` (เฟิร์มแวร์ส่ง `Authorization: Bearer` ด้วยก็ได้)
+- **ระบบ OCR:** `X-OCR-Key: <OCR_CLIENT_KEY>`
+
+### 6.3 token รายเครื่อง
+- **ออก/เพิกถอน:** super admin กดในหน้าตั้งค่ามิเตอร์ (มิเตอร์ต้องมีอยู่ในระบบก่อน ใช้ปุ่ม "+ ใหม่")
+- **รูปแบบ:** ขึ้นต้น `dt_` + สุ่ม 32 ไบต์ แสดงให้เห็น**ครั้งเดียว**ตอนออก ฐานข้อมูลเก็บเฉพาะ SHA-256
+- **ผูกกับมิเตอร์:** ใช้กับมิเตอร์อื่น = 403, token ผิดหรือถูกเพิกถอน = 401
+- **"ใช้ล่าสุด":** อัปเดตทุกครั้งที่มีคนใช้ token แม้คำขอจะถูกปฏิเสธทีหลัง ใช้ดูได้ว่าเครื่องใช้ token ไหนอยู่
+- **ไม่หมดอายุ:** ต้องกด "ออก token ใหม่" เอง token เดิมใช้ไม่ได้ทันที
+
+---
+
+## 7. การทำงานหลักทีละขั้น
+
+### 7.1 อุปกรณ์ส่งภาพ (`POST /iot/images/upload`)
+
+**ชื่อไฟล์** (เซิร์ฟเวอร์อ่านรหัสมิเตอร์และเวลาถ่ายจากชื่อไฟล์ ไม่ใช่จากเวลาที่ได้รับ):
+```
+{meter_id}_{YYYYMMDD}_{HHMMSS}_{ลำดับ}.jpg      เช่น ELE-000002_20261030_061501_01.jpg
+{meter_id}_NOTIME_{ms}_{ลำดับ}.jpg               ภาพที่ถ่ายก่อนเครื่องซิงก์เวลาได้ (ใช้เวลาที่เซิร์ฟเวอร์ได้รับแทน)
+```
+- เวลาในชื่อไฟล์เป็น**เวลาไทย**
+- ชื่อไฟล์ผิดรูปแบบ → **400**
+- ตัวอักษรนำหน้ารหัสบอกประเภท: `ELE-` ไฟฟ้า, `WAT-` น้ำประปา, `GAS-` แก๊ส
+
+**พารามิเตอร์ใน URL**
+
+| พารามิเตอร์ | ค่า | ใช้ทำอะไร |
+|---|---|---|
+| `net_mode` | `WiFi` / `4G` | บันทึกใน `esp32_upload_log` |
+| `carrier` | รหัสเครือข่าย | บันทึกเฉย ๆ |
+| `wakeup_reason` | `timer` (Carbon ตามรอบ), `interval` (AlwaysOn ตามรอบ) → **ภาพจริง** / `manual`, `boot`, อื่น ๆ → **ภาพทดสอบ** | แยกภาพจริงกับทดสอบ |
+| `power_mode` | `battery` / `always_on` (ไม่ส่ง = battery) | บันทึกประเภทเครื่อง ใช้ตัดสินรูปแบบตารางเวลา |
+| `fw_version` | เช่น `1.13`, `2.3-AlwaysOn` | แสดงในหน้าเว็บ |
+
+**ภาพทดสอบ:** ระบบเติม `_Test` ท้ายชื่อไฟล์ ผลไปที่ `ocr_meter_test` ไม่ถูกส่งไป CFO และไม่ถูกใช้เป็นค่าย้อนหลังของ Rule Base
+
+**การจัดกลุ่ม** (`app/grouping.py`):
+- ภาพของมิเตอร์เดียวกันที่มาห่างกันไม่เกิน `IMAGE_GROUP_WINDOW_SECONDS` อยู่กลุ่มเดียวกัน ชื่อกลุ่มเช่น `E12`, `W3`, `G5`
+- ครบตามจำนวนภาพ (`photo_count` ของมิเตอร์ หรือ `IMAGE_GROUP_SIZE`) → สร้างงาน OCR ทันที
+- ไม่ครบแต่หมดเวลารอ → งานเบื้องหลังปิดกลุ่มแล้วสร้างงานจากภาพที่มี
+- ประเภทภาพจริง/ทดสอบของกลุ่มตัดสินจาก**ภาพแรก**
+
+**กฎวันละ 1 ชุด** (`DAILY_GROUP_LIMIT_ENABLED=true`): ภาพจริงชุดที่ 2 ขึ้นไปของวันเดียวกัน (ตามเวลาไทย) ถูกตั้งเป็น `dropped` ไม่เข้าคิว OCR (ภาพยังเก็บไว้) ภาพทดสอบไม่ติดกฎนี้
+
+### 7.2 ตารางเวลาถ่ายภาพ (`device_config`)
+
+| `schedule_mode` | ความหมาย | ฟิลด์ที่ใช้ | แบต | เปิดตลอด |
+|---|---|---|---|---|
+| 0 | ถ่ายทุกวัน (Daily) | `date1` (ชั่วโมง นาที) | ✔ | ✔ |
+| 1 | ถ่ายตามวันที่ของเดือน (Fix date) | `date1`, `date2` (วัน ชั่วโมง นาที) | ✔ | ✔ |
+| 2 | ทุก N นาที | `interval_minutes` | ✘ | ✔ |
+| 3 | ตามรายการเวลา | `times` (เช่น `["08:00","17:00"]` สูงสุด 8) | ✘ | ✔ |
+
+- `date1`, `date2` เป็น `[วัน, เดือน, ปี, ชั่วโมง, นาที]` ใช้เฉพาะวัน ชั่วโมง นาที
+  - **วันที่จำกัด 0–28:** เครื่องแบตตั้งเวลาปลุกตามวันที่ตรง ๆ ถ้าตั้ง 29–31 เดือนที่ไม่มีวันนั้นจะไม่ถ่ายเลย
+  - `date1` วัน = 0 หมายถึงวันที่ 26, `date2` ทั้งหมดเป็น 0 = ไม่มีรอบที่สอง
+- `photo_delay` 0–3600 วินาที, `photo_count` 1–10
+- บันทึกโหมด 2 หรือ 3 ให้มิเตอร์ที่ไม่ใช่ `always_on` → **422** (เฟิร์มแวร์ Carbon ไม่ได้กันค่าเหล่านี้)
+- มิเตอร์ที่ไม่เคยตั้งค่า ได้ค่าเริ่มต้น (Fix date วันที่ 26 เวลา 08:00) และป้าย "ค่าเริ่มต้น"
+
+**คำตอบของ `GET /iot/devices/config`** ขึ้นกับประเภทเครื่องที่บันทึกไว้:
+- **battery / ไม่ทราบ:** รูปแบบเดิม (ไม่มี `power_mode`) เครื่อง Carbon ไม่ต้องแก้อะไร
+- **always_on:** มี `"power_mode": "always_on"` และส่ง `interval_minutes`, `times` ไปด้วยเสมอ ถ้าไม่มี `power_mode` เครื่อง AlwaysOn จะรับแค่ `photo_count`, `photo_delay` แล้วใช้รอบถ่ายของเฟิร์มแวร์เอง
+
+ประเภทเครื่องมาจาก `power_mode` ที่เครื่องส่งตอนอัปโหลดล่าสุด หรือจากที่ผู้ดูแลเลือกตอนกด "+ ใหม่" (ถ้าเครื่องยังไม่เคยส่งรูป)
+
+### 7.3 คิว OCR (`/iot/admin/images/ocr/...`)
+
+ขั้นตอนที่ระบบ OCR ทำ:
+1. `GET /iot/admin/images/ocr?job_status=queued` ดูงานที่รอ
+2. `POST .../{job_id}/claim` จองงาน (งานเป็น `processing`) ได้ URL ของภาพทุกภาพในกลุ่ม
+3. `GET /iot/admin/meters/{meter_id}/ocr-readings?limit=3&only_successful=true` ดึงค่าย้อนหลัง (เฉพาะภาพจริง)
+4. `POST .../{job_id}/result` (ภาพจริง) หรือ `.../result-test` (ภาพทดสอบ) ส่งผล
+5. ถ้าทำงานพลาด `POST .../{job_id}/fail` เพื่อคืนงานหรือนับครั้งที่พลาด
+
+**ผลที่ระบบ OCR ส่งมา**
+
+| `error_type` | ความหมาย | ต้องมี `ocr_reading` |
+|---|---|---|
+| 0 | อ่านสำเร็จ | ✔ |
+| 1 | หาตัวเลข/มิเตอร์ไม่เจอ หรืออ่านไม่ได้ | ✘ |
+| 2 | ระบบ OCR ผิดพลาด | ✘ |
+| 3 | อ่านได้แต่ค่าผิดปกติ (Rule Base ตีกลับ) | ✔ |
+
+`ocr_engine` คือรหัสเส้นทางการอ่านของระบบ OCR (เช่น 0 = CNN อ่านได้เอง, 110/120 = ต้องใช้ Gemini) ดูความหมายเต็มได้ที่ `GET /iot/admin/meters/ocr-engine-meaning`
+
+**การเติมจุดทศนิยม** (`app/routers/ocr_jobs.py`):
+- ระบบ OCR **ต้องส่งค่าเป็นข้อความตามที่อ่านได้** (เช่น `"53873"`, `"02875.335"`) ไม่แปลงเป็น float ก่อนส่ง
+- ข้อความ**ไม่มีจุด** → เติมจุดตาม `READING_DECIMALS_*` ของประเภทมิเตอร์ (`"53873"` ไฟฟ้า → 5387.3)
+- ข้อความ**มีจุดแล้ว** → ใช้ตามเดิม (`"5387.0"` ≠ `"5387"`)
+- ข้อความต้นฉบับเก็บใน `ocr_reading_raw` ไว้เป็นสถิติ ค่าที่ใช้งานอยู่ใน `ocr_reading`
+- `nan`, `inf`, ข้อความที่ไม่ใช่ตัวเลข → **422**
+
+**ค่าย้อนหลังที่ส่งให้ Rule Base** (`app/routers/meters.py`, `ocr-readings`):
+- `OCR_HISTORY_INCLUDE_ANOMALIES=true` (ค่าเริ่มต้น): ค่าล่าสุดที่มีตัวเลขจริง (> 0) ทั้งอ่านสำเร็จ (0) และค่าผิดปกติ (3) ข้ามค่าที่อ่านไม่ได้และค่า 0
+- `false`: เฉพาะอ่านสำเร็จแบบเดิม
+- เหตุผล: ถ้าค่าที่อ่านผิดได้สถานะ "อ่านสำเร็จ" (เช่น อ่าน 3 เป็น 8 ได้ 5889.2) แบบเดิมจะใช้ค่านั้นเป็นฐานเทียบตลอดไป ค่าที่อ่านถูกหลังจากนั้นถูกตีผิดปกติทั้งหมด
+- ตรรกะของ Rule Base อยู่ในระบบ OCR (`meter_validator.py`) ไม่ได้อยู่ใน repo นี้
+
+### 7.4 ส่งค่าไป CFO Platform (`app/external_push.py`)
+
+**เงื่อนไขการส่ง**
+- เฉพาะผลลัพธ์จริง (`ocr_meter`) ของมิเตอร์ที่มี CFO API Key
+- **เฉพาะค่าที่ถ่ายหลังบันทึก API Key ครั้งแรก** ค่าที่ถ่ายก่อนหน้า (ข้อมูลช่วงทดลอง) ได้สถานะ `skipped_before_key` ไม่ส่งอัตโนมัติ เปลี่ยน key ภายหลังจุดตัดไม่เลื่อน ผู้ดูแลสั่งส่งรายการเก่าเองได้
+
+**ข้อมูลที่ส่ง** (`POST {EXTERNAL_API_BASE_URL}/external/v1/meter-readings`, multipart, header `X-API-Key`)
+- `image`: ภาพหลักของกลุ่ม (ย่อให้ถ้าเกิน 10 MB)
+- `externalRef`: `{meter_id}-{YYYYMMDD}-{HHmm}` ซ้ำนาทีเดียวกันต่อท้าย `-2`, `-3`
+- `readingDate`: วันที่ถ่ายตามเวลาไทย
+- `aiValue`: ค่าที่อ่านได้ **ตัด**ทศนิยมเหลือ 2 ตำแหน่ง (ไม่ปัดขึ้น) ไม่ส่งเมื่ออ่านไม่ได้
+- `confidence`: ถ้ามี
+
+**สถานะการส่ง (`push_status`)**
+
+| สถานะ | ความหมาย |
+|---|---|
+| `not_pushed` | ยังไม่เคยส่ง (มิเตอร์ไม่มี key) |
+| `pending` | ส่งสำเร็จ CFO รับแล้ว รอเจ้าหน้าที่ตรวจ |
+| `failed_retryable` | ส่งไม่สำเร็จชั่วคราว (5xx, timeout) จะส่งซ้ำหลัง 30 วิ → 2 นาที → 10 นาที → 1 ชั่วโมง |
+| `failed_permanent` | ข้อมูลของรายการนั้นผิด (400 ฯลฯ) ไม่ส่งซ้ำ ต้องแก้เอง |
+| `blocked_auth` | key ใช้ไม่ได้ (401/403) หยุดส่งทั้งมิเตอร์จนกว่าจะใส่ key ใหม่ |
+| `skipped_before_key` | ถ่ายก่อนบันทึก key ครั้งแรก ไม่ส่งอัตโนมัติ |
+
+รายการที่ต้องตรวจ (`failed_permanent`, `blocked_auth`, มิเตอร์ไม่ตรงทะเบียน `meterMatched=false`) ดูได้จากปุ่ม **Push Issues** ในหน้าเว็บ
+
+### 7.5 หน้าเว็บผู้ดูแล
+- **`/iot/admin/device-config-ui`:** หน้าหลัก รายการมิเตอร์ (กรองตามประเภทมิเตอร์และประเภทเครื่อง), ตารางเวลา, CFO API Key, token อุปกรณ์, ผลลัพธ์จริง/ทดสอบล่าสุด, Push Issues, เพิ่มมิเตอร์ใหม่
+  - อัปเดตอัตโนมัติทุก 15 วินาที (ไม่แตะฟอร์มที่กำลังแก้ หยุดเมื่อเปิดหน้าต่างอื่นหรือสลับแท็บ)
+  - แสดงค่าตามจำนวนหลักทศนิยมของประเภทมิเตอร์ (ไฟ 1, แก๊ส/น้ำ 3)
+- **`/iot/admin/users-ui`:** จัดการบัญชีผู้ดูแล (เฉพาะ super admin)
+- **`/iot/docs`:** Swagger ของ API ทั้งหมด
+
+---
+
+## 8. ฐานข้อมูล
+
+| ตาราง | เก็บอะไร |
+|---|---|
+| `users` | บัญชีผู้ดูแล อุปกรณ์ ระบบ OCR (`is_admin`, `is_super_admin`, `is_device`) |
+| `device_config` | ตารางเวลาของแต่ละมิเตอร์, ประเภทเครื่อง (`power_mode`, `fw_version`), ข้อมูลอ้างอิงจาก CFO |
+| `device_tokens` | token รายเครื่อง (เก็บแฮช) 1 มิเตอร์ 1 token |
+| `external_api_keys` | CFO API Key (เข้ารหัส Fernet), เวลาที่ตั้งครั้งแรก (`created_at` = จุดตัดการส่ง) |
+| `images` | ภาพทุกภาพที่รับ (กลุ่ม, สถานะ OCR, ชื่อไฟล์, เวลาถ่าย) |
+| `ocr_jobs` | คิวงาน OCR (queued / processing / done / failed / dropped) |
+| `ocr_meter` | ผลลัพธ์ของภาพจริง + สถานะการส่ง CFO |
+| `ocr_meter_test` | ผลลัพธ์ของภาพทดสอบ (โครงสร้างเดียวกัน) |
+| `esp32_upload_log` | บันทึกการส่งภาพของอุปกรณ์ (เครือข่าย, สาเหตุการตื่น) เฉพาะคำขอที่สำเร็จ |
+| `error_type`, `ocr_engine_meaning` | ตารางอ้างอิงความหมายของรหัส |
+| `dataset` | ตำแหน่งไฟล์ภาพ ใช้รวบรวมชุดข้อมูลฝึกโมเดล |
+
+ไฟล์ภาพอยู่ใน Docker volume (ในคอนเทนเนอร์คือ `/data/images`) บนเครื่องโฮสต์ดูได้ที่ `/var/lib/docker/volumes/<ชื่อ volume>/_data/`
+
+---
+
+## 9. รายการ API
+
+ทุก path มี prefix `/iot` (ค่า `BASE_PATH_PREFIX`) รายละเอียดพารามิเตอร์ดูที่ `/iot/docs`
+
+| กลุ่ม | Method และ Path | สิทธิ์ |
+|---|---|---|
+| ระบบ | `GET /health` | ไม่ต้อง |
+| เข้าสู่ระบบ | `POST /login`, `GET /me`, `PUT /me/password` | ผู้ดูแล |
+| อุปกรณ์ | `POST /images/upload`, `GET /devices/config?meter_id=` | อุปกรณ์ |
+| คิว OCR | `GET /admin/images/ocr`, `POST /admin/images/ocr/{id}/claim`, `.../result`, `.../result-test`, `.../fail` | ระบบ OCR / ผู้ดูแล |
+| ภาพ | `GET /admin/images`, `GET /admin/images/{id}`, `GET .../{id}/file`, `GET /admin/images-by-filename/{name}/file`, `DELETE /admin/images/{id}`, `POST .../{id}/reprocess`, `PUT .../{id}/ocr-manual` | ผู้ดูแล / ระบบ OCR |
+| ผลลัพธ์ | `GET /admin/meters/ocr-meter`, `GET /admin/meters/ocr-meter-test`, `GET /admin/meters/{id}/ocr-readings`, `GET /admin/meters/{id}/history`, `GET /admin/meters/esp32-upload-log`, `GET /admin/meters/ocr-engine-meaning` | ผู้ดูแล / ระบบ OCR |
+| CFO | `PUT/GET /admin/device-config/{id}/external-api-key`, `POST .../verify-external`, `POST /admin/meters/ocr-meter/{id}/push-external`, `GET /admin/meters/push-issues` | ผู้ดูแล |
+| มิเตอร์ | `GET /admin/device-config`, `POST /admin/device-config` (เพิ่มมิเตอร์), `GET/PUT/DELETE /admin/device-config/{id}` | ผู้ดูแล |
+| token อุปกรณ์ | `GET /admin/device-config/{id}/device-token` (ผู้ดูแล), `POST`/`DELETE` (super admin) | |
+| บัญชีผู้ดูแล | `GET/POST /admin/users`, `DELETE /admin/users/{id}`, `PUT /admin/users/{id}/password` | super admin |
+| หน้าเว็บ | `GET /admin/device-config-ui`, `GET /admin/users-ui` | เปิดได้ (login ในหน้า) |
+
+> `POST /register` ถูกจำกัดให้เฉพาะผู้ดูแลแล้ว (เคยเปิดสาธารณะ) ให้สร้างบัญชีผ่านหน้า "จัดการผู้ดูแล" หรือ `scripts/create_user.py`
+
+---
+
+## 10. การอัปเดตเวอร์ชันบนเซิร์ฟเวอร์ (deploy)
+
+### 10.1 ขั้นตอนปกติ
+```bash
+cd ~/docker_ocr_meter/OCR_Meter        # โฟลเดอร์ของ repo บนเซิร์ฟเวอร์
+
+# 1) เก็บ log ไว้ก่อน — log จะหายเมื่อสร้างคอนเทนเนอร์ใหม่
+sudo docker logs -t ocr-meter-store > ~/log_$(date +%Y%m%d_%H%M).txt 2>&1
+
+# 2) ดึงโค้ด
+git pull
+
+# 3) ถ้าเวอร์ชันนี้มีคอลัมน์/ตารางใหม่ → เพิ่มในฐานข้อมูล "ก่อน" build (ดู 10.2)
+
+# 4) build และรันใหม่
+sudo docker compose up -d --build
+
+# 5) ตรวจ
+curl -s http://localhost:<พอร์ต>/iot/health
+sudo docker logs --since 2m ocr-meter-store 2>&1 | grep -iE "error|traceback"
+```
+แล้วในเบราว์เซอร์กด Ctrl + Shift + R (Mac: Cmd + Shift + R) เพื่อโหลดหน้าเว็บใหม่
+
+### 10.2 ⚠️ เพิ่มคอลัมน์ก่อน build เสมอ
+ถ้าโค้ดใหม่อ่านคอลัมน์ที่ฐานข้อมูลยังไม่มี ทั้งหน้าเว็บและอุปกรณ์จะได้ **500** (`KeyError` หรือ `column ... does not exist`) จนกว่าจะเพิ่มคอลัมน์
+
+วิธีเพิ่มคอลัมน์โดยใช้การเชื่อมต่อของคอนเทนเนอร์เอง (ไม่ต้องรู้รหัสผ่านฐานข้อมูล):
+```bash
+sudo docker compose exec -T ocr-meter-store python - <<'EOF'
+import asyncio, sys
+sys.path.insert(0, "/srv")
+from app import db
+SQL = [
+    "ALTER TABLE <ตาราง> ADD COLUMN IF NOT EXISTS <คอลัมน์> <ชนิด>",
+]
+async def main():
+    await db.connect()
+    for q in SQL:
+        await db.pool().execute(q)
+        print("done:", q)
+    await db.disconnect()
+asyncio.run(main())
+EOF
+```
+คำสั่ง ALTER ทุกตัวที่ระบบต้องใช้อยู่ท้าย `db/init.sql` อยู่แล้ว คัดลอกมาใช้ได้ ทุกคำสั่งรันซ้ำได้
+
+**ถ้าลืมแล้วระบบ error:** รันคำสั่งเพิ่มคอลัมน์ได้เลยตอนนั้น ไม่ต้อง build ใหม่ ระบบกลับมาทำงานทันที
+
+### 10.3 ย้อนกลับเวอร์ชันก่อน
+```bash
+git log --oneline -5
+git checkout <รหัส commit ก่อนหน้า> -- app db
+sudo docker compose up -d --build
+```
+คอลัมน์ที่เพิ่มไปแล้วไม่ต้องลบ โค้ดเก่าไม่ได้ใช้ก็ไม่เป็นไร
+
+### 10.4 ข้อควรระวังกับ git
+- **อย่าใช้ `git add .` หรือ `git commit -a`** ให้ add เฉพาะไฟล์ที่แก้ (เคยมีไฟล์ใน `app/routers/` ถูกลบในเครื่องโดยไม่ตั้งใจ ถ้า commit ไปเซิร์ฟเวอร์จะพัง)
+- เพิ่มใน `.gitignore`: `.env`, `.DS_Store`, `*.jpg`, `*.patch`
+- ตรวจด้วย `git status` และ `git diff --stat` ก่อน commit ทุกครั้ง
+
+---
+
+## 11. คำสั่งที่ใช้บ่อย
+
+เวลาใน log เป็น **UTC** (เวลาไทย = UTC + 7)
 
 ```bash
-cp .env.example .env   # fill in DB_USER / DB_PASSWORD / JWT_SECRET / etc.
-docker compose up --build
+# log สด เฉพาะคำขอจากอุปกรณ์
+sudo docker logs -f --tail 20 ocr-meter-store 2>&1 | grep -E "devices/config|images/upload"
+
+# log ย้อนหลังตามช่วงเวลา (UTC)
+sudo docker logs -t --since "2026-10-30T00:00:00" ocr-meter-store 2>&1 | grep -E "devices/config|images/upload"
+
+# เส้นทางของภาพจริง 1 ชุด: อัปโหลด → จองงาน → ดึงค่าย้อนหลัง → ส่งผล
+sudo docker logs -t --since 1h ocr-meter-store 2>&1 | grep -E "wakeup_reason=(timer|interval)|/claim|ocr-readings|/result"
+
+# คำขอที่ถูกปฏิเสธ
+sudo docker logs -t --since 1h ocr-meter-store 2>&1 | grep -E " 40[0-9] "
+
+# error ของระบบ
+sudo docker logs --since 1h ocr-meter-store 2>&1 | grep -iE "error|traceback|keyerror"
+
+# คอนเทนเนอร์เริ่มเมื่อไร (log ก่อนเวลานี้หายแล้ว)
+sudo docker inspect -f '{{.State.StartedAt}}' ocr-meter-store
+
+# เช็กว่าคอนเทนเนอร์ใช้โค้ดเวอร์ชันใหม่ (ค้นคำที่มีเฉพาะในโค้ดใหม่)
+sudo docker compose exec ocr-meter-store grep -c "<คำ>" app/<ไฟล์>.py
 ```
 
-The DB itself (container name `timescaledb` on `innovation_net`,
-`DB_HOST` — **not** the host's `192.168.248.199`, which times out due to
-container-to-own-host routing, confirmed while debugging the real
-deploy — database from `DB_NAME`) is assumed to already exist and
-already have `db/init.sql` applied — this compose file does not manage
-a Postgres container. If it's a brand-new database, run `db/init.sql`
-against it once by hand (`psql -f db/init.sql`) before starting the app.
-
-### Testing on localhost first (no production DB needed)
-
-`docker-compose.local.yml` is a separate stack that adds a throwaway
-local Postgres, so you can smoke-test everything before pointing at the
-real production database. It also sets dev `DEVICE_API_KEY`/
-`OCR_CLIENT_KEY` values so you can test the no-login key path too:
-
+**ดูข้อมูลในฐานข้อมูลโดยไม่ต้องใช้ psql** (แก้ SQL ตามต้องการ):
 ```bash
-docker compose -f docker-compose.local.yml up --build
+sudo docker compose exec -T ocr-meter-store python - <<'EOF'
+import asyncio, sys
+sys.path.insert(0, "/srv")
+from app import db
+async def main():
+    await db.connect()
+    for r in await db.pool().fetch("""
+        SELECT capture_date, capture_time, ocr_reading, ocr_reading_raw, error_type, ocr_engine, push_status
+        FROM ocr_meter WHERE meter_id = 'ELE-000002'
+        ORDER BY capture_date DESC, capture_time DESC LIMIT 5"""):
+        print(dict(r))
+    await db.disconnect()
+asyncio.run(main())
+EOF
 ```
 
-This runs `db/init.sql` automatically against the local Postgres on
-first start. Once it's up:
+> การลบข้อมูล (`DELETE`) ให้ดูแถวด้วย `SELECT` ก่อนทุกครั้ง แล้วลบด้วย `id` พร้อมเงื่อนไข `meter_id` กันลบผิดมิเตอร์ ลบแล้วกู้คืนไม่ได้
 
-```bash
-# 1. health check
-curl http://localhost:3003/health
+---
 
-# 2. create the first admin, esp32, and ocr-service accounts, then log in as admin
-docker compose -f docker-compose.local.yml exec ocr-meter-store \
-    python -m scripts.create_user --username admin --password 'devpassword123' --admin
-docker compose -f docker-compose.local.yml exec ocr-meter-store \
-    python -m scripts.create_user --username esp32 --password 'unused-but-required' --device
-docker compose -f docker-compose.local.yml exec ocr-meter-store \
-    python -m scripts.create_user --username ocr-service --password 'unused-but-required' --admin --device
+## 12. ปัญหาที่พบบ่อยและวิธีแก้
 
-curl -s -X POST http://localhost:3003/login \
-    -H 'Content-Type: application/json' \
-    -d '{"username":"admin","password":"devpassword123"}'
-# -> {"access_token": "...", ...}  — save this as $TOKEN
+| อาการ | สาเหตุที่เป็นไปได้ | วิธีแก้ |
+|---|---|---|
+| หน้าเว็บ/อุปกรณ์ได้ **500** หลัง deploy, log มี `KeyError: '<ชื่อคอลัมน์>'` | ยังไม่ได้เพิ่มคอลัมน์ใหม่ | รันคำสั่งเพิ่มคอลัมน์ (10.2) ไม่ต้อง build ใหม่ |
+| อุปกรณ์ได้ **401** | กุญแจผิด, token ถูกออกใหม่ทับ/เพิกถอน | ดู "ใช้ล่าสุด" ของ token เทียบเวลาใน log, ออก token ใหม่แล้วแฟลชเครื่อง |
+| อุปกรณ์ได้ **403** | token ของมิเตอร์อื่น | รหัสมิเตอร์ในเครื่องอยู่ใน EEPROM ไม่ใช่ `DEFAULT_METER_ID` ต้องเข้าโหมดตั้งค่าเครื่องใหม่ |
+| อุปกรณ์ได้ **400** ตอนอัปโหลด | ชื่อไฟล์ผิดรูปแบบ (เวลาเครื่องเพี้ยน, รหัสมิเตอร์ผิด) | ดู Serial Monitor ของเครื่อง |
+| ภาพจริงชุดที่ 2 ของวันไม่ถูกอ่าน | กฎวันละ 1 ชุด (`dropped`) | ปกติ หรือตั้ง `DAILY_GROUP_LIMIT_ENABLED=false` |
+| ภาพของ AlwaysOn ไปอยู่ในผลทดสอบ | เครื่องส่ง `wakeup_reason` ที่ไม่ใช่ `interval` | เช็กเฟิร์มแวร์ |
+| ค่ามากกว่าจริง 10 / 1000 เท่า | ระบบ OCR ไม่ใส่จุดทศนิยม และจำนวนหลักตามประเภทไม่ตรงกับรุ่นมิเตอร์ | ดู `ocr_reading_raw`, ปรับ `READING_DECIMALS_*` (ดูข้อ 13) |
+| ค่าที่อ่านถูกโดนตี "ค่าผิดปกติ" ต่อเนื่อง | ฐานเทียบเป็นค่าที่อ่านผิด | ตรวจ `OCR_HISTORY_INCLUDE_ANOMALIES=true` |
+| "อ่านเลขไม่ได้" (`error_type 1`) | ภาพมืด/เบลอ/กล้องขยับ หรือระบบ OCR อ่านไม่ออก | เปิดดูภาพในการ์ด ถ้าภาพดีแต่อ่านไม่ได้ ส่งให้ทีม OCR |
+| หน้าเว็บเด้งไป login เอง | token ผู้ดูแลหมดอายุ (`JWT_EXPIRE_MINUTES`) | login ใหม่ |
+| ไม่ส่งไป CFO ทั้งที่ใส่ key แล้ว | ภาพถ่ายก่อนบันทึก key (`skipped_before_key`) หรือ `blocked_auth` | ดู Push Issues / สถานะในการ์ด |
+| ภาพผ่าน 4G เสียเป็นแถบ | ข้อมูลหายระหว่าง ESP32 กับโมดูล 4G (ไม่ใช่เซิร์ฟเวอร์ — เซิร์ฟเวอร์เก็บไฟล์ตามไบต์ที่ได้รับทุกไบต์) | ฝั่งเฟิร์มแวร์ |
 
-# 3. upload an image via the no-login device key (matches DEVICE_API_KEY_USERNAME=esp32)
-# meter_id and the capture timestamp come from the FILENAME itself —
-# {meterId}_{YYYYMMDD}_{HHMMSS}_{seq}.jpg — rename any test JPEG to match:
-cp /path/to/some.jpg E101_20260818_151230_01.jpg
+---
 
-curl -s -X POST http://localhost:3003/images/upload \
-    -H 'X-Device-Key: dev-device-key-not-for-production' \
-    -F 'file=@E101_20260818_151230_01.jpg'
-# -> {"image": {...}, "group_id": "E1", "ocr_job_id": null}
-# ocr_job_id is null here — this group has only 1 image so far. E101's
-# target is IMAGE_GROUP_SIZE (3) unless it has its own device_config
-# row with a different photo_count. Either upload 2 more (or however
-# many the target is) within the window to trigger the fast path, or
-# wait out the full window (60s, matches production — see
-# docker-compose.local.yml) for the fallback sweep to pick it up with
-# just this 1 image. Then:
+## 13. งานค้างและข้อจำกัดที่รู้อยู่แล้ว
 
-curl -s "http://localhost:3003/admin/images/ocr?job_status=queued" \
-    -H 'X-OCR-Key: dev-ocr-key-not-for-production'
-# -> [{"id": 1, "image_id": 1, ...}]  — the job the background sweep just created
+### บั๊กฝั่งเซิร์ฟเวอร์ที่ยังไม่แก้ (ควรแก้ก่อนเปิดส่ง CFO เต็มรูปแบบ)
+1. **งาน OCR ค้าง `processing`** ถ้าระบบ OCR ล่มหลังจองงาน ไม่มีกลไกคืนงานเข้าคิว ต้องเพิ่มคอลัมน์ `claimed_at` ใน `ocr_jobs` และงานเบื้องหลังที่คืนงานที่ค้างเกินเวลา
+2. **อัปโหลดชื่อไฟล์ซ้ำ** สร้างแถวใหม่และเขียนทับไฟล์ภาพเดิม ควรตอบข้อมูลภาพเดิมกลับแทน
+3. **แก้ค่าด้วยมือ (`ocr-manual`) กับงานที่ failed** ตอบ 200 แต่ไม่บันทึก
+4. **JWT ตรวจเฉพาะ `uid`** ไม่ตรวจ `sub`
+5. **ค่าทศนิยมยาวในฐานข้อมูล** (เช่น `5397.3999…`) เพราะบันทึกผ่าน float ไม่กระทบการแสดงผลและการส่ง CFO ควรบันทึกเป็น Decimal
+6. **ไม่มีการจำกัดจำนวนครั้งที่ login ผิด** ทำที่ reverse proxy ได้
+7. **บันทึกเหตุผลที่ปฏิเสธอุปกรณ์** log มีแค่ 401/403 ไม่บอกสาเหตุ
 
-# 4. run job 1 through claim -> result via the no-login OCR key
-curl -s -X POST http://localhost:3003/admin/images/ocr/1/claim \
-    -H 'X-OCR-Key: dev-ocr-key-not-for-production'
-# -> {"job": {...}, "image_file_urls": ["/admin/images/1/file"]}  — plural,
-# one URL per image in the burst group (just one here since only one was uploaded)
+### ข้อจำกัดของการออกแบบ
+- **จำนวนหลักทศนิยมตั้งตามประเภท ไม่ใช่รายมิเตอร์:** มิเตอร์ไฟฟ้าบางรุ่นไม่มีทศนิยม (เช่น Mitsubishi) และมิเตอร์น้ำบางรุ่นแสดงทศนิยมเป็นเข็มซึ่งระบบ OCR ไม่ได้อ่าน ถ้าใช้มิเตอร์เหล่านี้ต้องเพิ่มการตั้งค่ารายมิเตอร์
+- **ข้อมูลที่แก้บน CFO ไม่ย้อนกลับมา:** ระบบนี้เก็บค่าดิบของ OCR ไว้เป็นสถิติโดยตั้งใจ ค่าที่ถูกต้องอยู่บน CFO Platform จับคู่กันได้ด้วย `externalRef`
+- **การส่งทันทีกับงานเบื้องหลังอาจส่งรายการเดียวกันซ้ำ:** ใช้ `externalRef` เดิม CFO ตอบ `duplicate` ไม่สร้างรายการซ้ำ
 
-curl -s -X POST http://localhost:3003/admin/images/ocr/1/result \
-    -H 'X-OCR-Key: dev-ocr-key-not-for-production' \
-    -F 'ocr_reading=12345' -F 'error_type=0'
+### เรื่องที่อยู่นอก repo นี้
+- **ระบบ OCR:** ภาพที่อ่านไม่ได้ควรส่ง `error_type 1` ไม่ใช่ 3 พร้อมค่า 0, Rule Base ควรเทียบค่ามัธยฐานและคิดอัตราการใช้ต่อวัน
+- **เฟิร์มแวร์:** เปลี่ยนเป็น HTTPS, แยก token ออกจาก `setting.h` ไม่ให้ขึ้น git
 
-# 5. list images as admin
-curl -s http://localhost:3003/admin/images -H "Authorization: Bearer $TOKEN"
-```
+---
 
-Interactive docs (Swagger UI) work both ways locally now —
-`http://localhost:3003/docs` **and** `http://localhost:3003/iot/docs`
-both work simultaneously, since `BASE_PATH_PREFIX=/iot` matches
-production but the middleware only acts on paths that actually start
-with it (see `app/prefix_middleware.py`) — anything else passes through
-untouched. Use the `/iot/...` form specifically when you want to verify
-our own handling of the production path is correct, in isolation from
-whatever's happening with the reverse proxy at `cfo.ntplc.co.th`.
+## 14. ความปลอดภัย
+- **ห้าม commit:** `.env`, token อุปกรณ์ (`dt_...`), CFO API Key, รหัสผ่าน, ภาพหน้าจอที่เห็นค่าเหล่านี้
+- **token หรือ key หลุด:** ออกใหม่ทันที (token อุปกรณ์: ปุ่ม "ออก token ใหม่" / CFO API Key: ขอใหม่จาก CFO แล้วบันทึกทับ)
 
-Once this all checks out, switch to the real `docker-compose.yml`
-(production DB + `/iot` base path + `innovation_net`) for the actual
-deploy.
+---
 
-Create your real admin/esp32/ocr-service accounts in production the same
-way, against the real container:
-
-```bash
-docker compose exec ocr-meter-store python -m scripts.create_user \
-    --username admin --password 'change-me' --admin
-```
-
-## Deployment notes (per your spec)
-
-- Container listens on **port 3003 only**.
-- `BASE_PATH_PREFIX=/iot` is baked into `docker-compose.yml`, matching
-  the public base URL `https://cfo.ntplc.co.th/iot`. The middleware
-  (`app/prefix_middleware.py`) strips it if present and is a no-op if
-  the proxy already strips it before forwarding — safe either way, per
-  your own note that you weren't 100% sure which.
-- `innovation_net` is declared `external: true`, so create it first if
-  it doesn't exist yet: `docker network create innovation_net`.
-- I dropped `NODE_ENV=production` from the compose env — that's a
-  Node.js convention and this is a pure-Python service, so it wouldn't
-  do anything here. Let me know if it's actually needed for something
-  else in your stack (e.g. a shared reverse-proxy config) and I'll add
-  it back.
-- `DB_HOST`/`DB_PORT`/`TZ`/`BASE_PATH_PREFIX` are pinned in
-  `docker-compose.yml` as specified; set `DB_USER`/
-  `DB_PASSWORD`/`DB_NAME`/`JWT_SECRET`/`DEVICE_API_KEY`/
-  `OCR_CLIENT_KEY` in `.env` (see `.env.example`).
-
-## `device_config` — ESP32 capture schedule, from a separate spec doc
-
-Not part of the original confirmed spec at all — came from a standalone
-"Device Configuration API Specification" doc another team sent,
-describing how ESP32 should fetch its own capture schedule.
-
-```bash
-curl "http://localhost:3003/devices/config?meter_id=E101" \
-    -H 'X-Device-Key: dev-device-key-not-for-production'
-```
-```json
-{"meter_id": "E101", "schedule_mode": 1, "date1": [26,0,0,8,0],
- "date2": [0,0,0,0,0], "photo_count": 3, "photo_delay": 5}
-```
-
-- `schedule_mode`: `0` = program/daily mode, `1` = fix-date mode.
-- `date1`/`date2`: `[Day, Month, Year, Hour, Minute]`. In daily mode
-  only Hour/Minute are meaningful (Day/Month/Year sit at `0`); `date2`
-  stays `[0,0,0,0,0]` unless the meter has a second monthly cycle.
-- **A meter with no row yet always gets `DEFAULT_CONFIG` back, still
-  `200 OK`** — confirmed from the spec doc directly, never a 404.
-  **This call also auto-provisions a real row** for a brand-new
-  meter_id (`get_or_create_device_config()`) — the response body is
-  identical either way, but a row now exists in the DB afterward. This
-  matters more than it might look: real FKs point at
-  `device_config(meter_id)` from seven other tables now (see
-  "`device_config`" below), so this row existing is what lets this same
-  meter_id's very first `images_*` insert succeed at all.
-- **`is_default` (my own addition, not in the spec)** — `true` = still
-  running on auto-provisioned defaults, nobody has ever explicitly set
-  this meter's schedule; `false` = an admin used `PUT` below at least
-  once. ESP32 ignores the extra field (harmless); a dashboard can use
-  it to show "using default" vs "customized" state.
-
-**Four things NOT in that spec doc, all my own additions — flag if
-any should be different:**
-
-1. **Auth** — the doc only showed a generic `Authorization: Bearer
-   <token>` example, no detail on what issues/validates that token.
-   This reuses `get_uploader` (the same dependency `/images/upload`
-   already uses) — accepts the existing `X-Device-Key`, an admin JWT,
-   **or** (confirmed against the real firmware source) the device key
-   sent RAW in the `Authorization` header with no `Bearer ` prefix at
-   all — `http.addHeader("Authorization", API_AUTH_BEARER_TOKEN)` in
-   `fetchDeviceConfigWiFi`/`fetchDeviceConfig4G`, no string
-   concatenation with `"Bearer "` anywhere in that code. A strict
-   `Authorization: Bearer <token>` parser would 401 this firmware
-   outright — `get_uploader` checks for the `bearer ` prefix first and
-   falls back to a direct key comparison when it's absent, so this
-   exact already-written ESP32 code works without any firmware changes.
-2. **`GET /admin/device-config`** — lists every meter that has an
-   explicit row (admin-or-service auth). Meters still running on
-   `DEFAULT_CONFIG` don't appear — there's nothing in the table for
-   them. `limit`/`offset` pagination, same pattern as everywhere else.
-3. **`GET /admin/device-config/{meter_id}`** — fetch one meter's config
-   for a dashboard's edit form to pre-fill. Falls back to
-   `DEFAULT_CONFIG` (`is_default: true`) the same way the ESP32-facing
-   endpoint does, rather than 404ing — opening "edit E999" for a
-   never-configured meter should show sensible starting values, not an
-   empty form.
-4. **`PUT /admin/device-config/{meter_id}`** — the spec doc only
-   describes ESP32 *reading* its config; it never says how one gets
-   *set* in the first place. Without some way to write a row, every
-   meter would read back the exact same hardcoded default forever. This
-   endpoint upserts by `meter_id` (admin JWT only, overwrites every
-   field — not a partial patch):
-```bash
-curl -X PUT http://localhost:3003/admin/device-config/E101 \
-    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-    -d '{"schedule_mode":1,"date1":[26,0,0,8,0],"date2":[0,0,0,0,0],"photo_count":3,"photo_delay":5}'
-```
-5. **`DELETE /admin/device-config/{meter_id}`** — a dashboard "reset to
-   default" button (admin JWT only). **Confirmed final (round 4, see
-   "`device_config`" below for the full back-and-forth): an UPSERT back
-   to `DEFAULT_CONFIG` with `is_default=true`, NOT a real row removal.**
-   Real FKs from seven other tables point at this one now — an actual
-   `DELETE` would fail (FK violation) for any meter with history in
-   those tables, which in practice is nearly every meter with a row
-   here to reset in the first place. Same externally-visible effect as
-   a real delete either way (every `GET` above goes back to reporting
-   `is_default: true`); idempotent.
-6. **`GET /admin/device-config-ui`** — a small standalone dashboard
-   (`app/static/device_config_ui.html`, served as plain `HTMLResponse`
-   — no template engine, no build step) so a human can browse/edit
-   `device_config` from a browser instead of curl or Swagger. Own login
-   form (posts to `/login`, stores the JWT in `localStorage`), a list
-   pane of every configured meter (color-coded dot by type — amber
-   electric, blue water, coral gas), and a detail pane that edits one
-   meter's schedule and calls the four endpoints above. No FastAPI-side
-   auth on the route itself — it's static HTML/CSS/JS, nothing to
-   protect there; the page's own JS is what attaches the JWT to every
-   `/admin/device-config*` call it makes, same as any other admin
-   client. Every API call inside the page uses a relative URL (e.g.
-   `fetch("device-config")`, `fetch("../login")`) resolved against the
-   page's own path — works unmodified behind `BASE_PATH_PREFIX`
-   (production) and without it (local), no hardcoded domain anywhere in
-   the file. This is genuinely a from-scratch admin tool, not anything
-   from the spec doc — flag if a different auth story (e.g. its own
-   session cookie instead of reusing the JWT-in-localStorage pattern)
-   is wanted instead.
-
-   **"ผลทดสอบล่าสุด" (recent test results) section — confirmed request,
-   same page, integrated into the meter detail form itself (a brief
-   earlier version put this behind a separate top-level tab instead —
-   replaced with this after confirming it should live on the config
-   page, scoped to whichever meter is currently selected).** Loads
-   automatically every time `selectMeter()` runs — a card list pulling
-   from `GET /admin/meters/ocr-meter-test?meter_id=...&limit=10` — each
-   card shows the group's `group_id` (E1/W3/G12-style — rides the same
-   query-time `LEFT JOIN` `anchor_image_path` comes from, see
-   `app/routers/meters.py`), the anchor image (loaded via
-   `GET /admin/images-by-filename/{filename}/file`, `fetch()`ed with the
-   JWT attached and shown through a `URL.createObjectURL()` blob, since
-   a plain `<img src>` can't send an `Authorization` header), the
-   reading, and a color-coded `error_type` badge. Clicking a thumbnail
-   opens it full-size in a simple fixed-position lightbox overlay
-   (click anywhere to close) — confirmed request. Confirmed scope:
-   anchor image only (not every image in the group) and only for
-   `ocr_meter_test` — `ocr_meter` itself has no equivalent section.
-
-`date1`/`date2` are stored as raw Postgres `INTEGER[]` (5 elements,
-`CHECK`-constrained to exactly 5), matching the wire format exactly —
-no attempt to normalize into real `DATE`/`TIME` columns, since
-`schedule_mode=0`'s semantics (only Hour/Minute meaningful) don't map
-cleanly onto them anyway. `schedule_mode`/`photo_count`/`photo_delay`
-also have `CHECK` constraints matching the spec's valid ranges
-(0-1, 1-10, 1-60) — enforced at the DB level, not just in the Pydantic
-request model, so a bad value can never land in the table regardless of
-how it got inserted.
-
-### `device_config` — real FKs from 7 tables, confirmed final (round 4)
-
-This has gone through four full rounds — worth recording the whole
-arc, since it's flipped back and forth and a future change might
-reasonably want to revisit it again:
-
-1. **Originally**: every `meter_id` column across the schema was a
-   plain `TEXT`, matched by *value* against `device_config.meter_id`
-   purely by application-code convention — no DB-level relationship at
-   all, in either direction. `GET /devices/config` a pure read, nothing
-   ever persisted for a brand-new meter.
-2. **Real FKs added, confirmed request from a hand-drawn diagram**:
-   `FOREIGN KEY (meter_id) REFERENCES device_config(meter_id)` on seven
-   tables (`images_electric`/`water`/`gas`, `ocr_jobs`, `ocr_meter`,
-   `ocr_meter_test`, `esp32_upload_log`), plus an `is_default` column
-   and auto-provisioning (`get_or_create_device_config()`) so a
-   brand-new meter's first upload wouldn't fail outright against a
-   `device_config` row that didn't exist yet.
-3. **FK reverted, confirmed** — a real FK meant `device_config` could
-   no longer ever be cleanly deleted for a meter that still had any
-   history in those other seven tables (a hard Postgres rule: you
-   cannot delete a row another table's FK still points at), and a
-   genuine "remove this meter_id's config row" was confirmed as wanted
-   at the time. `device_config` went back to standing alone, `is_default`/
-   `get_or_create_device_config()` both removed.
-4. **Auto-provisioning re-added minus the FK** — the auto-provisioning
-   *behavior itself* was still wanted independent of the referential-
-   integrity question, so it came back on its own first (`is_default`,
-   `get_or_create_device_config()`), deliberately without any FK.
-5. **FK re-added, confirmed final — this time deliberately accepting
-   the DELETE tradeoff.** Real FKs from all seven tables restored,
-   matching the original hand-drawn diagram exactly. Confirmed
-   explicitly: `DELETE /admin/device-config/{meter_id}` can no longer
-   ever be a real `DELETE` for a meter with any history elsewhere —
-   accepted as the right tradeoff this time, in exchange for
-   `device_config(meter_id)` being a real, DB-enforced foreign key
-   everywhere `meter_id` appears.
-
-**Where this landed:** `is_default` and `get_or_create_device_config()`
-— called from `GET /devices/config` and from
-`app/routers/images.py`'s upload handler, right at the top of that
-transaction so it commits or rolls back atomically with the
-`images` insert it's guarding. All five FKs (confirmed count now that
-`images_electric`/`water`/`gas` merged into one `images` table, see
-"`images` — merged table" above — was seven tables/FKs when this list
-was first written, is five now for the same underlying relationship,
-nothing about the FK design itself changed): `images`, `ocr_jobs`,
-`ocr_meter`, `ocr_meter_test`, `esp32_upload_log` → `device_config(meter_id)`,
-`DROP CONSTRAINT IF EXISTS` + `ADD CONSTRAINT` pairs in
-`db/init.sql`, placed *after* `CREATE TABLE device_config` (ordering
-matters here — a table can't be referenced by an FK before it exists).
-`DELETE /admin/device-config/{meter_id}` is an UPSERT back to
-`DEFAULT_CONFIG` values with `is_default=true`, not an actual row
-removal — same externally-visible effect (every `GET` reports
-`is_default: true` afterward, indistinguishable from a never-configured
-meter) without ever violating the FK.
-
-## Things still worth double-checking
-
-- **`get_admin_or_service()`** (admin-JWT-or-either-static-key, on the
-  read-mostly `/admin/images*`/`/admin/meters/*` routes) — my own
-  addition, not confirmed against your real code.
-- **`meter_id` → table routing**: first letter `e/w/g` (case-insensitive),
-  per your comment in `init.sql` and the "ประเภทมิเตอร์" spec page.
-- **`error_type` codes 1 vs 2** ("found the meter but couldn't read the
-  digits" vs "couldn't find any digits/meter at all") — the distinction
-  is entirely the OCR client's own judgment call; nothing server-side
-  tries to tell these apart.
-- **`group_id` assignment timing**: happens when a group *opens* (first
-  image of a burst), not when it's *finalized* into a job — so a burst
-  that never completes still consumes a code from the sequence (a
-  small, permanent gap, same as id gaps elsewhere in this system). Flag
-  if you'd rather it only be assigned at finalization time.
-- **Fast-path race window**: two uploads that both push a group's count
-  to `IMAGE_GROUP_SIZE` at nearly the same instant are protected by
-  `FOR UPDATE` on the anchor row plus a `NOT EXISTS` check right before
-  inserting into `ocr_jobs` (`app/routers/images.py`) — same pattern as
-  the sweep's own race-safety. Not independently tested against real
-  concurrent load, just reasoned through.
+ผู้พัฒนาเริ่มต้น: นายเกริกไกร จอดนอก (นักศึกษาสหกิจศึกษา วิศวกรรมคอมพิวเตอร์ มหาวิทยาลัยรังสิต) ปีการศึกษา 2569
