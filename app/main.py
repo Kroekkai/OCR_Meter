@@ -8,7 +8,7 @@ from app.config import get_settings
 from app.external_push import external_push_sweep_loop
 from app.grouping import group_sweep_loop
 from app.prefix_middleware import StripPathPrefixMiddleware
-from app.routers import admin_users, auth_routes, device_config, health, images, meters, ocr_jobs
+from app.routers import admin_users, auth_routes, deletions, device_config, health, images, meters, ocr_jobs
 
 
 @asynccontextmanager
@@ -58,6 +58,7 @@ app.include_router(admin_users.ui_router)
 # ที่เจอตอน ocr_client_poller.py เรียก GET /admin/images/ocr ครั้งแรก
 app.include_router(ocr_jobs.router)
 app.include_router(images.router)
+app.include_router(deletions.router)
 app.include_router(meters.router)
 # No collision risk with anything above — "/devices/config" and
 # "/admin/device-config/{meter_id}" are both brand-new path prefixes

@@ -310,6 +310,21 @@
     z-index: 110; align-items: flex-start; justify-content: center; padding: 60px 20px;
   }
   #newm-overlay.open { display: flex; }
+  #dlog-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    z-index: 110; align-items: flex-start; justify-content: center; padding: 60px 20px;
+  }
+  #dlog-overlay.open { display: flex; }
+  #dlog-panel {
+    background: var(--surface); color: var(--text); border: 1px solid var(--border);
+    border-radius: 10px; width: 100%; max-width: 860px; max-height: 80vh; overflow: auto; padding: 20px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+  }
+  #dlog-panel h2 { font-size: 16px; font-weight: 500; margin: 0 0 14px; }
+  #dlog-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  #dlog-table th, #dlog-table td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+  #dlog-table td.detail { font-family: monospace; font-size: 12px; color: var(--text-muted); word-break: break-word; }
+  .tr-del { margin-top: 6px; font-size: 12px; padding: 2px 10px; }
   #newm-panel {
     background: var(--surface); color: var(--text); border: 1px solid var(--border);
     border-radius: 10px; width: 100%; max-width: 420px; padding: 20px;
@@ -519,11 +534,21 @@
       <span id="auto-refresh" title="อัปเดตรายการมิเตอร์ ผลลัพธ์ และ Push Issues อัตโนมัติทุก 15 วินาที"><span id="auto-refresh-time"></span></span>
       <button id="push-issues-btn" type="button">⚠ Push Issues<span class="badge-count" id="push-issues-count" style="display:none"></span></button>
       <button id="manage-users-btn" type="button">จัดการผู้ดูแล</button>
+      <button id="dlog-btn" type="button" style="display:none">บันทึกการลบ</button>
       <span id="whoami-name"></span>
       <button id="change-pw-btn" type="button">เปลี่ยนรหัสผ่าน</button>
       <button id="logout-btn">ออกจากระบบ</button>
     </div>
   </header>
+
+  <div id="dlog-overlay">
+    <div id="dlog-panel">
+      <h2>บันทึกการลบ (100 รายการล่าสุด)</h2>
+      <div id="dlog-msg"></div>
+      <table id="dlog-table"><thead><tr><th>เวลา</th><th>ผู้ลบ</th><th>การกระทำ</th><th>มิเตอร์</th><th>รายละเอียด</th></tr></thead><tbody id="dlog-body"></tbody></table>
+      <div style="text-align:right;margin-top:12px"><button type="button" id="dlog-close">ปิด</button></div>
+    </div>
+  </div>
 
   <div id="newm-overlay">
     <div id="newm-panel">
@@ -702,6 +727,8 @@
         <div class="actions">
           <button class="primary" id="save-btn">บันทึก</button>
           <button class="danger" id="reset-btn">รีเซ็ตเป็นค่า default</button>
+          <button class="danger" id="clear-readings-btn" type="button">ล้างค่าที่อ่านได้ทั้งหมด</button>
+          <button class="danger" id="delete-meter-btn" type="button">ลบมิเตอร์</button>
           <span id="save-msg"></span>
         </div>
 
@@ -822,6 +849,7 @@
       const me = await res.json();
       isSuperAdmin = !!me.is_super_admin;
       if (isSuperAdmin) $("manage-users-btn").style.display = "inline-block";
+      $("dlog-btn").style.display = isSuperAdmin ? "inline-block" : "none";
       applyDeviceTokenRole();
     } catch (e) { /* handled in api() */ }
   }
@@ -1466,6 +1494,98 @@
     } catch (e) { /* handled in api() */ }
   });
 
+
+  // ---------- ลบข้อมูล (ทำได้ทั้ง admin และ super admin; บันทึกใน deletion_log) ----------
+  function deleteReadingButton(entry, isTest) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "danger tr-del";
+    b.textContent = "ลบ";
+    b.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const mid = entry.meter_id || currentMeterId;
+      const val = entry.ocr_reading == null ? "-" : formatReading(mid, entry.ocr_reading);
+      let msg = "ลบค่า " + val + " (" + entry.capture_date + " " + entry.capture_time + ") ของ " + mid + "?";
+      if (!isTest && entry.push_status && entry.push_status !== "not_pushed") {
+        msg += "\n\nค่านี้ส่งไป CFO Platform แล้ว การลบที่นี่จะไม่ลบค่าที่ CFO";
+      }
+      if (!confirm(msg)) return;
+      try {
+        const res = await api("meters/" + encodeURIComponent(mid) + "/readings/" + entry.id + (isTest ? "?test=true" : ""), { method: "DELETE" });
+        if (!res.ok) { alert("ลบไม่สำเร็จ (" + res.status + ")"); return; }
+        if (isTest) { lastSig.test = null; loadTestResults(currentMeterId); }
+        else { lastSig.real = null; loadRealResults(currentMeterId); }
+      } catch (e) { /* handled in api() */ }
+    });
+    return b;
+  }
+
+  $("clear-readings-btn").addEventListener("click", async () => {
+    if (!currentMeterId) return;
+    if (!confirm('ล้างค่าที่อ่านได้ทั้งหมดของ "' + currentMeterId + '" (ทั้งผลลัพธ์จริงและผลทดสอบ)?\n\nค่าที่ส่งไป CFO Platform แล้วจะยังอยู่ที่ CFO และไฟล์ภาพยังเก็บไว้')) return;
+    try {
+      const res = await api("meters/" + encodeURIComponent(currentMeterId) + "/readings", { method: "DELETE" });
+      if (!res.ok) { alert("ล้างค่าไม่สำเร็จ (" + res.status + ")"); return; }
+      const r = await res.json();
+      alert("ลบผลลัพธ์จริง " + r.deleted_real + " รายการ และผลทดสอบ " + r.deleted_test + " รายการ");
+      lastSig.real = null; lastSig.test = null;
+      loadRealResults(currentMeterId); loadTestResults(currentMeterId);
+    } catch (e) { /* handled in api() */ }
+  });
+
+  $("delete-meter-btn").addEventListener("click", async () => {
+    if (!currentMeterId) return;
+    const typed = prompt('ลบมิเตอร์ "' + currentMeterId + '" ทั้งหมด: การตั้งค่า, API Key, token ของอุปกรณ์, ค่าที่อ่านได้ และประวัติ\n' +
+      'อุปกรณ์ที่ใช้ token ของมิเตอร์นี้จะส่งภาพไม่ได้อีก ค่าที่ส่งไป CFO แล้วยังอยู่ที่ CFO\n\nพิมพ์รหัสมิเตอร์เพื่อยืนยัน:');
+    if (typed === null) return;
+    if (typed.trim().toUpperCase() !== currentMeterId) { alert("รหัสมิเตอร์ไม่ตรง ยกเลิกการลบ"); return; }
+    try {
+      const res = await api("meters/" + encodeURIComponent(currentMeterId), { method: "DELETE" });
+      if (!res.ok) { alert("ลบไม่สำเร็จ (" + res.status + ")"); return; }
+      currentMeterId = null;
+      $("detail-form").style.display = "none";
+      $("detail-empty").style.display = "block";
+      loadList();
+    } catch (e) { /* handled in api() */ }
+  });
+
+  const DLOG_ACTION = {
+    delete_reading: "ลบผลลัพธ์จริง 1 รายการ",
+    delete_reading_test: "ลบผลทดสอบ 1 รายการ",
+    clear_readings: "ล้างค่าที่อ่านได้ทั้งหมด",
+    delete_meter: "ลบมิเตอร์",
+  };
+  async function openDeletionLog() {
+    $("dlog-overlay").classList.add("open");
+    $("dlog-body").innerHTML = "";
+    $("dlog-msg").textContent = "กำลังโหลด...";
+    try {
+      const res = await api("deletion-log?limit=100");
+      if (!res.ok) { $("dlog-msg").textContent = "โหลดไม่สำเร็จ (" + res.status + ")"; return; }
+      const rows = await res.json();
+      $("dlog-msg").textContent = rows.length ? "" : "ยังไม่มีการลบ";
+      rows.forEach((r) => {
+        const tr = document.createElement("tr");
+        const cells = [
+          new Date(r.deleted_at).toLocaleString("th-TH"),
+          r.actor_username,
+          DLOG_ACTION[r.action] || r.action,
+          r.meter_id,
+          JSON.stringify(r.detail),
+        ];
+        cells.forEach((c, i) => {
+          const td = document.createElement("td");
+          if (i === 4) td.className = "detail";
+          td.textContent = c;
+          tr.appendChild(td);
+        });
+        $("dlog-body").appendChild(tr);
+      });
+    } catch (e) { $("dlog-msg").textContent = "โหลดไม่สำเร็จ"; }
+  }
+  $("dlog-btn").addEventListener("click", openDeletionLog);
+  $("dlog-close").addEventListener("click", () => $("dlog-overlay").classList.remove("open"));
+
   // ---------- CFO Platform API key (ข้อ 18) ----------
   async function loadApiKeyStatus(meterId) {
     $("f-api-key-status").textContent = "กำลังโหลด...";
@@ -1671,6 +1791,7 @@
     // ยังไม่เคยแสดงค่า confidence ในหน้านี้เลยมาก่อน (แค่เก็บไว้ในฐานข้อมูล/
     // API) — เพิ่มบรรทัดนี้ไว้ใต้ badge สถานะ ใช้ร่วมกับผลลัพธ์จริงด้านล่างด้วย
     meta.appendChild(confidenceLine(entry.confidence));
+    meta.appendChild(deleteReadingButton(entry, true));
 
     card.appendChild(meta);
     $("tr-list").appendChild(card);
@@ -1756,6 +1877,7 @@
     pushLine.textContent = pushStatusLabel(entry.push_status);
     meta.appendChild(pushLine);
 
+    meta.appendChild(deleteReadingButton(entry, false));
     card.appendChild(meta);
     $("rr-list").appendChild(card);
   }

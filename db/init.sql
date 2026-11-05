@@ -1249,3 +1249,21 @@ ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_schedule_mode_
 ALTER TABLE device_config ADD CONSTRAINT device_config_schedule_mode_check CHECK (schedule_mode IN (0, 1, 2, 3));
 ALTER TABLE device_config DROP CONSTRAINT IF EXISTS device_config_photo_delay_check;
 ALTER TABLE device_config ADD CONSTRAINT device_config_photo_delay_check CHECK (photo_delay BETWEEN 0 AND 3600);
+
+
+-- --------------------------------------------------------------------------
+-- deletion_log — บันทึกการลบจากหน้าเว็บผู้ดูแลระบบ (ใครลบอะไรเมื่อไร)
+-- ไม่มี FK ไปที่ device_config เพราะต้องเก็บบันทึกไว้แม้มิเตอร์ถูกลบแล้ว
+-- ดูได้เฉพาะ super admin ผ่าน GET /admin/deletion-log
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS deletion_log (
+    id              BIGSERIAL   PRIMARY KEY,
+    deleted_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    actor_id        INTEGER,
+    actor_username  TEXT        NOT NULL,
+    action          TEXT        NOT NULL,
+    meter_id        TEXT        NOT NULL,
+    target_id       BIGINT,
+    detail          JSONB       NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS deletion_log_deleted_at_idx ON deletion_log (deleted_at DESC);
