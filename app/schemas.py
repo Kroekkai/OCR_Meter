@@ -400,6 +400,13 @@ class DeviceConfigOut(BaseModel):
     fw_version: str | None = None
     interval_minutes: int | None = None
     times: list[str] | None = None
+    # บันทึกของผู้ดูแลระบบ เช่น ตำแหน่งติดตั้ง — ไม่ส่งให้อุปกรณ์ (/devices/config ใช้ payload แยก)
+    note: str | None = None
+
+
+class DeviceConfigNoteRequest(BaseModel):
+    """บันทึกของมิเตอร์ (ตำแหน่ง/รายละเอียด) — ข้อความว่างหรือเว้นวรรคล้วน = ล้างบันทึก"""
+    note: str = Field(default="", max_length=500)
 
 
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -536,3 +543,4 @@ class DeviceConfigCreateRequest(BaseModel):
     """เพิ่มมิเตอร์ใหม่จากหน้าเว็บ — ใช้ก่อนออก token ให้ทีมอุปกรณ์ใส่ในเฟิร์มแวร์"""
     meter_id: str = Field(pattern=r"^(ELE|WAT|GAS)-\d{6}$", description="เช่น ELE-000003")
     power_mode: Literal["battery", "always_on"]
+    note: str | None = Field(default=None, max_length=500)

@@ -1267,3 +1267,6 @@ CREATE TABLE IF NOT EXISTS deletion_log (
     detail          JSONB       NOT NULL DEFAULT '{}'::jsonb
 );
 CREATE INDEX IF NOT EXISTS deletion_log_deleted_at_idx ON deletion_log (deleted_at DESC);
+
+-- บันทึกของมิเตอร์ (ตำแหน่งติดตั้ง/รายละเอียด) ที่ผู้ดูแลระบบพิมพ์เอง — ไม่ส่งให้อุปกรณ์
+ALTER TABLE device_config ADD COLUMN IF NOT EXISTS note TEXT;

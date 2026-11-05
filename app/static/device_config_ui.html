@@ -323,8 +323,13 @@
   #dlog-panel h2 { font-size: 16px; font-weight: 500; margin: 0 0 14px; }
   #dlog-table { width: 100%; border-collapse: collapse; font-size: 13px; }
   #dlog-table th, #dlog-table td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
-  #dlog-table td.detail { font-family: monospace; font-size: 12px; color: var(--text-muted); word-break: break-word; }
+  #dlog-table td.detail { font-size: 12px; color: var(--text-muted); word-break: break-word; }
+  #dlog-table td:nth-child(3), #dlog-table td:nth-child(4) { white-space: nowrap; }
   .tr-del { margin-top: 6px; font-size: 12px; padding: 2px 10px; }
+  .meter-row .mid-wrap { display: flex; flex-direction: column; min-width: 0; }
+  .meter-row .mnote { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 170px; }
+  #f-note, #newm-note { width: 100%; box-sizing: border-box; min-height: 64px; resize: vertical; font: inherit; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); }
+  .note-hint { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
   #newm-panel {
     background: var(--surface); color: var(--text); border: 1px solid var(--border);
     border-radius: 10px; width: 100%; max-width: 420px; padding: 20px;
@@ -555,6 +560,8 @@
       <h2>เพิ่มมิเตอร์ใหม่</h2>
       <label for="newm-id">รหัสมิเตอร์</label>
       <input type="text" id="newm-id" placeholder="เช่น ELE-000003, WAT-000001, GAS-000002" autocomplete="off">
+      <label for="newm-note">บันทึกของมิเตอร์ (ไม่บังคับ)</label>
+      <textarea id="newm-note" maxlength="500" placeholder="เช่น อาคาร 9 ชั้น 2 ห้องควบคุมไฟฟ้า"></textarea>
       <label>ประเภทเครื่อง</label>
       <div class="mode-toggle" id="newm-power">
         <button type="button" data-power="battery" class="selected">แบตเตอรี่ (Carbon)</button>
@@ -616,7 +623,7 @@
         <button type="button" class="tab" data-power="battery">แบตเตอรี่</button>
         <button type="button" class="tab" data-power="always_on">เปิดตลอด</button>
       </div>
-      <input type="text" id="search-box" placeholder="ค้นหา meter ID...">
+      <input type="text" id="search-box" placeholder="ค้นหา meter ID หรือบันทึก...">
       <div id="list-body"></div>
     </div>
     <div id="detail-pane">
@@ -632,6 +639,12 @@
         </div>
         <div id="d-powermode" class="powermode"></div>
         <div id="detail-sub"></div>
+
+        <fieldset>
+          <legend>บันทึกของมิเตอร์</legend>
+          <textarea id="f-note" maxlength="500" placeholder="เช่น อาคาร 9 ชั้น 2 ห้องควบคุมไฟฟ้า / ผู้ติดต่อ / ข้อสังเกตการติดตั้ง"></textarea>
+          <div class="note-hint">บันทึกพร้อมปุ่ม "บันทึก" ด้านล่าง ไม่เกิน 500 ตัวอักษร ไม่ส่งไปที่อุปกรณ์ และปุ่มรีเซ็ตตารางเวลาไม่ล้างบันทึกนี้</div>
+        </fieldset>
 
         <fieldset>
           <legend>โหมดตารางเวลา</legend>
@@ -1042,7 +1055,7 @@
       items = items.filter((c) => (c.power_mode === "always_on" ? "always_on" : "battery") === activePower);
     }
     if (query) {
-      items = items.filter((c) => c.meter_id.toUpperCase().includes(query));
+      items = items.filter((c) => c.meter_id.toUpperCase().includes(query) || (c.note || "").toUpperCase().includes(query));
     }
     body.innerHTML = "";
     if (!items.length) {
@@ -1062,8 +1075,18 @@
       dot.className = "meter-dot";
       dot.style.background = dotColor(cfg.meter_id);
       const label = document.createElement("span");
-      label.className = "mid";
-      label.textContent = cfg.meter_id;
+      label.className = "mid-wrap";
+      const midEl = document.createElement("span");
+      midEl.className = "mid";
+      midEl.textContent = cfg.meter_id;
+      label.appendChild(midEl);
+      if (cfg.note) {
+        const noteEl = document.createElement("span");
+        noteEl.className = "mnote";
+        noteEl.textContent = cfg.note;
+        label.appendChild(noteEl);
+        row.title = cfg.note;
+      }
       const pm = document.createElement("span");
       pm.className = "pm";
       pm.textContent = cfg.power_mode === "always_on" ? "เปิดตลอด" : cfg.power_mode === "battery" ? "แบต" : "";
@@ -1101,7 +1124,7 @@
   function newmMsg(t) { $("newm-msg").textContent = t || ""; }
   function closeNewm() { $("newm-overlay").classList.remove("open"); newmMsg(""); }
   $("new-btn").addEventListener("click", () => {
-    $("newm-id").value = ""; newmMsg("");
+    $("newm-id").value = ""; $("newm-note").value = ""; newmMsg("");
     $("newm-overlay").classList.add("open"); $("newm-id").focus();
   });
   document.querySelectorAll("#newm-power button").forEach((b) => b.addEventListener("click", () => {
@@ -1116,7 +1139,7 @@
     const res = await api("device-config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ meter_id: meterId, power_mode: newPower }),
+      body: JSON.stringify({ meter_id: meterId, power_mode: newPower, note: $("newm-note").value }),
     });
     if (res.status === 201) { closeNewm(); await loadList(); selectMeter(meterId); return; }
     if (res.status === 409) {
@@ -1289,6 +1312,7 @@
     $("detail-empty").style.display = "none";
     $("detail-form").style.display = "block";
     $("d-meter-id").textContent = cfg.meter_id;
+    $("f-note").value = cfg.note || "";
     $("d-badge").textContent = cfg.is_default ? "ใช้ค่า default" : "ตั้งค่าเองแล้ว";
     $("d-badge").className = "badge" + (cfg.is_default ? "" : " custom");
     $("detail-sub").textContent = cfg.is_default
@@ -1470,7 +1494,19 @@
         showSaveMsg("บันทึกไม่สำเร็จ: " + (err.detail ? JSON.stringify(err.detail) : res.status), true);
         return;
       }
-      const cfg = await res.json();
+      let cfg = await res.json();
+      const noteRes = await api("device-config/" + encodeURIComponent(currentMeterId) + "/note", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note: $("f-note").value }),
+      });
+      if (!noteRes.ok) {
+        renderDetail(cfg);
+        showSaveMsg("บันทึกตารางเวลาแล้ว แต่บันทึกของมิเตอร์ไม่สำเร็จ (" + noteRes.status + ")", true);
+        loadList();
+        return;
+      }
+      cfg = await noteRes.json();
       renderDetail(cfg);
       showSaveMsg("บันทึกแล้ว", false);
       loadList();
@@ -1506,7 +1542,7 @@
       const mid = entry.meter_id || currentMeterId;
       const val = entry.ocr_reading == null ? "-" : formatReading(mid, entry.ocr_reading);
       let msg = "ลบค่า " + val + " (" + entry.capture_date + " " + entry.capture_time + ") ของ " + mid + "?";
-      if (!isTest && entry.push_status && entry.push_status !== "not_pushed") {
+      if (!isTest && entry.push_status === "pending") {
         msg += "\n\nค่านี้ส่งไป CFO Platform แล้ว การลบที่นี่จะไม่ลบค่าที่ CFO";
       }
       if (!confirm(msg)) return;
@@ -1555,6 +1591,26 @@
     clear_readings: "ล้างค่าที่อ่านได้ทั้งหมด",
     delete_meter: "ลบมิเตอร์",
   };
+  function dlogDetailText(r) {
+    const d = r.detail || {};
+    if (r.action === "delete_reading" || r.action === "delete_reading_test") {
+      const parts = ["ค่า " + (d.ocr_reading == null ? "-" : d.ocr_reading)];
+      if (d.ocr_reading_raw) parts.push("ค่าดิบ " + d.ocr_reading_raw);
+      parts.push("ถ่ายเมื่อ " + d.capture_date + " " + String(d.capture_time || "").slice(0, 5));
+      if (d.push_status) parts.push("สถานะส่ง CFO: " + pushStatusLabel(d.push_status));
+      return parts.join(" · ");
+    }
+    if (r.action === "clear_readings") {
+      return "ผลลัพธ์จริง " + (d.ocr_meter || 0) + " รายการ · ผลทดสอบ " + (d.ocr_meter_test || 0) + " รายการ";
+    }
+    if (r.action === "delete_meter") {
+      return "ผลลัพธ์จริง " + (d.ocr_meter || 0) + " · ผลทดสอบ " + (d.ocr_meter_test || 0) +
+        " · ภาพ " + (d.images || 0) + " · งาน OCR " + (d.ocr_jobs || 0) +
+        " · บันทึกอัปโหลด " + (d.esp32_upload_log || 0) + " · API Key " + (d.external_api_keys || 0) +
+        " · token " + (d.device_tokens || 0);
+    }
+    return JSON.stringify(d);
+  }
   async function openDeletionLog() {
     $("dlog-overlay").classList.add("open");
     $("dlog-body").innerHTML = "";
@@ -1571,7 +1627,7 @@
           r.actor_username,
           DLOG_ACTION[r.action] || r.action,
           r.meter_id,
-          JSON.stringify(r.detail),
+          dlogDetailText(r),
         ];
         cells.forEach((c, i) => {
           const td = document.createElement("td");

@@ -10,6 +10,7 @@ from app.db import pool
 from app.external_push import ExternalPushClientError, ExternalPushServerError, verify_device
 from app.schemas import (
     DeviceConfigCreateRequest,
+    DeviceConfigNoteRequest,
     DeviceConfigOut,
     DeviceConfigSetRequest,
     ExternalApiKeySetRequest,
@@ -68,6 +69,7 @@ def _config_out(row) -> DeviceConfigOut:
         fw_version=row["fw_version"],
         interval_minutes=row["interval_minutes"],
         times=list(row["capture_times"]) if row["capture_times"] else None,
+        note=row["note"] if "note" in row.keys() else None,
     )
 
 
@@ -712,8 +714,32 @@ async def admin_create_meter(body: DeviceConfigCreateRequest, _: CurrentUser = D
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Meter {meter_id} already exists")
             await get_or_create_device_config(conn, meter_id)
             row = await conn.fetchrow(
-                "UPDATE device_config SET power_mode = $2 WHERE meter_id = $1 RETURNING *",
+                "UPDATE device_config SET power_mode = $2, note = $3 WHERE meter_id = $1 RETURNING *",
                 meter_id,
                 body.power_mode,
+                (body.note or "").strip() or None,
+            )
+    return _config_out(row)
+
+
+@router.put(
+    "/admin/device-config/{meter_id}/note",
+    response_model=DeviceConfigOut,
+    summary="Admin Set Meter Note",
+)
+async def admin_set_meter_note(meter_id: str, body: DeviceConfigNoteRequest, _: CurrentUser = Depends(get_current_admin)):
+    """
+    บันทึกของมิเตอร์ที่ผู้ดูแลระบบพิมพ์เอง เช่น ตำแหน่งติดตั้ง ผู้ติดต่อ หรือข้อสังเกต
+    แยกจากการบันทึกตารางเวลา: ไม่เปลี่ยน is_default และปุ่มรีเซ็ตตารางเวลาไม่ล้างบันทึกนี้
+    ข้อความว่าง = ล้างบันทึก (เก็บเป็น NULL)
+    """
+    meter_id = meter_id.strip().upper()
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            await get_or_create_device_config(conn, meter_id)
+            row = await conn.fetchrow(
+                "UPDATE device_config SET note = $2 WHERE meter_id = $1 RETURNING *",
+                meter_id,
+                body.note.strip() or None,
             )
     return _config_out(row)
