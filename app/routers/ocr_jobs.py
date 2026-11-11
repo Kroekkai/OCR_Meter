@@ -16,6 +16,7 @@ from app.external_push import (
     push_immediately_if_configured,
 )
 from app.filename import capture_date_time_from_device_timestamp, is_test_filename
+from app.reading_guard import apply_decimal_drop_guard
 from app.repo import get_group_images
 from app.schemas import JobStatus, OcrClaimResponse, OcrFailRequest, OcrJobOut, OcrMeterEntry, VALID_OCR_ENGINE_CODES
 from app import storage
@@ -251,6 +252,11 @@ async def _submit_ocr_result(
             if parsed_reading is not None:
                 ocr_reading = float(_apply_decimal_point(ocr_reading_raw, parsed_reading, job["meter_id"]))
             capture_date, capture_time = capture_date_time_from_device_timestamp(job["device_timestamp"])
+            if not expected_test:
+                # กันทศนิยมลดลงเพราะแสง — ฟังก์ชันแยกใน app/reading_guard.py (เฉพาะผลลัพธ์จริง)
+                ocr_reading, error_type = await apply_decimal_drop_guard(
+                    conn, job["meter_id"], capture_date, capture_time, ocr_reading, error_type
+                )
 
             # No file write at all — just reference the anchor's filename,
             # already sitting on disk since the original ESP32 upload.

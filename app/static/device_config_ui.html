@@ -224,6 +224,8 @@
   .badge { font-size: 12px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border); color: var(--text-muted); }
   .badge.custom { border-color: var(--accent-dim); color: var(--accent); }
   #detail-sub { color: var(--text-muted); font-size: 13px; margin-bottom: 24px; }
+  .sched-summary { font-size: 14px; margin: 6px 0 10px; padding: 8px 12px; border-radius: 8px; background: var(--surface); border: 1px solid var(--border); }
+  .sched-summary b { font-weight: 600; }
 
   fieldset { border: none; padding: 0; margin: 0 0 22px; }
   legend { font-size: 13px; color: var(--text-muted); margin-bottom: 10px; padding: 0; }
@@ -638,6 +640,7 @@
           <span class="badge" id="d-badge"></span>
         </div>
         <div id="d-powermode" class="powermode"></div>
+        <div id="d-schedule" class="sched-summary"></div>
         <div id="detail-sub"></div>
 
         <fieldset>
@@ -1337,6 +1340,8 @@
     toggleDate2(hasSecond);
     fillDate("d2", cfg.date2[0] ? cfg.date2 : [1, 0, 0, 0, 0]);
 
+    $("d-schedule").innerHTML = "";
+    $("d-schedule").append(...scheduleSummaryNodes(cfg));
     $("f-photo-count").textContent = cfg.photo_count;
     // ค่าที่ตั้งผ่าน API ได้เกิน 60 วินาที — เพิ่มตัวเลือกให้ถ้ายังไม่มี จะได้ไม่หายตอนบันทึก
     if (![...$("f-photo-delay").options].some((o) => +o.value === cfg.photo_delay)) {
@@ -1358,6 +1363,34 @@
   // <input type="time"> — a brief earlier version tried that merge in
   // the JS here without actually updating the HTML to match, which was
   // a real bug — this fixes that mismatch).
+
+  // ---------- สรุปตารางเวลาที่ใช้อยู่ (จากค่าที่บันทึกแล้ว ไม่ใช่ค่าที่กำลังแก้) ----------
+  function hm(arr) { return String(arr[3]).padStart(2, "0") + ":" + String(arr[4]).padStart(2, "0"); }
+  function scheduleSummaryNodes(cfg) {
+    const mode = cfg.schedule_mode;
+    const second = cfg.date2 && cfg.date2.some((v) => v !== 0);
+    let text;
+    if (mode === 0) {
+      text = "ถ่ายทุกวัน เวลา " + hm(cfg.date1) + (second ? " และ " + hm(cfg.date2) : "");
+    } else if (mode === 1) {
+      const day = (a) => (a[0] ? "วันที่ " + a[0] : "วันที่ตามค่าเริ่มต้น");
+      text = "ถ่ายตามวันที่กำหนด: " + day(cfg.date1) + " เวลา " + hm(cfg.date1) +
+        (second ? " และ " + day(cfg.date2) + " เวลา " + hm(cfg.date2) : "");
+    } else if (mode === 2) {
+      text = "ถ่ายทุก " + (cfg.interval_minutes || "-") + " นาที";
+    } else if (mode === 3) {
+      text = "ถ่ายตามเวลา " + ((cfg.times && cfg.times.length) ? cfg.times.join(", ") : "-");
+    } else {
+      text = "โหมด " + mode;
+    }
+    text += " · " + cfg.photo_count + " ภาพต่อรอบ ห่าง " + cfg.photo_delay + " วินาที";
+    if (mode >= 2 && cfg.power_mode !== "always_on") text += " (เครื่องแบตเตอรี่ใช้โหมดนี้ไม่ได้)";
+    if (cfg.is_default) text += " (ค่า default)";
+    const label = document.createElement("b");
+    label.textContent = "ตารางเวลาที่ใช้อยู่: ";
+    return [label, document.createTextNode(text)];
+  }
+
   function fillDate(prefix, arr) {
     $(prefix + "-day").value = arr[0] || 1;
     $(prefix + "-hour").value = arr[3];
