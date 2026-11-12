@@ -1270,3 +1270,6 @@ CREATE INDEX IF NOT EXISTS deletion_log_deleted_at_idx ON deletion_log (deleted_
 
 -- บันทึกของมิเตอร์ (ตำแหน่งติดตั้ง/รายละเอียด) ที่ผู้ดูแลระบบพิมพ์เอง — ไม่ส่งให้อุปกรณ์
 ALTER TABLE device_config ADD COLUMN IF NOT EXISTS note TEXT;
+
+-- เวลาที่ระบบ OCR จองงาน ใช้คืนงานที่ค้าง processing เข้าคิว (app/ocr_requeue.py)
+ALTER TABLE ocr_jobs ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;

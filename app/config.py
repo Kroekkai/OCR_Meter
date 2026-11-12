@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     #   false = เฉพาะ "อ่านสำเร็จ" (error_type 0) แบบเดิม
     # ตั้งผ่าน env: OCR_HISTORY_INCLUDE_ANOMALIES=false
     ocr_history_include_anomalies: bool = True
+    # คืนงาน OCR ที่ค้างสถานะ processing เข้าคิว (app/ocr_requeue.py)
+    # งานที่ถูกจองแล้วไม่ส่งผลหรือแจ้งล้มเหลวภายในเวลานี้ จะกลับเป็น queued ให้จองใหม่ได้
+    # คืนเข้าคิวต่อไปเรื่อย ๆ ไม่จำกัดจำนวนครั้ง (attempts ยังนับเพิ่มทุกครั้งที่จอง)
+    ocr_requeue_enabled: bool = True
+    ocr_claim_timeout_minutes: int = 5
+    ocr_requeue_check_seconds: int = 60
     # จำนวนหลักทศนิยมบนหน้าปัดของมิเตอร์แต่ละประเภท — ถ้าระบบ OCR ส่งค่ามา
     # โดยไม่มีจุดทศนิยม (เช่น "53864") เซิร์ฟเวอร์จะเติมจุดให้ตามจำนวนนี้
     # (ไฟฟ้า 1 → 5386.4) ถ้าส่งมามีจุดอยู่แล้วจะใช้ตามเดิม ไม่แตะ

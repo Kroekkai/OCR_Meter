@@ -7,6 +7,7 @@ from app import db
 from app.config import get_settings
 from app.external_push import external_push_sweep_loop
 from app.grouping import group_sweep_loop
+from app.ocr_requeue import ocr_requeue_loop
 from app.prefix_middleware import StripPathPrefixMiddleware
 from app.routers import admin_users, auth_routes, deletions, device_config, health, images, meters, ocr_jobs
 
@@ -25,10 +26,13 @@ async def lifespan(app: FastAPI):
     # actually does each tick (a no-op until external_api_base_url is
     # configured).
     external_push_task = asyncio.create_task(external_push_sweep_loop())
+    # คืนงาน OCR ที่จองแล้วค้างเข้าคิว — app/ocr_requeue.py
+    ocr_requeue_task = asyncio.create_task(ocr_requeue_loop())
     yield
     sweep_task.cancel()
     external_push_task.cancel()
-    for task in (sweep_task, external_push_task):
+    ocr_requeue_task.cancel()
+    for task in (sweep_task, external_push_task, ocr_requeue_task):
         try:
             await task
         except asyncio.CancelledError:

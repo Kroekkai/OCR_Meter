@@ -85,7 +85,7 @@ async def admin_claim_ocr_job(job_id: int, _: CurrentUser = Depends(get_ocr_clie
                 )
             updated = await conn.fetchrow(
                 """
-                UPDATE ocr_jobs SET status = 'processing', attempts = attempts + 1
+                UPDATE ocr_jobs SET status = 'processing', attempts = attempts + 1, claimed_at = now()
                 WHERE id = $1
                 RETURNING *
                 """,
