@@ -250,7 +250,10 @@ async def _submit_ocr_result(
                 )
 
             if parsed_reading is not None:
-                ocr_reading = float(_apply_decimal_point(ocr_reading_raw, parsed_reading, job["meter_id"]))
+                # เก็บเป็น Decimal ตรง ๆ — ห้ามแปลงเป็น float เพราะ float(33.4) คือ
+                # 33.39999999999999857… ฐานข้อมูล (NUMERIC) จะเก็บค่าเพี้ยนนี้ไว้ทั้งหมด
+                # แล้วตอนส่ง CFO ตัดทศนิยม (ROUND_DOWN) จะกลายเป็น 33.39 แทน 33.40
+                ocr_reading = _apply_decimal_point(ocr_reading_raw, parsed_reading, job["meter_id"])
             capture_date, capture_time = capture_date_time_from_device_timestamp(job["device_timestamp"])
             if not expected_test:
                 # กันทศนิยมลดลงเพราะแสง — ฟังก์ชันแยกใน app/reading_guard.py (เฉพาะผลลัพธ์จริง)

@@ -364,7 +364,12 @@ def _format_ai_value(value) -> str:
     """aiValue per spec 4.1: number ≥0, ≤2 decimal places, '.' as the decimal point, never exponent notation.
     ตัดทศนิยมเกิน 2 ตำแหน่งทิ้ง (ROUND_DOWN) ไม่ปัดขึ้น — เลขสะสมบนหน้าปัดยังไม่ถึงค่าที่ปัดขึ้นจริง
     เช่น แก๊ส 2875.335 → 2875.33 (ไม่ใช่ 2875.34)"""
-    d = decimal.Decimal(str(value)).quantize(decimal.Decimal("0.01"), rounding=decimal.ROUND_DOWN)
+    d = decimal.Decimal(str(value))
+    # กันค่าที่ถูกเก็บมาจาก float (เช่น 33.39999999999999857…) — ปัดที่ 6 ตำแหน่งก่อน
+    # ให้กลับเป็น 33.400000 แล้วค่อยตัดเหลือ 2 ตำแหน่ง ไม่อย่างนั้นจะได้ 33.39
+    # (หน้าปัดมิเตอร์มีทศนิยมไม่เกิน 3 หลัก การปัดที่หลักที่ 6 จึงไม่เปลี่ยนค่าจริง)
+    d = d.quantize(decimal.Decimal("0.000001"), rounding=decimal.ROUND_HALF_EVEN)
+    d = d.quantize(decimal.Decimal("0.01"), rounding=decimal.ROUND_DOWN)
     if d < 0:
         # Already rejected at ingest (ocr_jobs.py) — re-checked here so a bad
         # row can never go out as a negative value (spec: "number ≥0").
