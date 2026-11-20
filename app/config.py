@@ -97,6 +97,11 @@ class Settings(BaseSettings):
     reading_decimals_electric: int = 1
     reading_decimals_gas: int = 3
     reading_decimals_water: int = 3
+    # ค่าที่ส่งเป็น ocr_reading ในประวัติที่ส่งให้ระบบ OCR
+    #   true  = ค่าดิบตามที่ระบบ OCR อ่านได้ (ocr_reading_raw) เช่น 54203
+    #   false = ค่าที่เซิร์ฟเวอร์บันทึก (เติมจุดแล้ว) เช่น 5420.3
+    # ตั้งผ่าน env: OCR_HISTORY_USE_RAW=false
+    ocr_history_use_raw: bool = True
     # กันทศนิยมลดลงเพราะแสง/ล้อทศนิยมหมุน (app/reading_guard.py) — เฉพาะผลลัพธ์จริง
     # ถ้าจำนวนเต็มเท่ากับค่าก่อนหน้าแต่ทศนิยมน้อยกว่า ให้ใช้ค่าก่อนหน้าและบันทึกเป็นอ่านสำเร็จ
     reading_decimal_drop_guard_enabled: bool = True

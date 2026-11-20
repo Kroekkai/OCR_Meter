@@ -206,7 +206,23 @@ async def admin_get_meter_ocr_readings(
         """,
         *params,
     )
-    return [OcrMeterEntry(**dict(r)) for r in rows]
+    if not get_settings().ocr_history_use_raw:
+        return [OcrMeterEntry(**dict(r)) for r in rows]
+
+    # ส่งค่าดิบที่ระบบ OCR อ่านได้กลับไปเป็น ocr_reading (เช่น 54203 แทน 5420.3)
+    # Rule Base ของระบบ OCR จะได้เทียบค่าในรูปแบบเดียวกับที่ตัวเองอ่าน
+    # แถวเก่าที่ไม่มีค่าดิบ ใช้ ocr_reading ตามที่บันทึกไว้
+    entries = []
+    for r in rows:
+        d = dict(r)
+        raw = d.get("ocr_reading_raw")
+        if raw:
+            try:
+                d["ocr_reading"] = float(raw.replace(",", ""))
+            except ValueError:
+                pass
+        entries.append(OcrMeterEntry(**d))
+    return entries
 
 
 @router.get(
